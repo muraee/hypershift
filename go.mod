@@ -12,7 +12,7 @@ require (
 	github.com/IBM/platform-services-go-sdk v0.28.5
 	github.com/IBM/vpc-go-sdk v0.26.0
 	github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5
-	github.com/aws/aws-sdk-go v1.44.107
+	github.com/aws/aws-sdk-go v1.44.190
 	github.com/blang/semver v3.5.1+incompatible
 	github.com/clarketm/json v1.14.1
 	github.com/coreos/ignition/v2 v2.10.1
@@ -28,7 +28,7 @@ require (
 	github.com/onsi/gomega v1.24.1
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.0.3-0.20211202183452-c5a74bcca799
-	github.com/openshift/api v0.0.0-20220831183848-09c070622e2c
+	github.com/openshift/api v0.0.0-20230119154305-a7b1b9651014
 	github.com/openshift/cloud-credential-operator v0.0.0-20220708202639-ef451d260cf6
 	github.com/openshift/cluster-api-provider-agent/api v0.0.0-20220227135922-dd6353f609dc
 	github.com/openshift/cluster-node-tuning-operator v0.0.0-20220614214129-2c76314fb3cc

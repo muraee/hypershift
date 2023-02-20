@@ -54,3 +54,12 @@ func MultusAdmissionControllerDeployment(namespace string) *appsv1.Deployment {
 		},
 	}
 }
+
+func ClusterNetworkOperatorServiceAccount(namespace string) *corev1.ServiceAccount {
+	return &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      resourceName,
+		},
+	}
+}
