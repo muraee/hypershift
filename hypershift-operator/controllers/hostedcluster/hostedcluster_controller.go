@@ -2452,9 +2452,9 @@ func reconcileControlPlaneOperatorDeployment(
 		Template: corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
 				Labels: map[string]string{
-					"name":                        "control-plane-operator",
-					"app":                         "control-plane-operator",
-					hyperv1.ControlPlaneComponent: "control-plane-operator",
+					"name":                             "control-plane-operator",
+					"app":                              "control-plane-operator",
+					hyperv1.ControlPlaneComponentLabel: "control-plane-operator",
 				},
 			},
 			Spec: corev1.PodSpec{
@@ -3036,9 +3036,9 @@ func reconcileCAPICluster(cluster *capiv1.Cluster, hcluster *hyperv1.HostedClust
 
 func reconcileCAPIProviderDeployment(deployment *appsv1.Deployment, capiProviderDeploymentSpec *appsv1.DeploymentSpec, hcp *hyperv1.HostedControlPlane, sa *corev1.ServiceAccount, setDefaultSecurityContext bool) error {
 	selectorLabels := map[string]string{
-		"control-plane":               "capi-provider-controller-manager",
-		"app":                         "capi-provider-controller-manager",
-		hyperv1.ControlPlaneComponent: "capi-provider-controller-manager",
+		"control-plane":                    "capi-provider-controller-manager",
+		"app":                              "capi-provider-controller-manager",
+		hyperv1.ControlPlaneComponentLabel: "capi-provider-controller-manager",
 	}
 	// Before this change we did
 	// 		Selector: &metav1.LabelSelector{
@@ -3098,9 +3098,9 @@ func reconcileCAPIProviderDeployment(deployment *appsv1.Deployment, capiProvider
 func reconcileCAPIManagerDeployment(deployment *appsv1.Deployment, hc *hyperv1.HostedCluster, hcp *hyperv1.HostedControlPlane, sa *corev1.ServiceAccount, capiManagerImage string, setDefaultSecurityContext bool) error {
 	defaultMode := int32(0640)
 	selectorLabels := map[string]string{
-		"name":                        "cluster-api",
-		"app":                         "cluster-api",
-		hyperv1.ControlPlaneComponent: "cluster-api",
+		"name":                             "cluster-api",
+		"app":                              "cluster-api",
+		hyperv1.ControlPlaneComponentLabel: "cluster-api",
 	}
 
 	// Before this change we did

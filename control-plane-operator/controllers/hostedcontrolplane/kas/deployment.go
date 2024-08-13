@@ -93,8 +93,8 @@ var (
 
 func kasLabels() map[string]string {
 	return map[string]string{
-		"app":                         "kube-apiserver",
-		hyperv1.ControlPlaneComponent: "kube-apiserver",
+		"app":                              "kube-apiserver",
+		hyperv1.ControlPlaneComponentLabel: "kube-apiserver",
 	}
 }
 

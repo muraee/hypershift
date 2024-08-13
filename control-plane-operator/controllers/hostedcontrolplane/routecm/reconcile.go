@@ -118,8 +118,7 @@ func (r *RouteControllerManagerReconciler) Volumes(cpContext component.ControlPl
 
 func openShiftRouteControllerManagerLabels() map[string]string {
 	return map[string]string{
-		"app":                         "openshift-route-controller-manager",
-		hyperv1.ControlPlaneComponent: "openshift-route-controller-manager",
+		"app": ComponentName,
 	}
 }
 
