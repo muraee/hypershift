@@ -16,6 +16,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/util/sets"
+
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -49,6 +53,10 @@ type controlPlaneWorkload struct {
 	deploymentReconciler  DeploymentReconciler
 	statefulSetReconciler StatefulSetReconciler
 
+	// list of component names that this component depends on.
+	// reconcilation will be blocked until all Dependencies are available.
+	Dependencies []string
+
 	// optional
 	rbacReconciler RBACReconciler
 	// reconiclers for Secret, ConfigMap, Service, ServiceMonitor, etc.
@@ -76,6 +84,31 @@ func (c *controlPlaneWorkload) Name() string {
 
 }
 
+func (c *controlPlaneWorkload) checkDependencies(cpContext ControlPlaneContext) ([]string, error) {
+	if len(c.Dependencies) == 0 {
+		return nil, nil
+	}
+
+	componentsList := &hyperv1.ControlPlaneComponentList{}
+	if err := cpContext.Client.List(cpContext, componentsList, client.InNamespace(cpContext.HCP.Namespace)); err != nil {
+		return nil, err
+	}
+
+	unavailableDependencies := sets.New(c.Dependencies...)
+	for _, component := range componentsList.Items {
+		if !unavailableDependencies.Has(component.Name) {
+			continue
+		}
+
+		availableCondition := meta.FindStatusCondition(component.Status.Conditions, string(hyperv1.ControlPlaneComponentAvailable))
+		if availableCondition != nil && availableCondition.Status == metav1.ConditionTrue {
+			unavailableDependencies.Delete(component.Name)
+		}
+	}
+
+	return sets.List(unavailableDependencies), nil
+}
+
 // reconcile implements ControlPlaneComponent.
 func (c *controlPlaneWorkload) Reconcile(cpContext ControlPlaneContext) error {
 	if c.predicate != nil {
@@ -88,6 +121,33 @@ func (c *controlPlaneWorkload) Reconcile(cpContext ControlPlaneContext) error {
 		}
 	}
 
+	unavailableDependencies, err := c.checkDependencies(cpContext)
+	if err != nil {
+		return fmt.Errorf("failed checking for Dependencies availability: %v", err)
+	}
+
+	var reconcilationError error
+	if len(unavailableDependencies) == 0 {
+		// reconcile only when all dependencies are available, and don't return error immediatly so it can be included in the status condition first.
+		reconcilationError = c.update(cpContext)
+	}
+
+	component := &hyperv1.ControlPlaneComponent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      c.Name(),
+			Namespace: cpContext.HCP.Namespace,
+		},
+	}
+	if _, err := cpContext.CreateOrUpdate(cpContext, cpContext.Client, component, func() error {
+		return c.reconcileComponentStatus(cpContext, component, unavailableDependencies, reconcilationError)
+	}); err != nil {
+		return err
+	}
+
+	return reconcilationError
+}
+
+func (c *controlPlaneWorkload) update(cpContext ControlPlaneContext) error {
 	hcp := cpContext.HCP
 	ownerRef := config.OwnerRefFrom(hcp)
 	// reconcile resources such as ConfigMaps and Secrets first, as the deployment might depend on them.
@@ -156,6 +216,67 @@ func (c *controlPlaneWorkload) reconcileRBAC(cpContext ControlPlaneContext) erro
 	return nil
 }
 
+func (c *controlPlaneWorkload) reconcileComponentStatus(cpContext ControlPlaneContext, component *hyperv1.ControlPlaneComponent, unavailableDependencies []string, reconcilationError error) error {
+	component.Status.Resources = []hyperv1.ComponentResource{}
+	for _, reconciler := range c.resourcesReconcilers {
+		if reconciler.PredicateFn != nil && !reconciler.PredicateFn(cpContext) {
+			continue
+		}
+
+		resource := reconciler.ManifestFn(cpContext.HCP.Namespace)
+		gvk, err := cpContext.Client.GroupVersionKindFor(resource)
+		if err != nil {
+			return err
+		}
+
+		component.Status.Resources = append(component.Status.Resources, hyperv1.ComponentResource{
+			Kind:  gvk.Kind,
+			Group: gvk.Group,
+			Name:  resource.GetName(),
+		})
+
+	}
+
+	if len(unavailableDependencies) > 0 {
+		meta.SetStatusCondition(&component.Status.Conditions, metav1.Condition{
+			Type:    string(hyperv1.ControlPlaneComponentAvailable),
+			Status:  metav1.ConditionFalse,
+			Reason:  hyperv1.WaitingForDependenciesReason,
+			Message: fmt.Sprintf("Waiting for Dependencies: %s", strings.Join(unavailableDependencies, ", ")),
+		})
+		return nil
+	}
+
+	if reconcilationError != nil {
+		meta.SetStatusCondition(&component.Status.Conditions, metav1.Condition{
+			Type:    string(hyperv1.ControlPlaneComponentAvailable),
+			Status:  metav1.ConditionFalse,
+			Reason:  hyperv1.ReconciliationErrorReason,
+			Message: reconcilationError.Error(),
+		})
+		return nil
+	}
+
+	// set version status only if there was no reconcilationError
+	component.Status.Version = cpContext.ReleaseImageProvider.Version()
+
+	var status metav1.ConditionStatus
+	var reason, message string
+	if c.deploymentReconciler != nil {
+		status, reason, message = c.isDeploymentReady(cpContext)
+	} else {
+		status, reason, message = c.isStatefulSetReady(cpContext)
+	}
+
+	meta.SetStatusCondition(&component.Status.Conditions, metav1.Condition{
+		Type:    string(hyperv1.ControlPlaneComponentAvailable),
+		Status:  status,
+		Reason:  reason,
+		Message: message,
+	})
+	return nil
+}
+
 func (c *controlPlaneWorkload) defaultDeploymentConfig(cpContext ControlPlaneContext, desiredReplicas *int32) *config.DeploymentConfig {
 	hcp := cpContext.HCP
 
@@ -167,10 +288,11 @@ func (c *controlPlaneWorkload) defaultDeploymentConfig(cpContext ControlPlaneCon
 		deploymentConfig.Scheduling.PriorityClass = hcp.Annotations[hyperv1.ControlPlanePriorityClass]
 	}
 
+	deploymentConfig.AdditionalLabels = map[string]string{
+		hyperv1.ControlPlaneComponentLabel: c.Name(),
+	}
 	if c.needsManagementKASAccess {
-		deploymentConfig.AdditionalLabels = map[string]string{
-			config.NeedManagementKASAccessLabel: "true",
-		}
+		deploymentConfig.AdditionalLabels[config.NeedManagementKASAccessLabel] = "true"
 	}
 
 	var replicas *int

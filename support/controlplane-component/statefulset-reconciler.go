@@ -3,10 +3,13 @@ package controlplanecomponent
 import (
 	"fmt"
 
+	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	"github.com/openshift/hypershift/support/config"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 )
@@ -43,6 +46,33 @@ func (c *controlPlaneWorkload) reconcileStatefulSet(cpContext ControlPlaneContex
 	}
 
 	return nil
+}
+
+func (c *controlPlaneWorkload) isStatefulSetReady(cpContext ControlPlaneContext) (status metav1.ConditionStatus, reason string, message string) {
+	status = metav1.ConditionFalse
+
+	statefulSet := statefulSetManifest(c.Name(), cpContext.HCP.Namespace)
+	if err := cpContext.Client.Get(cpContext, client.ObjectKeyFromObject(statefulSet), statefulSet); err != nil {
+		if !apierrors.IsNotFound(err) {
+			reason = "Error"
+			message = err.Error()
+			return
+		}
+		reason = hyperv1.NotFoundReason
+		message = fmt.Sprintf("%s StatefulSet not found", statefulSet.Name)
+		return
+	}
+
+	if statefulSet.Status.ReadyReplicas >= ptr.Deref(statefulSet.Spec.Replicas, 0) {
+		status = metav1.ConditionTrue
+		reason = hyperv1.AsExpectedReason
+		message = fmt.Sprintf("%s StatefulSet is available", statefulSet.Name)
+	} else {
+		reason = hyperv1.WaitingForAvailableReason
+		message = fmt.Sprintf("%s StatefulSet is not available: %d/%d replicas ready", statefulSet.Name, statefulSet.Status.ReadyReplicas, *statefulSet.Spec.Replicas)
+	}
+
+	return
 }
 
 func (c *controlPlaneWorkload) applyOptionsToStatefulSet(cpContext ControlPlaneContext, statefulSet *appsv1.StatefulSet, existingResources map[string]corev1.ResourceRequirements, existingLabelSelector *metav1.LabelSelector) error {

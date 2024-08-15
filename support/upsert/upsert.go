@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	routev1 "github.com/openshift/api/route/v1"
+	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	appsv1 "k8s.io/api/apps/v1"
 
 	configv1 "github.com/openshift/api/config/v1"
@@ -38,6 +39,7 @@ var withStatusSubresource = sets.NewString(
 	fmt.Sprintf("%T", &capiv1.Cluster{}),
 	fmt.Sprintf("%T", &capiazure.AzureCluster{}),
 	fmt.Sprintf("%T", &capiibmv1.IBMPowerVSCluster{}),
+	fmt.Sprintf("%T", &hyperv1.ControlPlaneComponent{}),
 )
 
 func hasStatusSubResource(o crclient.Object) bool {
