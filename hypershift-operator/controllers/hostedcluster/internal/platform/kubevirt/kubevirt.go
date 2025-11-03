@@ -33,7 +33,7 @@ type Kubevirt struct{}
 
 func (p Kubevirt) ReconcileCAPIInfraCR(ctx context.Context, c client.Client, createOrUpdate upsert.CreateOrUpdateFN,
 	hcluster *hyperv1.HostedCluster,
-	controlPlaneNamespace string, _ hyperv1.APIEndpoint) (client.Object, error) {
+	controlPlaneNamespace string, _ hyperv1.APIEndpoint) (*corev1.ObjectReference, error) {
 	kubevirtCluster := &capikubevirt.KubevirtCluster{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: controlPlaneNamespace,
@@ -56,7 +56,12 @@ func (p Kubevirt) ReconcileCAPIInfraCR(ctx context.Context, c client.Client, cre
 		return nil, err
 	}
 
-	return kubevirtCluster, nil
+	return &corev1.ObjectReference{
+		APIVersion: capikubevirt.GroupVersion.String(),
+		Kind:       "KubevirtCluster",
+		Namespace:  kubevirtCluster.Namespace,
+		Name:       kubevirtCluster.Name,
+	}, nil
 }
 
 func reconcileKubevirtCluster(kubevirtCluster *capikubevirt.KubevirtCluster, hcluster *hyperv1.HostedCluster) {

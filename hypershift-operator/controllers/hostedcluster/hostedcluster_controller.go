@@ -24,7 +24,6 @@ import (
 	"net/netip"
 	"os"
 	"reflect"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -50,7 +49,6 @@ import (
 	etcdrecoverymanifests "github.com/openshift/hypershift/hypershift-operator/controllers/manifests/etcdrecovery"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/manifests/ignitionserver"
 	kvinfra "github.com/openshift/hypershift/kubevirtexternalinfra"
-	"github.com/openshift/hypershift/support/api"
 	"github.com/openshift/hypershift/support/azureutil"
 	"github.com/openshift/hypershift/support/capabilities"
 	"github.com/openshift/hypershift/support/certs"
@@ -99,7 +97,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -1338,29 +1335,57 @@ func (r *HostedClusterReconciler) reconcile(ctx context.Context, req ctrl.Reques
 
 	// Reconcile Platform specifics.
 	{
-		if err := p.ReconcileCredentials(ctx, r.Client, createOrUpdate, hcluster, controlPlaneNamespace.Name); err != nil {
-			meta.SetStatusCondition(&hcluster.Status.Conditions, metav1.Condition{
-				Type:               string(hyperv1.PlatformCredentialsFound),
-				Status:             metav1.ConditionFalse,
-				Reason:             hyperv1.PlatformCredentialsNotFoundReason,
-				ObservedGeneration: hcluster.Generation,
-				Message:            err.Error(),
-			})
-			if statusErr := r.Client.Status().Update(ctx, hcluster); statusErr != nil {
-				return ctrl.Result{}, fmt.Errorf("failed to reconcile platform credentials: %s, failed to update status: %w", err, statusErr)
-			}
-			return ctrl.Result{}, fmt.Errorf("failed to reconcile platform credentials: %w", err)
+		// Skip credential reconciliation if using the new provider model (infrastructureRef is set).
+		// In this case, the platform provider controller handles credential management.
+		// This currently applies to AWS when using the HostedAWSCluster provider.
+		skipCredentials := hcluster.Spec.InfrastructureRef != nil &&
+			hcluster.Spec.Platform.Type == hyperv1.AWSPlatform
+
+		if skipCredentials {
+			log.Info("Skipping credential reconciliation - managed by infrastructure provider controller",
+				"infrastructureRef", hcluster.Spec.InfrastructureRef)
 		}
-		if !meta.IsStatusConditionTrue(hcluster.Status.Conditions, string(hyperv1.PlatformCredentialsFound)) {
-			meta.SetStatusCondition(&hcluster.Status.Conditions, metav1.Condition{
-				Type:               string(hyperv1.PlatformCredentialsFound),
-				Status:             metav1.ConditionTrue,
-				Reason:             hyperv1.AsExpectedReason,
-				ObservedGeneration: hcluster.Generation,
-				Message:            "Required platform credentials are found",
-			})
-			if statusErr := r.Client.Status().Update(ctx, hcluster); statusErr != nil {
-				return ctrl.Result{}, fmt.Errorf("failed to reconcile platform credentials: %s, failed to update status: %w", err, statusErr)
+
+		if !skipCredentials {
+			if err := p.ReconcileCredentials(ctx, r.Client, createOrUpdate, hcluster, controlPlaneNamespace.Name); err != nil {
+				meta.SetStatusCondition(&hcluster.Status.Conditions, metav1.Condition{
+					Type:               string(hyperv1.PlatformCredentialsFound),
+					Status:             metav1.ConditionFalse,
+					Reason:             hyperv1.PlatformCredentialsNotFoundReason,
+					ObservedGeneration: hcluster.Generation,
+					Message:            err.Error(),
+				})
+				if statusErr := r.Client.Status().Update(ctx, hcluster); statusErr != nil {
+					return ctrl.Result{}, fmt.Errorf("failed to reconcile platform credentials: %s, failed to update status: %w", err, statusErr)
+				}
+				return ctrl.Result{}, fmt.Errorf("failed to reconcile platform credentials: %w", err)
+			}
+			if !meta.IsStatusConditionTrue(hcluster.Status.Conditions, string(hyperv1.PlatformCredentialsFound)) {
+				meta.SetStatusCondition(&hcluster.Status.Conditions, metav1.Condition{
+					Type:               string(hyperv1.PlatformCredentialsFound),
+					Status:             metav1.ConditionTrue,
+					Reason:             hyperv1.AsExpectedReason,
+					ObservedGeneration: hcluster.Generation,
+					Message:            "Required platform credentials are found",
+				})
+				if statusErr := r.Client.Status().Update(ctx, hcluster); statusErr != nil {
+					return ctrl.Result{}, fmt.Errorf("failed to reconcile platform credentials: %s, failed to update status: %w", err, statusErr)
+				}
+			}
+		} else {
+			// When using the provider model, set the condition to True if not already set
+			// The provider controller handles the actual credential creation
+			if !meta.IsStatusConditionTrue(hcluster.Status.Conditions, string(hyperv1.PlatformCredentialsFound)) {
+				meta.SetStatusCondition(&hcluster.Status.Conditions, metav1.Condition{
+					Type:               string(hyperv1.PlatformCredentialsFound),
+					Status:             metav1.ConditionTrue,
+					Reason:             hyperv1.AsExpectedReason,
+					ObservedGeneration: hcluster.Generation,
+					Message:            "Platform credentials managed by infrastructure provider controller",
+				})
+				if statusErr := r.Client.Status().Update(ctx, hcluster); statusErr != nil {
+					return ctrl.Result{}, fmt.Errorf("failed to update platform credentials status: %w", statusErr)
+				}
 			}
 		}
 	}
@@ -1732,16 +1757,26 @@ func (r *HostedClusterReconciler) reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// Reconcile CAPI Infra CR.
-	infraCR, err := p.ReconcileCAPIInfraCR(ctx, r.Client, createOrUpdate,
-		hcluster,
-		controlPlaneNamespace.Name,
-		hcp.Status.ControlPlaneEndpoint)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
+	// If infrastructureRef is set, use the provider-managed infrastructure instead of inline platform spec
+	var capiInfraCRRef *corev1.ObjectReference
+	if hcluster.Spec.InfrastructureRef != nil {
+		// Infrastructure is managed by a dedicated provider controller
+		log.Info("Using provider-managed infrastructure", "infrastructureRef", hcluster.Spec.InfrastructureRef)
 
-	if err := r.reconcileAWSSubnets(ctx, createOrUpdate, infraCR, req.Namespace, req.Name, controlPlaneNamespace.Name); err != nil {
-		return ctrl.Result{}, err
+		// Ensure ownership and retrieve CAPI infrastructure CR reference from the provider CR status
+		capiInfraCRRef, err = r.reconcileProviderInfrastructure(ctx, hcluster)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to reconcile provider infrastructure: %w", err)
+		}
+	} else {
+		// Traditional inline platform spec reconciliation
+		capiInfraCRRef, err = p.ReconcileCAPIInfraCR(ctx, r.Client, createOrUpdate,
+			hcluster,
+			controlPlaneNamespace.Name,
+			hcp.Status.ControlPlaneEndpoint)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	// Reconcile cluster prometheus RBAC resources if enabled
@@ -1752,11 +1787,11 @@ func (r *HostedClusterReconciler) reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// Reconcile the CAPI Cluster resource
-	// In the None platform case, there is no CAPI provider/resources so infraCR is nil
-	if infraCR != nil {
+	// In the None platform case, there is no CAPI provider/resources so infraCRRef is nil
+	if capiInfraCRRef != nil {
 		capiCluster := controlplaneoperator.CAPICluster(controlPlaneNamespace.Name, hcluster.Spec.InfraID)
 		_, err = createOrUpdate(ctx, r.Client, capiCluster, func() error {
-			return reconcileCAPICluster(capiCluster, hcluster, hcp, infraCR)
+			return reconcileCAPICluster(capiCluster, hcluster, hcp, capiInfraCRRef)
 		})
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to reconcile capi cluster: %w", err)
@@ -2366,11 +2401,19 @@ func reconcileHostedControlPlane(hcp *hyperv1.HostedControlPlane, hcluster *hype
 	hcp.Spec.ImageContentSources = hcluster.Spec.ImageContentSources
 
 	// Pass through Platform spec.
-	hcp.Spec.Platform = *hcluster.Spec.Platform.DeepCopy()
-	switch hcluster.Spec.Platform.Type {
-	case hyperv1.AgentPlatform:
-		// Agent platform uses None platform for the hcp.
-		hcp.Spec.Platform.Type = hyperv1.NonePlatform
+	// In provider mode (when infrastructureRef is set), the platform provider controller
+	// manages the HCP platform spec via Server-Side Apply, so we don't overwrite it here.
+	if hcluster.Spec.InfrastructureRef == nil {
+		hcp.Spec.Platform = *hcluster.Spec.Platform.DeepCopy()
+		switch hcluster.Spec.Platform.Type {
+		case hyperv1.AgentPlatform:
+			// Agent platform uses None platform for the hcp.
+			hcp.Spec.Platform.Type = hyperv1.NonePlatform
+		}
+	} else {
+		// In provider mode, only set the platform type, not the full spec
+		// The provider controller will manage the platform-specific configuration
+		hcp.Spec.Platform.Type = hcluster.Spec.Platform.Type
 	}
 
 	if hcluster.Spec.Configuration != nil {
@@ -2775,16 +2818,12 @@ func reconcilecontrolPlaneOperatorIngressOperatorRoleBinding(binding *rbacv1.Rol
 	return nil
 }
 
-func reconcileCAPICluster(cluster *capiv1.Cluster, hcluster *hyperv1.HostedCluster, hcp *hyperv1.HostedControlPlane, infraCR client.Object) error {
+func reconcileCAPICluster(cluster *capiv1.Cluster, hcluster *hyperv1.HostedCluster, hcp *hyperv1.HostedControlPlane, infraCRRef *corev1.ObjectReference) error {
 	// We only create this resource once and then let CAPI own it
 	if !cluster.CreationTimestamp.IsZero() {
 		// make sure cluster is not paused.
 		cluster.Spec.Paused = false
 		return nil
-	}
-	infraCRGVK, err := apiutil.GVKForObject(infraCR, api.Scheme)
-	if err != nil {
-		return fmt.Errorf("failed to get gvk for %T: %w", infraCR, err)
 	}
 
 	cluster.Annotations = map[string]string{
@@ -2798,12 +2837,7 @@ func reconcileCAPICluster(cluster *capiv1.Cluster, hcluster *hyperv1.HostedClust
 			Namespace:  hcp.Namespace,
 			Name:       hcp.Name,
 		},
-		InfrastructureRef: &corev1.ObjectReference{
-			APIVersion: infraCRGVK.GroupVersion().String(),
-			Kind:       infraCRGVK.Kind,
-			Namespace:  infraCR.GetNamespace(),
-			Name:       infraCR.GetName(),
-		},
+		InfrastructureRef: infraCRRef,
 	}
 
 	return nil
@@ -3639,6 +3673,12 @@ func (r *HostedClusterReconciler) validateAWSConfig(hc *hyperv1.HostedCluster) e
 		return nil
 	}
 
+	// Skip validation if using provider-managed infrastructure
+	// The provider CR will have its own validation
+	if hc.Spec.InfrastructureRef != nil {
+		return nil
+	}
+
 	if hc.Spec.Platform.AWS == nil {
 		return errors.New("aws cluster needs .spec.platform.aws to be filled")
 	}
@@ -4226,25 +4266,6 @@ func (r *HostedClusterReconciler) reconcileAWSResourceTags(ctx context.Context, 
 	return nil
 }
 
-func (r *HostedClusterReconciler) reconcileAWSSubnets(ctx context.Context, createOrUpdate upsert.CreateOrUpdateFN,
-	infraCR client.Object, namespace, clusterName, hcpNamespace string,
-) error {
-	nodePools, err := listNodePools(ctx, r.Client, namespace, clusterName)
-	if err != nil {
-		return fmt.Errorf("failed to get nodePools by cluster name for cluster %q: %w", clusterName, err)
-	}
-	subnetIDs := []string{}
-	for _, nodePool := range nodePools {
-		if nodePool.Spec.Platform.AWS != nil &&
-			nodePool.Spec.Platform.AWS.Subnet.ID != nil {
-			subnetIDs = append(subnetIDs, *nodePool.Spec.Platform.AWS.Subnet.ID)
-		}
-	}
-	// Sort for stable update detection (is this needed?)
-	sort.Strings(subnetIDs)
-	return nil
-}
-
 func (r *HostedClusterReconciler) lookupReleaseImage(ctx context.Context, hcluster *hyperv1.HostedCluster, releaseProvider releaseinfo.ProviderWithOpenShiftImageRegistryOverrides) (*releaseinfo.ReleaseImage, error) {
 	pullSecretBytes, err := hyperutil.GetPullSecretBytes(ctx, r.Client, hcluster)
 	if err != nil {
@@ -4640,6 +4661,7 @@ func (r *HostedClusterReconciler) getARNFromSecret(ctx context.Context, hcName, 
 	return credContent.Section("default").Key("role_arn").String(), nil
 }
 
+// TODO: move this to the platform/aws-provider package
 func (r *HostedClusterReconciler) dereferenceAWSRoles(ctx context.Context, hcName string, rolesRef *hyperv1.AWSRolesRef, ns string) error {
 	if strings.HasPrefix(rolesRef.NodePoolManagementARN, "arn-from-secret::") {
 		secretName := strings.TrimPrefix(rolesRef.NodePoolManagementARN, "arn-from-secret::")

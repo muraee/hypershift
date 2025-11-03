@@ -118,7 +118,9 @@ func DestroyCluster(ctx context.Context, o *core.DestroyOptions) error {
 	}
 	if hostedCluster != nil {
 		o.InfraID = hostedCluster.Spec.InfraID
-		o.AWSPlatform.Region = hostedCluster.Spec.Platform.AWS.Region
+		if hostedCluster.Spec.Platform.AWS != nil {
+			o.AWSPlatform.Region = hostedCluster.Spec.Platform.AWS.Region
+		}
 		o.AWSPlatform.BaseDomain = hostedCluster.Spec.DNS.BaseDomain
 
 		if hostedCluster.Spec.DNS.BaseDomainPrefix != nil {

@@ -1,0 +1,426 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.15.0
+  name: hostedawsclusters.infrastructure.hypershift.openshift.io
+spec:
+  group: infrastructure.hypershift.openshift.io
+  names:
+    kind: HostedAWSCluster
+    listKind: HostedAWSClusterList
+    plural: hostedawsclusters
+    shortNames:
+    - hawsc
+    singular: hostedawscluster
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - description: Infrastructure ready status
+      jsonPath: .status.ready
+      name: Ready
+      type: boolean
+    - description: AWS Region
+      jsonPath: .spec.region
+      name: Region
+      type: string
+    - description: Endpoint access type
+      jsonPath: .spec.endpointAccess
+      name: Endpoint Access
+      type: string
+    name: v1beta1
+    schema:
+      openAPIV3Schema:
+        description: HostedAWSCluster defines AWS infrastructure for a hosted cluster
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: HostedAWSClusterSpec defines the desired state of HostedAWSCluster
+            properties:
+              additionalAllowedPrincipals:
+                description: |-
+                  additionalAllowedPrincipals specifies a list of additional allowed principal ARNs
+                  to be added to the hosted control plane's VPC Endpoint Service to enable additional
+                  VPC Endpoint connection requests to be automatically accepted.
+                  See https://docs.aws.amazon.com/vpc/latest/privatelink/configure-endpoint-service.html
+                  for more details around VPC Endpoint Service allowed principals.
+                items:
+                  maxLength: 255
+                  type: string
+                maxItems: 25
+                type: array
+              cloudProviderConfig:
+                description: |-
+                  cloudProviderConfig specifies AWS networking configuration for the control
+                  plane.
+                  This is mainly used for cloud provider controller config:
+                  https://github.com/kubernetes/kubernetes/blob/f5be5052e3d0808abb904aebd3218fe4a5c2dd82/staging/src/k8s.io/legacy-cloud-providers/aws/aws.go#L1347-L1364
+                properties:
+                  subnet:
+                    description: subnet is the subnet to use for control plane cloud
+                      resources.
+                    properties:
+                      filters:
+                        description: |-
+                          filters is a set of key/value pairs used to identify a resource
+                          They are applied according to the rules defined by the AWS API:
+                          https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/Using_Filtering.html
+                        items:
+                          description: Filter is a filter used to identify an AWS
+                            resource
+                          properties:
+                            name:
+                              description: name is the name of the filter.
+                              maxLength: 255
+                              type: string
+                            values:
+                              description: values is a list of values for the filter.
+                              items:
+                                maxLength: 255
+                                type: string
+                              maxItems: 50
+                              type: array
+                          required:
+                          - name
+                          - values
+                          type: object
+                        maxItems: 50
+                        type: array
+                      id:
+                        description: id of resource
+                        maxLength: 255
+                        type: string
+                    type: object
+                  vpc:
+                    description: vpc is the VPC to use for control plane cloud resources.
+                    maxLength: 255
+                    type: string
+                  zone:
+                    description: |-
+                      zone is the availability zone where control plane cloud resources are
+                      created.
+                    maxLength: 255
+                    type: string
+                required:
+                - vpc
+                type: object
+              endpointAccess:
+                default: Public
+                description: |-
+                  endpointAccess specifies the publishing scope of cluster endpoints. The
+                  default is Public.
+                enum:
+                - Public
+                - PublicAndPrivate
+                - Private
+                type: string
+              region:
+                description: |-
+                  region is the AWS region in which the cluster resides. This configures the
+                  OCP control plane cloud integrations, and is used by NodePool to resolve
+                  the correct boot AMI for a given release.
+                maxLength: 255
+                type: string
+              resourceTags:
+                description: |-
+                  resourceTags is a list of additional tags to apply to AWS resources created
+                  for the cluster. See
+                  https://docs.aws.amazon.com/general/latest/gr/aws_tagging.html for
+                  information on tagging AWS resources. AWS supports a maximum of 50 tags per
+                  resource. OpenShift reserves 25 tags for its use, leaving 25 tags available
+                  for the user.
+                  Changes to this field will be propagated in-place to AWS resources (VPC Endpoints, EC2 instances, initial EBS volumes and default/endpoint security groups).
+                  These tags will be propagated to the infrastructure CR in the guest cluster, where other OCP operators might choose to honor this input to reconcile AWS resources created by them.
+                  Please consult the official documentation for a list of all AWS resources that support in-place tag updates.
+                  These take precedence over tags defined out of band (i.e., tags added manually or by other tools outside of HyperShift) in AWS in case of conflicts.
+                items:
+                  description: AWSResourceTag is a tag to apply to AWS resources created
+                    for the cluster.
+                  properties:
+                    key:
+                      description: key is the key of the tag.
+                      maxLength: 128
+                      minLength: 1
+                      pattern: ^[0-9A-Za-z_.:/=+-@]+$
+                      type: string
+                    value:
+                      description: |-
+                        value is the value of the tag.
+
+                        Some AWS service do not support empty values. Since tags are added to
+                        resources in many services, the length of the tag value must meet the
+                        requirements of all services.
+                      maxLength: 256
+                      minLength: 1
+                      pattern: ^[0-9A-Za-z_.:/=+-@]+$
+                      type: string
+                  required:
+                  - key
+                  - value
+                  type: object
+                maxItems: 25
+                type: array
+              rolesRef:
+                description: |-
+                  rolesRef contains references to various AWS IAM roles required to enable
+                  integrations such as OIDC.
+                properties:
+                  controlPlaneOperatorARN:
+                    description: controlPlaneOperatorARN  is an ARN value referencing
+                      a role appropriate for the Control Plane Operator.
+                    maxLength: 2048
+                    type: string
+                  imageRegistryARN:
+                    description: imageRegistryARN is an ARN value referencing a role
+                      appropriate for the Image Registry Operator.
+                    maxLength: 2048
+                    type: string
+                  ingressARN:
+                    description: ingressARN is an ARN value referencing a role appropriate
+                      for the Ingress Operator.
+                    maxLength: 2048
+                    type: string
+                  kubeCloudControllerARN:
+                    description: |-
+                      kubeCloudControllerARN is an ARN value referencing a role appropriate for the KCM/KCC.
+                      Refer to https://docs.aws.amazon.com/eks/latest/userguide/create-node-role.html
+                      for details about the required permissions for the role.
+                    maxLength: 2048
+                    type: string
+                  networkARN:
+                    description: networkARN is an ARN value referencing a role appropriate
+                      for the Network Operator.
+                    maxLength: 2048
+                    type: string
+                  nodePoolManagementARN:
+                    description: nodePoolManagementARN is an ARN value referencing
+                      a role appropriate for the CAPI controllers.
+                    maxLength: 2048
+                    type: string
+                  storageARN:
+                    description: storageARN is an ARN value referencing a role appropriate
+                      for the Storage Operator.
+                    maxLength: 2048
+                    type: string
+                required:
+                - controlPlaneOperatorARN
+                - imageRegistryARN
+                - ingressARN
+                - kubeCloudControllerARN
+                - networkARN
+                - nodePoolManagementARN
+                - storageARN
+                type: object
+              serviceEndpoints:
+                description: |-
+                  serviceEndpoints specifies optional custom endpoints which will override
+                  the default service endpoint of specific AWS Services.
+
+                  There must be only one ServiceEndpoint for a given service name.
+                items:
+                  description: |-
+                    AWSServiceEndpoint stores the configuration for services to
+                    override existing defaults of AWS Services.
+                  properties:
+                    name:
+                      description: |-
+                        name is the name of the AWS service.
+                        This must be provided and cannot be empty.
+                      maxLength: 255
+                      type: string
+                    url:
+                      description: |-
+                        url is fully qualified URI with scheme https, that overrides the default generated
+                        endpoint for a client.
+                        This must be provided and cannot be empty.
+                      maxLength: 2048
+                      pattern: ^https://
+                      type: string
+                  required:
+                  - name
+                  - url
+                  type: object
+                maxItems: 50
+                type: array
+              sharedVPC:
+                description: |-
+                  sharedVPC contains fields that must be specified if the HostedCluster must use a VPC that is
+                  created in a different AWS account and is shared with the AWS account where the HostedCluster
+                  will be created.
+                properties:
+                  localZoneID:
+                    description: |-
+                      localZoneID is the ID of the route53 hosted zone for [cluster-name].hypershift.local that is
+                      associated with the HostedCluster's VPC and exists in the VPC owner account.
+                    maxLength: 32
+                    type: string
+                  rolesRef:
+                    description: |-
+                      rolesRef contains references to roles in the VPC owner account that enable a
+                      HostedCluster on a shared VPC.
+                    properties:
+                      controlPlaneARN:
+                        description: |-
+                          controlPlaneARN is the ARN of the role in the VPC owner account that will
+                          be assumed to create cloud resources for the control plane.
+                        maxLength: 2048
+                        type: string
+                      ingressARN:
+                        description: |-
+                          ingressARN is the ARN of the role in the VPC owner account that will be
+                          assumed to create cloud resources for Ingress.
+                        maxLength: 2048
+                        type: string
+                    required:
+                    - controlPlaneARN
+                    - ingressARN
+                    type: object
+                required:
+                - localZoneID
+                - rolesRef
+                type: object
+            required:
+            - region
+            - rolesRef
+            type: object
+          status:
+            description: HostedAWSClusterStatus defines the observed state of HostedAWSCluster
+            properties:
+              conditions:
+                description: Conditions represent the latest available observations
+                  of the HostedAWSCluster's current state
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              infrastructureCRRef:
+                description: |-
+                  infrastructureCRRef is a reference to the CAPI infrastructure CR (AWSCluster)
+                  that was created by this provider controller.
+                  This allows the HyperShift operator to generically reference the infrastructure
+                  without knowing platform-specific details.
+                properties:
+                  apiVersion:
+                    description: API version of the referent.
+                    type: string
+                  fieldPath:
+                    description: |-
+                      If referring to a piece of an object instead of an entire object, this string
+                      should contain a valid JSON/Go field access statement, such as desiredState.manifest.containers[2].
+                      For example, if the object reference is to a container within a pod, this would take on a value like:
+                      "spec.containers{name}" (where "name" refers to the name of the container that triggered
+                      the event) or if no container name is specified "spec.containers[2]" (container with
+                      index 2 in this pod). This syntax is chosen only to have some well-defined way of
+                      referencing a part of an object.
+                    type: string
+                  kind:
+                    description: |-
+                      Kind of the referent.
+                      More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+                    type: string
+                  name:
+                    description: |-
+                      Name of the referent.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                  namespace:
+                    description: |-
+                      Namespace of the referent.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/namespaces/
+                    type: string
+                  resourceVersion:
+                    description: |-
+                      Specific resourceVersion to which this reference is made, if any.
+                      More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#concurrency-control-and-consistency
+                    type: string
+                  uid:
+                    description: |-
+                      UID of the referent.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#uids
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
+              observedGeneration:
+                description: ObservedGeneration is the last generation reconciled
+                  by the controller
+                format: int64
+                type: integer
+              ready:
+                description: Ready indicates infrastructure is ready
+                type: boolean
+            required:
+            - ready
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

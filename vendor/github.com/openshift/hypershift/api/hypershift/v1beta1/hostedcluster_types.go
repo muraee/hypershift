@@ -521,6 +521,16 @@ type HostedClusterSpec struct {
 	// +required
 	Platform PlatformSpec `json:"platform"`
 
+	// infrastructureRef is an optional reference to a provider-specific infrastructure resource
+	// that contains the infrastructure configuration for this hosted cluster.
+	// When set, the controller will use the referenced resource instead of the inline
+	// platform specification for infrastructure management.
+	// This enables separation of concerns where infrastructure is managed by dedicated
+	// platform provider controllers.
+	// The referenced resource must be in the same namespace as the HostedCluster.
+	// +optional
+	InfrastructureRef *corev1.ObjectReference `json:"infrastructureRef,omitempty"`
+
 	// kubeAPIServerDNSName specifies a desired DNS name to resolve to the KAS.
 	// When set, the controller will automatically generate a secret with kubeconfig and expose it in the hostedCluster Status.customKubeconfig field.
 	// If it's set or removed day 2, the kubeconfig generated secret will be created, recreated or deleted.

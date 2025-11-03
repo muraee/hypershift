@@ -18,6 +18,7 @@ import (
 	imgUtil "github.com/openshift/hypershift/support/util"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -44,8 +45,9 @@ type Platform interface {
 	// ReconcileCAPIInfraCR is called during HostedCluster reconciliation prior to reconciling the CAPI Cluster CR.
 	// Implementations should use the given input and client to create and update the desired state of the
 	// platform infrastructure CAPI CR, which will then be referenced by the CAPI Cluster CR.
+	// Returns an ObjectReference to the created/updated infrastructure CR.
 	// TODO (alberto): Pass createOrUpdate construct instead of client.
-	ReconcileCAPIInfraCR(ctx context.Context, c client.Client, createOrUpdate upsert.CreateOrUpdateFN, hcluster *hyperv1.HostedCluster, controlPlaneNamespace string, apiEndpoint hyperv1.APIEndpoint) (client.Object, error)
+	ReconcileCAPIInfraCR(ctx context.Context, c client.Client, createOrUpdate upsert.CreateOrUpdateFN, hcluster *hyperv1.HostedCluster, controlPlaneNamespace string, apiEndpoint hyperv1.APIEndpoint) (*corev1.ObjectReference, error)
 
 	// CAPIProviderDeploymentSpec is called during HostedCluster reconciliation prior to reconciling
 	// the CAPI provider Deployment.

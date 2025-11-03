@@ -13,6 +13,7 @@ import (
 	"github.com/openshift/hypershift/support/backwardcompat"
 	"github.com/openshift/hypershift/support/globalconfig"
 	karpenterutil "github.com/openshift/hypershift/support/karpenter"
+	"github.com/openshift/hypershift/support/platform"
 	"github.com/openshift/hypershift/support/upsert"
 	supportutil "github.com/openshift/hypershift/support/util"
 
@@ -135,8 +136,13 @@ func NewToken(ctx context.Context, configGenerator *ConfigGenerator, cpoCapabili
 	globalconfig.ReconcileProxyConfigWithStatusFromHostedCluster(proxy, configGenerator.hostedCluster)
 
 	ami := ""
-	if configGenerator.hostedCluster.Spec.Platform.AWS != nil {
-		ami, err = defaultNodePoolAMI(configGenerator.hostedCluster.Spec.Platform.AWS.Region, configGenerator.nodePool.Spec.Arch, configGenerator.releaseImage)
+	if configGenerator.hostedCluster.Spec.Platform.Type == hyperv1.AWSPlatform {
+		// Get AWS platform spec from either inline or provider CR
+		awsPlatformSpec, err := platform.GetAWSPlatformSpec(ctx, configGenerator.Client, configGenerator.hostedCluster)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get AWS platform spec: %w", err)
+		}
+		ami, err = defaultNodePoolAMI(awsPlatformSpec.Region, configGenerator.nodePool.Spec.Arch, configGenerator.releaseImage)
 		if err != nil {
 			return nil, err
 		}

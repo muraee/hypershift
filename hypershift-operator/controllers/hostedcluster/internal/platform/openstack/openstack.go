@@ -51,7 +51,7 @@ func New(capiProviderImage string, orcImage string, payloadVersion *semver.Versi
 }
 
 func (a OpenStack) ReconcileCAPIInfraCR(ctx context.Context, client client.Client, createOrUpdate upsert.CreateOrUpdateFN, hcluster *hyperv1.HostedCluster,
-	controlPlaneNamespace string, apiEndpoint hyperv1.APIEndpoint) (client.Object, error) {
+	controlPlaneNamespace string, apiEndpoint hyperv1.APIEndpoint) (*corev1.ObjectReference, error) {
 	openStackCluster := &capo.OpenStackCluster{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      hcluster.Name,
@@ -76,7 +76,13 @@ func (a OpenStack) ReconcileCAPIInfraCR(ctx context.Context, client client.Clien
 	}); err != nil {
 		return nil, err
 	}
-	return openStackCluster, nil
+
+	return &corev1.ObjectReference{
+		APIVersion: capo.SchemeGroupVersion.String(),
+		Kind:       "OpenStackCluster",
+		Namespace:  openStackCluster.Namespace,
+		Name:       openStackCluster.Name,
+	}, nil
 }
 
 func reconcileOpenStackClusterSpec(hcluster *hyperv1.HostedCluster, openStackClusterSpec *capo.OpenStackClusterSpec, apiEndpoint hyperv1.APIEndpoint) error {

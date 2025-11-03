@@ -7,6 +7,7 @@ import (
 	"github.com/openshift/hypershift/support/upsert"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -16,7 +17,7 @@ type None struct{}
 
 func (p None) ReconcileCAPIInfraCR(ctx context.Context, c client.Client, createOrUpdate upsert.CreateOrUpdateFN,
 	hcluster *hyperv1.HostedCluster,
-	controlPlaneNamespace string, apiEndpoint hyperv1.APIEndpoint) (client.Object, error) {
+	controlPlaneNamespace string, apiEndpoint hyperv1.APIEndpoint) (*corev1.ObjectReference, error) {
 
 	return nil, nil
 }

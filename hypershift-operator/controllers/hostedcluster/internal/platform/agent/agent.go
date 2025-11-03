@@ -35,7 +35,7 @@ type Agent struct{}
 
 func (p Agent) ReconcileCAPIInfraCR(ctx context.Context, c client.Client, createOrUpdate upsert.CreateOrUpdateFN,
 	hcluster *hyperv1.HostedCluster,
-	controlPlaneNamespace string, apiEndpoint hyperv1.APIEndpoint) (client.Object, error) {
+	controlPlaneNamespace string, apiEndpoint hyperv1.APIEndpoint) (*corev1.ObjectReference, error) {
 
 	// Ensure we create the agentCluster only after ignition endpoint exists
 	// so AgentClusterInstall is only created with the right ign to boot machines.
@@ -60,7 +60,12 @@ func (p Agent) ReconcileCAPIInfraCR(ctx context.Context, c client.Client, create
 		return nil, err
 	}
 
-	return agentCluster, nil
+	return &corev1.ObjectReference{
+		APIVersion: agentv1.GroupVersion.String(),
+		Kind:       "AgentCluster",
+		Namespace:  agentCluster.Namespace,
+		Name:       agentCluster.Name,
+	}, nil
 }
 
 func (p Agent) CAPIProviderDeploymentSpec(hcluster *hyperv1.HostedCluster, _ *hyperv1.HostedControlPlane) (*appsv1.DeploymentSpec, error) {

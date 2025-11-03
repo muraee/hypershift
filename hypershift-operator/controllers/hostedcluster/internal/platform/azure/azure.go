@@ -58,7 +58,7 @@ func (a Azure) ReconcileCAPIInfraCR(
 	hcluster *hyperv1.HostedCluster,
 	controlPlaneNamespace string,
 	apiEndpoint hyperv1.APIEndpoint,
-) (client.Object, error) {
+) (*corev1.ObjectReference, error) {
 	azureCluster := &capiazure.AzureCluster{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      hcluster.Name,
@@ -85,7 +85,12 @@ func (a Azure) ReconcileCAPIInfraCR(
 		return nil, fmt.Errorf("failed to reconcile Azure CAPI cluster: %w", err)
 	}
 
-	return azureCluster, nil
+	return &corev1.ObjectReference{
+		APIVersion: capiazure.GroupVersion.String(),
+		Kind:       "AzureCluster",
+		Namespace:  azureCluster.Namespace,
+		Name:       azureCluster.Name,
+	}, nil
 }
 
 func (a Azure) CAPIProviderDeploymentSpec(hcluster *hyperv1.HostedCluster, _ *hyperv1.HostedControlPlane) (*appsv1.DeploymentSpec, error) {

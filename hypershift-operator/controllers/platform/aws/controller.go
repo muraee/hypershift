@@ -11,6 +11,7 @@ import (
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	awsutil "github.com/openshift/hypershift/cmd/infra/aws/util"
 	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/manifests"
+	"github.com/openshift/hypershift/support/platform"
 	"github.com/openshift/hypershift/support/upsert"
 	supportutil "github.com/openshift/hypershift/support/util"
 
@@ -495,7 +496,13 @@ func (r *AWSEndpointServiceReconciler) reconcileAWSEndpointServiceStatus(ctx con
 		return fmt.Errorf("failed to get vpc endpoint permissions with service ID %s: %w", serviceID, err)
 	}
 
-	controlPlaneOperatorRoleARN, err := r.controlPlaneOperatorRoleARNWithoutPath(hostedCluster)
+	// Get AWS platform spec from either inline or provider CR
+	awsPlatformSpec, err := platform.GetAWSPlatformSpec(ctx, r.Client, hostedCluster)
+	if err != nil {
+		return fmt.Errorf("failed to get AWS platform spec: %w", err)
+	}
+
+	controlPlaneOperatorRoleARN, err := r.controlPlaneOperatorRoleARNWithoutPath(awsPlatformSpec)
 	if err != nil {
 		return fmt.Errorf("failed to get control plane operator role ARN: %w", err)
 	}
@@ -505,7 +512,7 @@ func (r *AWSEndpointServiceReconciler) reconcileAWSEndpointServiceStatus(ctx con
 		oldPerms.Insert(aws.StringValue(allowed.Principal))
 	}
 	desiredPerms := sets.NewString(controlPlaneOperatorRoleARN)
-	desiredPerms = desiredPerms.Insert(hostedCluster.Spec.Platform.AWS.AdditionalAllowedPrincipals...)
+	desiredPerms = desiredPerms.Insert(awsPlatformSpec.AdditionalAllowedPrincipals...)
 
 	if !desiredPerms.Equal(oldPerms) {
 		input := &ec2.ModifyVpcEndpointServicePermissionsInput{
@@ -695,18 +702,18 @@ func (r *AWSEndpointServiceReconciler) hostedCluster(ctx context.Context, hcp *h
 
 // controlPlaneOperatorRoleWithoutPathFn excludes the IAM path from an ARN, which is needed when adding the CPO
 // IAM role to AWS IAM trust policies, namely the AWS VPC Endpoint Service allowed principals' policy.
-func (r *AWSEndpointServiceReconciler) controlPlaneOperatorRoleARNWithoutPath(hc *hyperv1.HostedCluster) (string, error) {
-	if hc.Spec.Platform.AWS == nil || hc.Spec.Platform.AWS.RolesRef.ControlPlaneOperatorARN == "" {
+func (r *AWSEndpointServiceReconciler) controlPlaneOperatorRoleARNWithoutPath(awsPlatformSpec *hyperv1.AWSPlatformSpec) (string, error) {
+	if awsPlatformSpec.RolesRef.ControlPlaneOperatorARN == "" {
 		return "", fmt.Errorf("hosted cluster does not have control plane operator credentials")
 	}
-	arn, err := arn.Parse(hc.Spec.Platform.AWS.RolesRef.ControlPlaneOperatorARN)
+	roleARN, err := arn.Parse(awsPlatformSpec.RolesRef.ControlPlaneOperatorARN)
 	if err != nil {
-		return "", fmt.Errorf("failed to parse %s into an ARN: %v", hc.Spec.Platform.AWS.RolesRef.ControlPlaneOperatorARN, err)
+		return "", fmt.Errorf("failed to parse %s into an ARN: %v", awsPlatformSpec.RolesRef.ControlPlaneOperatorARN, err)
 	}
 
 	// IAM names cannot have a "/" while path names are the only way to get "/" into the name
 	// IAM path names must begin and end with a "/", so the last chunk will be the name of the IAM role
 	// https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_iam-quotas.html#reference_iam-quotas-names
-	name := arn.Resource[strings.LastIndex(arn.Resource, "/")+1:]
-	return fmt.Sprintf("arn:%s:%s::%s:role/%s", arn.Partition, arn.Service, arn.AccountID, name), nil
+	name := roleARN.Resource[strings.LastIndex(roleARN.Resource, "/")+1:]
+	return fmt.Sprintf("arn:%s:%s::%s:role/%s", roleARN.Partition, roleARN.Service, roleARN.AccountID, name), nil
 }

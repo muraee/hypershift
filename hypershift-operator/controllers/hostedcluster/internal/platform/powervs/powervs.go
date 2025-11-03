@@ -40,7 +40,7 @@ func (p PowerVS) DeleteCredentials(ctx context.Context, c client.Client, hcluste
 func (p PowerVS) ReconcileCAPIInfraCR(ctx context.Context, c client.Client, createOrUpdate upsert.CreateOrUpdateFN,
 	hcluster *hyperv1.HostedCluster,
 	controlPlaneNamespace string,
-	apiEndpoint hyperv1.APIEndpoint) (client.Object, error) {
+	apiEndpoint hyperv1.APIEndpoint) (*corev1.ObjectReference, error) {
 	ibmCluster := &capiibmv1.IBMPowerVSCluster{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: controlPlaneNamespace,
@@ -66,13 +66,13 @@ func (p PowerVS) ReconcileCAPIInfraCR(ctx context.Context, c client.Client, crea
 	if err != nil {
 		return nil, err
 	}
-	// reconciliation strips TypeMeta. We repopulate the static values since they are necessary for
-	// downstream reconciliation of the CAPI Cluster resource.
-	ibmCluster.TypeMeta = metav1.TypeMeta{
-		Kind:       "IBMPowerVSCluster",
+
+	return &corev1.ObjectReference{
 		APIVersion: capiibmv1.GroupVersion.String(),
-	}
-	return ibmCluster, nil
+		Kind:       "IBMPowerVSCluster",
+		Namespace:  ibmCluster.Namespace,
+		Name:       ibmCluster.Name,
+	}, nil
 }
 
 func (p PowerVS) CAPIProviderDeploymentSpec(hcluster *hyperv1.HostedCluster, _ *hyperv1.HostedControlPlane) (*appsv1.DeploymentSpec, error) {

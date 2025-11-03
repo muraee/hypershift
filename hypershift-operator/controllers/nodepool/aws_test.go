@@ -180,6 +180,7 @@ func TestAWSMachineTemplateSpec(t *testing.T) {
 				clusterStatus = *tc.clusterStatus
 			}
 			result, err := awsMachineTemplateSpec(infraName,
+				tc.cluster.Platform.AWS,
 				&hyperv1.HostedCluster{Spec: tc.cluster, Status: clusterStatus},
 				&hyperv1.NodePool{
 					ObjectMeta: metav1.ObjectMeta{

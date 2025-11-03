@@ -314,7 +314,7 @@ func Test_controlPlaneOperatorRoleARNWithoutPath(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			r := AWSEndpointServiceReconciler{}
-			actual, _ := r.controlPlaneOperatorRoleARNWithoutPath(test.hc)
+			actual, _ := r.controlPlaneOperatorRoleARNWithoutPath(test.hc.Spec.Platform.AWS)
 			if test.expected != actual {
 				t.Errorf("expected: %v, got %v", test.expected, actual)
 			}

@@ -284,6 +284,26 @@ and is used to configure platform specific behavior.</p>
 </tr>
 <tr>
 <td>
+<code>infrastructureRef</code></br>
+<em>
+<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.22/#objectreference-v1-core">
+Kubernetes core/v1.ObjectReference
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>infrastructureRef is an optional reference to a provider-specific infrastructure resource
+that contains the infrastructure configuration for this hosted cluster.
+When set, the controller will use the referenced resource instead of the inline
+platform specification for infrastructure management.
+This enables separation of concerns where infrastructure is managed by dedicated
+platform provider controllers.
+The referenced resource must be in the same namespace as the HostedCluster.</p>
+</td>
+</tr>
+<tr>
+<td>
 <code>kubeAPIServerDNSName</code></br>
 <em>
 string
@@ -5861,6 +5881,26 @@ PlatformSpec
 <td>
 <p>platform specifies the underlying infrastructure provider for the cluster
 and is used to configure platform specific behavior.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>infrastructureRef</code></br>
+<em>
+<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.22/#objectreference-v1-core">
+Kubernetes core/v1.ObjectReference
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>infrastructureRef is an optional reference to a provider-specific infrastructure resource
+that contains the infrastructure configuration for this hosted cluster.
+When set, the controller will use the referenced resource instead of the inline
+platform specification for infrastructure management.
+This enables separation of concerns where infrastructure is managed by dedicated
+platform provider controllers.
+The referenced resource must be in the same namespace as the HostedCluster.</p>
 </td>
 </tr>
 <tr>

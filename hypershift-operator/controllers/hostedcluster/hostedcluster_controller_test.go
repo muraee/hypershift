@@ -1028,7 +1028,7 @@ func TestReconcileCAPICluster(t *testing.T) {
 		capiCluster        *v1beta1.Cluster
 		hostedCluster      *hyperv1.HostedCluster
 		hostedControlPlane *hyperv1.HostedControlPlane
-		infraCR            crclient.Object
+		infraCRRef         *corev1.ObjectReference
 
 		expectedCAPICluster *v1beta1.Cluster
 	}{
@@ -1055,15 +1055,11 @@ func TestReconcileCAPICluster(t *testing.T) {
 					Name:      "cluster1",
 				},
 			},
-			infraCR: &capibmv1.IBMVPCCluster{
-				TypeMeta: metav1.TypeMeta{
-					Kind:       "IBMVPCCluster",
-					APIVersion: capibmv1.GroupVersion.String(),
-				},
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "cluster1",
-					Namespace: "master-cluster1",
-				},
+			infraCRRef: &corev1.ObjectReference{
+				APIVersion: capibmv1.GroupVersion.String(),
+				Kind:       "IBMVPCCluster",
+				Namespace:  "master-cluster1",
+				Name:       "cluster1",
 			},
 			expectedCAPICluster: &v1beta1.Cluster{
 				ObjectMeta: metav1.ObjectMeta{
@@ -1113,15 +1109,11 @@ func TestReconcileCAPICluster(t *testing.T) {
 					Name:      "cluster1",
 				},
 			},
-			infraCR: &capiaws.AWSCluster{
-				TypeMeta: metav1.TypeMeta{
-					Kind:       "AWSCluster",
-					APIVersion: capiaws.GroupVersion.String(),
-				},
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "cluster1",
-					Namespace: "master-cluster1",
-				},
+			infraCRRef: &corev1.ObjectReference{
+				APIVersion: capiaws.GroupVersion.String(),
+				Kind:       "AWSCluster",
+				Namespace:  "master-cluster1",
+				Name:       "cluster1",
 			},
 			expectedCAPICluster: &v1beta1.Cluster{
 				ObjectMeta: metav1.ObjectMeta{
@@ -1151,7 +1143,7 @@ func TestReconcileCAPICluster(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := reconcileCAPICluster(tc.capiCluster, tc.hostedCluster, tc.hostedControlPlane, tc.infraCR); err != nil {
+			if err := reconcileCAPICluster(tc.capiCluster, tc.hostedCluster, tc.hostedControlPlane, tc.infraCRRef); err != nil {
 				t.Fatalf("reconcileCAPICluster failed: %v", err)
 			}
 			if diff := cmp.Diff(tc.capiCluster, tc.expectedCAPICluster); diff != "" {

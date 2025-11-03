@@ -60,6 +60,7 @@ type RawCreateOptions struct {
 	PublicOnly                       bool
 	AutoNode                         bool
 	UseROSAManagedPolicies           bool
+	UseProviderArchitecture          bool
 }
 
 // validatedCreateOptions is a private wrapper that enforces a call of Validate() before Complete() can be invoked.
@@ -214,6 +215,13 @@ func (o *ValidatedCreateOptions) Complete(ctx context.Context, opts *core.Create
 }
 
 func (o *CreateOptions) ApplyPlatformSpecifics(cluster *hyperv1.HostedCluster) error {
+	// Use provider-based architecture if flag is set
+	if o.UseProviderArchitecture {
+		hostedAWSClusterName := fmt.Sprintf("%s-infra", cluster.Name)
+		return o.ApplyPlatformSpecificsForProvider(cluster, hostedAWSClusterName)
+	}
+
+	// Legacy path: embed platform spec in HostedCluster
 	tagMap, err := util.ParseAWSTags(o.AdditionalTags)
 	if err != nil {
 		return fmt.Errorf("failed to parse additional tags: %w", err)
@@ -432,6 +440,17 @@ func serviceAccountTokenIssuerSecret(namespace, name string) *corev1.Secret {
 
 func (o *CreateOptions) GenerateResources() ([]client.Object, error) {
 	var result []client.Object
+
+	// Use provider-based architecture if flag is set
+	if o.UseProviderArchitecture {
+		// Generate HostedAWSCluster Custom Resource
+		hostedAWSCluster, err := o.GenerateHostedAWSCluster(o.name)
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate HostedAWSCluster: %w", err)
+		}
+		result = append(result, hostedAWSCluster)
+	}
+
 	if o.infra.ProxyCA != "" {
 		cm := util.ConfigMapResource(o.namespace, o.proxyCAConfigMapName())
 		cm.Data = map[string]string{
@@ -502,6 +521,7 @@ func bindCoreOptions(opts *RawCreateOptions, flags *flag.FlagSet) {
 	flags.BoolVar(&opts.PrivateZonesInClusterAccount, "private-zones-in-cluster-account", opts.PrivateZonesInClusterAccount, "In shared VPC infrastructure, create private hosted zones in cluster account")
 	flags.BoolVar(&opts.PublicOnly, "public-only", opts.PublicOnly, "If true, creates a cluster that does not have private subnets or NAT gateway and assigns public IPs to all instances.")
 	flags.BoolVar(&opts.UseROSAManagedPolicies, "use-rosa-managed-policies", opts.UseROSAManagedPolicies, "Use ROSA managed policies for the operator roles and worker instance profile")
+	flags.BoolVar(&opts.UseProviderArchitecture, "use-provider-architecture", opts.UseProviderArchitecture, "If true, creates a cluster using the new provider-based architecture with HostedAWSCluster CRD (experimental)")
 
 	_ = flags.MarkDeprecated("multi-arch", "Multi-arch validation is now performed automatically based on the release image and signaled in the HostedCluster.Status.PayloadArch.")
 }

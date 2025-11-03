@@ -57,7 +57,7 @@ func (p AWS) ReconcileCAPIInfraCR(ctx context.Context, c client.Client, createOr
 	hcluster *hyperv1.HostedCluster,
 	controlPlaneNamespace string,
 	apiEndpoint hyperv1.APIEndpoint,
-) (client.Object, error) {
+) (*corev1.ObjectReference, error) {
 	awsCluster := &capiaws.AWSCluster{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: controlPlaneNamespace,
@@ -85,7 +85,13 @@ func (p AWS) ReconcileCAPIInfraCR(ctx context.Context, c client.Client, createOr
 	if err != nil {
 		return nil, err
 	}
-	return awsCluster, nil
+
+	return &corev1.ObjectReference{
+		APIVersion: capiaws.GroupVersion.String(),
+		Kind:       "AWSCluster",
+		Namespace:  awsCluster.Namespace,
+		Name:       awsCluster.Name,
+	}, nil
 }
 
 func (p AWS) CAPIProviderDeploymentSpec(hcluster *hyperv1.HostedCluster, hcp *hyperv1.HostedControlPlane) (*appsv1.DeploymentSpec, error) {

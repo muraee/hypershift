@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
+	"github.com/openshift/hypershift/support/platform"
 	"github.com/openshift/hypershift/support/releaseinfo"
 
 	corev1 "k8s.io/api/core/v1"
@@ -33,10 +34,9 @@ func awsClusterCloudProviderTagKey(id string) string {
 	return fmt.Sprintf("kubernetes.io/cluster/%s", id)
 }
 
-func awsMachineTemplateSpec(infraName string, hostedCluster *hyperv1.HostedCluster, nodePool *hyperv1.NodePool, defaultSG bool, releaseImage *releaseinfo.ReleaseImage) (*capiaws.AWSMachineTemplateSpec, error) {
-
+func awsMachineTemplateSpec(infraName string, awsPlatformSpec *hyperv1.AWSPlatformSpec, hostedCluster *hyperv1.HostedCluster, nodePool *hyperv1.NodePool, defaultSG bool, releaseImage *releaseinfo.ReleaseImage) (*capiaws.AWSMachineTemplateSpec, error) {
 	var ami string
-	region := hostedCluster.Spec.Platform.AWS.Region
+	region := awsPlatformSpec.Region
 	arch := nodePool.Spec.Arch
 	if nodePool.Spec.Platform.AWS.AMI != "" {
 		ami = nodePool.Spec.Platform.AWS.AMI
@@ -136,7 +136,7 @@ func awsMachineTemplateSpec(infraName string, hostedCluster *hyperv1.HostedClust
 				AdditionalSecurityGroups: securityGroups,
 				Subnet:                   subnet,
 				RootVolume:               rootVolume,
-				AdditionalTags:           awsAdditionalTags(nodePool, hostedCluster, infraName),
+				AdditionalTags:           awsAdditionalTags(nodePool, awsPlatformSpec, infraName),
 				InstanceMetadataOptions:  instanceMetadataOptions,
 			},
 		},
@@ -171,9 +171,9 @@ func awsMachineTemplateSpec(infraName string, hostedCluster *hyperv1.HostedClust
 	return awsMachineTemplateSpec, nil
 }
 
-func awsAdditionalTags(nodePool *hyperv1.NodePool, hostedCluster *hyperv1.HostedCluster, infraName string) capiaws.Tags {
+func awsAdditionalTags(nodePool *hyperv1.NodePool, awsPlatformSpec *hyperv1.AWSPlatformSpec, infraName string) capiaws.Tags {
 	tags := capiaws.Tags{}
-	for _, tag := range append(nodePool.Spec.Platform.AWS.ResourceTags, hostedCluster.Spec.Platform.AWS.ResourceTags...) {
+	for _, tag := range append(nodePool.Spec.Platform.AWS.ResourceTags, awsPlatformSpec.ResourceTags...) {
 		tags[tag.Key] = tag.Value
 	}
 
@@ -187,7 +187,13 @@ func awsAdditionalTags(nodePool *hyperv1.NodePool, hostedCluster *hyperv1.Hosted
 }
 
 func (c *CAPI) awsMachineTemplate(ctx context.Context, templateNameGenerator func(spec any) (string, error)) (*capiaws.AWSMachineTemplate, error) {
-	desiredSpec, err := awsMachineTemplateSpec(c.capiClusterName, c.hostedCluster, c.nodePool, c.cpoCapabilities.CreateDefaultAWSSecurityGroup, c.releaseImage)
+	// Get AWS platform spec from either inline or provider CR
+	awsPlatformSpec, err := platform.GetAWSPlatformSpec(ctx, c.Client, c.hostedCluster)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get AWS platform spec: %w", err)
+	}
+
+	desiredSpec, err := awsMachineTemplateSpec(c.capiClusterName, awsPlatformSpec, c.hostedCluster, c.nodePool, c.cpoCapabilities.CreateDefaultAWSSecurityGroup, c.releaseImage)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate AWSMachineTemplateSpec: %w", err)
 	}
@@ -228,6 +234,12 @@ func (c *CAPI) awsMachineTemplate(ctx context.Context, templateNameGenerator fun
 }
 
 func (c *CAPI) reconcileAWSMachines(ctx context.Context) error {
+	// Get AWS platform spec from either inline or provider CR
+	awsPlatformSpec, err := platform.GetAWSPlatformSpec(ctx, c.Client, c.hostedCluster)
+	if err != nil {
+		return fmt.Errorf("failed to get AWS platform spec: %w", err)
+	}
+
 	awsMachines := &capiaws.AWSMachineList{}
 	if err := c.List(ctx, awsMachines, client.InNamespace(c.controlplaneNamespace), client.MatchingLabels{
 		capiv1.MachineDeploymentNameLabel: c.nodePool.Name,
@@ -238,7 +250,7 @@ func (c *CAPI) reconcileAWSMachines(ctx context.Context) error {
 	var errs []error
 	for _, machine := range awsMachines.Items {
 		if _, err := controllerutil.CreateOrPatch(ctx, c.Client, &machine, func() error {
-			machine.Spec.AdditionalTags = awsAdditionalTags(c.nodePool, c.hostedCluster, c.capiClusterName)
+			machine.Spec.AdditionalTags = awsAdditionalTags(c.nodePool, awsPlatformSpec, c.capiClusterName)
 			return nil
 		}); err != nil {
 			errs = append(errs, fmt.Errorf("failed to reconcile AWSMachine %s: %w", machine.Name, err))
@@ -250,15 +262,18 @@ func (c *CAPI) reconcileAWSMachines(ctx context.Context) error {
 
 func (r *NodePoolReconciler) setAWSConditions(ctx context.Context, nodePool *hyperv1.NodePool, hcluster *hyperv1.HostedCluster, controlPlaneNamespace string, releaseImage *releaseinfo.ReleaseImage) error {
 	if nodePool.Spec.Platform.Type == hyperv1.AWSPlatform {
-		if hcluster.Spec.Platform.AWS == nil {
-			return fmt.Errorf("the HostedCluster for this NodePool has no .Spec.Platform.AWS, this is unsupported")
+		// Get AWS platform spec from either inline or provider CR
+		awsPlatformSpec, err := platform.GetAWSPlatformSpec(ctx, r.Client, hcluster)
+		if err != nil {
+			return fmt.Errorf("failed to get AWS platform spec: %w", err)
 		}
+
 		if nodePool.Spec.Platform.AWS.AMI != "" {
 			// User-defined AMIs cannot be validated
 			removeStatusCondition(&nodePool.Status.Conditions, hyperv1.NodePoolValidPlatformImageType)
 		} else {
 			// TODO: Should the region be included in the NodePool platform information?
-			ami, err := defaultNodePoolAMI(hcluster.Spec.Platform.AWS.Region, nodePool.Spec.Arch, releaseImage)
+			ami, err := defaultNodePoolAMI(awsPlatformSpec.Region, nodePool.Spec.Arch, releaseImage)
 			if err != nil {
 				SetStatusCondition(&nodePool.Status.Conditions, hyperv1.NodePoolCondition{
 					Type:               hyperv1.NodePoolValidPlatformImageType,

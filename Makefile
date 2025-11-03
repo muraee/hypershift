@@ -242,6 +242,20 @@ cluster-api-provider-openstack: $(CONTROLLER_GEN)
 api-docs: $(GENAPIDOCS)
 	hack/gen-api-docs.sh $(GENAPIDOCS) $(DIR)
 
+## Platform Providers
+
+.PHONY: aws-provider-api
+aws-provider-api: ## Generate AWS provider CRDs and deepcopy
+	$(MAKE) -C providers/aws api
+
+.PHONY: install-aws-provider-crds
+install-aws-provider-crds: ## Install AWS provider CRDs
+	$(MAKE) -C providers/aws install-crds
+
+.PHONY: aws-provider
+aws-provider: ## Build AWS provider binary
+	$(MAKE) -C providers/aws build
+
 .PHONY: clients
 clients: delegating_client
 	GOWORK=off GO=GO111MODULE=on GOFLAGS=-mod=readonly hack/update-codegen.sh

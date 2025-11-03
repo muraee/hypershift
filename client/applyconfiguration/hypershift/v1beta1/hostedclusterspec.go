@@ -33,6 +33,7 @@ type HostedClusterSpecApplyConfiguration struct {
 	UpdateService                    *v1.URL                                              `json:"updateService,omitempty"`
 	Channel                          *string                                              `json:"channel,omitempty"`
 	Platform                         *PlatformSpecApplyConfiguration                      `json:"platform,omitempty"`
+	InfrastructureRef                *corev1.ObjectReference                              `json:"infrastructureRef,omitempty"`
 	KubeAPIServerDNSName             *string                                              `json:"kubeAPIServerDNSName,omitempty"`
 	ControllerAvailabilityPolicy     *hypershiftv1beta1.AvailabilityPolicy                `json:"controllerAvailabilityPolicy,omitempty"`
 	InfrastructureAvailabilityPolicy *hypershiftv1beta1.AvailabilityPolicy                `json:"infrastructureAvailabilityPolicy,omitempty"`
@@ -120,6 +121,14 @@ func (b *HostedClusterSpecApplyConfiguration) WithChannel(value string) *HostedC
 // If called multiple times, the Platform field is set to the value of the last call.
 func (b *HostedClusterSpecApplyConfiguration) WithPlatform(value *PlatformSpecApplyConfiguration) *HostedClusterSpecApplyConfiguration {
 	b.Platform = value
+	return b
+}
+
+// WithInfrastructureRef sets the InfrastructureRef field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the InfrastructureRef field is set to the value of the last call.
+func (b *HostedClusterSpecApplyConfiguration) WithInfrastructureRef(value corev1.ObjectReference) *HostedClusterSpecApplyConfiguration {
+	b.InfrastructureRef = &value
 	return b
 }
 

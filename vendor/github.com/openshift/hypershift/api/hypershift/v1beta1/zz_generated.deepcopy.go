@@ -1547,6 +1547,11 @@ func (in *HostedClusterSpec) DeepCopyInto(out *HostedClusterSpec) {
 		**out = **in
 	}
 	in.Platform.DeepCopyInto(&out.Platform)
+	if in.InfrastructureRef != nil {
+		in, out := &in.InfrastructureRef, &out.InfrastructureRef
+		*out = new(corev1.ObjectReference)
+		**out = **in
+	}
 	in.DNS.DeepCopyInto(&out.DNS)
 	in.Networking.DeepCopyInto(&out.Networking)
 	in.Autoscaling.DeepCopyInto(&out.Autoscaling)
