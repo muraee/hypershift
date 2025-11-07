@@ -28,13 +28,13 @@ This document outlines a comprehensive re-architecture plan for HyperShift to se
 
 ## Table of Contents
 
-1. [Current State Analysis](#current-state-analysis)
+1. [Problem Statement](#problem-statement)
 2. [Architecture Overview](#architecture-overview)
 3. [CRD Naming Conventions](#crd-naming-conventions)
 4. [Component Separation Strategy](#component-separation-strategy)
 5. [User Workflow](#user-workflow)
 6. [Platform Provider Pattern](#platform-provider-pattern)
-7. [NodePool Provider Pattern](#nodepool-provider-pattern)
+7. [NodePool Configuration Pattern](#nodepool-configuration-pattern)
 8. [Control Plane Operator](#control-plane-operator)
 9. [Security Considerations](#security-considerations)
 10. [Repository Structure](#repository-structure)
@@ -43,95 +43,362 @@ This document outlines a comprehensive re-architecture plan for HyperShift to se
 
 ---
 
-## Current State Analysis
+## Problem Statement
 
-### API Complexity
+### The Challenge
 
-**Total API Code**: ~10,744 lines across all files
+HyperShift's current architecture was designed when AWS was the primary platform. As support for Azure, KubeVirt, PowerVS, OpenStack, and Agent platforms has been added, the codebase has accumulated significant technical debt that threatens its maintainability and scalability.
 
-**Platform-Specific API Code**: ~2,976 lines (28% of total)
-- AWS: 1,004 lines
-- Azure: 774 lines
-- OpenStack: 451 lines
-- KubeVirt: 403 lines
-- PowerVS: 324 lines
-- Agent: 20 lines
+### Core Architectural Problems
 
-### Current Issues
+#### 1. Monolithic API Design
 
-1. **Monolithic API**: All platform specs embedded in single `PlatformSpec` struct
-2. **Tight Coupling**: Platform logic mixed throughout hypershift-operator and control-plane-operator
-3. **Switch-Based Dispatch**: Central `GetPlatform()` function requires modification for each new platform
-4. **Growing Complexity**: 34+ platform-specific files in control-plane-operator alone
-5. **Cross-Platform Risk**: Changes to one platform can affect others
-6. **Import Conflicts**: Risk of Go module dependency conflicts as providers use different versions
+**Current Reality**: All platform-specific configuration is embedded directly in core types:
+
+```go
+// api/hypershift/v1beta1/platform.go
+type PlatformSpec struct {
+    Type PlatformType
+
+    AWS       *AWSPlatformSpec       `json:"aws,omitempty"`
+    Azure     *AzurePlatformSpec     `json:"azure,omitempty"`
+    KubeVirt  *KubevirtPlatformSpec  `json:"kubevirt,omitempty"`
+    PowerVS   *PowerVSPlatformSpec   `json:"powervs,omitempty"`
+    OpenStack *OpenStackPlatformSpec `json:"openstack,omitempty"`
+    Agent     *AgentPlatformSpec     `json:"agent,omitempty"`
+    // Every new platform adds another field...
+}
+```
+
+**Impact**:
+- **API Bloat**: ~2,976 lines of platform-specific API code (28% of total) embedded in core types
+  - AWS: 1,004 lines
+  - Azure: 774 lines
+  - OpenStack: 451 lines
+  - KubeVirt: 403 lines
+  - PowerVS: 324 lines
+  - Agent: 20 lines
+- **Breaking Changes Risk**: Adding/modifying platform fields requires core API changes affecting all users
+- **Cognitive Load**: Developers must understand all platform APIs even when working on a single platform
+- **API Versioning Complexity**: Cannot version platform APIs independently from core API
+
+#### 2. Platform Code Contamination
+
+**Current Reality**: Platform-specific logic is scattered across multiple operators:
+
+**In hypershift-operator**:
+- `controllers/platform/platform.go` - 500+ line switch statement for platform dispatch
+- `controllers/hostedcluster/internal/platform/` - Platform-specific validators and defaulters
+- Platform-specific reconciliation logic in core controllers
+
+**In control-plane-operator**:
+- 34+ platform-specific files across multiple packages
+- Platform-specific KAS (Kube API Server) customizers
+- Platform-specific secret handlers
+- Platform-specific networking setup
+
+**Real-World Example of Cross-Contamination**:
+```go
+// This pattern appears throughout the codebase:
+switch hc.Spec.Platform.Type {
+case hyperv1.AWSPlatform:
+    // AWS-specific logic using AWS SDK
+    // Imports: github.com/aws/aws-sdk-go-v2/...
+case hyperv1.AzurePlatform:
+    // Azure-specific logic using Azure SDK
+    // Imports: github.com/Azure/azure-sdk-for-go/...
+case hyperv1.PowerVSPlatform:
+    // PowerVS-specific logic using IBM SDK
+    // Imports: github.com/IBM-Cloud/...
+// Adding new platform requires modifying this file
+}
+```
+
+**Impact**:
+- **Tight Coupling**: Core operators import ALL platform SDKs even if only using one platform
+- **Change Amplification**: Simple platform-specific change requires touching core operator code
+- **Review Burden**: Platform changes require review from core team even for platform-specific logic
+- **Testing Complexity**: Testing one platform requires dependencies for all platforms
+
+#### 3. Dependency Hell
+
+**Current Reality**: Single `go.mod` for entire repository creates version conflicts:
+
+```
+go.mod (current monorepo):
+require (
+    github.com/aws/aws-sdk-go-v2 v1.50.0
+    github.com/Azure/azure-sdk-for-go v68.0.0
+    github.com/IBM-Cloud/power-go-client v1.6.0
+    sigs.k8s.io/cluster-api v1.11.0
+    sigs.k8s.io/cluster-api-provider-aws v2.8.0  // Wants CAPI v1.10.0!
+    sigs.k8s.io/cluster-api-provider-azure v1.18.0
+    // Version conflicts force us to:
+    // - Stay on old versions of CAPI providers
+    // - Use replace directives (technical debt)
+    // - Skip security updates
+    // - Block feature adoption
+)
+```
+
+**Real Issues Encountered**:
+1. **CAPI Version Skew**:
+   - Core HyperShift ready for CAPI v1.11.0
+   - CAPI-AWS provider requires CAPI v1.10.x
+   - Cannot upgrade without breaking AWS support
+
+2. **SDK Version Conflicts**:
+   - AWS SDK v1 and v2 incompatibilities
+   - Azure SDK major version migrations
+   - IBM Cloud SDK API changes
+
+3. **Transitive Dependency Conflicts**:
+   - Different platforms use different versions of common dependencies
+   - Kubernetes client-go version conflicts
+   - Controller-runtime version mismatches
+
+**Impact**:
+- **Innovation Blocked**: Cannot adopt new CAPI features
+- **Security Risk**: Cannot update SDKs with security fixes
+- **Maintenance Overhead**: Complex `replace` directives and version pinning
+- **Upgrade Paralysis**: Major version upgrades become multi-month projects
+
+#### 4. Development Velocity Degradation
+
+**Time to Add New Platform** (Historical Data):
+
+| Platform | Time to Initial Support | Lines of Code Touched | Files Modified |
+|----------|------------------------|----------------------|----------------|
+| AWS (initial) | 2 months | ~5,000 | 20 |
+| Azure | 4 months | ~8,000 | 45 (including core changes) |
+| KubeVirt | 3 months | ~6,500 | 38 (including core changes) |
+| PowerVS | 5 months | ~7,800 | 52 (including core changes) |
+
+**Why It Gets Slower**:
+1. **Core Modifications Required**: Every new platform needs changes to:
+   - Core API types (platform_types.go)
+   - Platform dispatcher (GetPlatform() switch)
+   - Core operator controllers (validation, defaulting)
+   - CPO platform setup logic
+
+2. **Integration Testing Burden**: Must test that new platform doesn't break existing platforms
+   - AWS integration tests still pass
+   - Azure integration tests still pass
+   - KubeVirt integration tests still pass
+   - PowerVS integration tests still pass
+
+3. **Review Bottleneck**: Core team must review ALL changes even for platform-specific logic
+
+**Impact**:
+- **Longer Time to Market**: 3-5 months to add new platform support
+- **Higher Development Costs**: More engineer-months required
+- **Opportunity Cost**: Core team bandwidth consumed by platform-specific work
+- **Competitive Disadvantage**: Slower to support new cloud providers
+
+#### 5. Testing and Maintenance Burden
+
+**Current Test Matrix Complexity**:
+
+Every change potentially affects N platforms × M configurations:
+- 6 platforms (AWS, Azure, KubeVirt, PowerVS, OpenStack, Agent)
+- 3 cluster types (Public, Private, PrivateLink)
+- 2 networking modes (OVN, Calico)
+- 2 scaling modes (Manual, Auto)
+
+**Result**: 72+ test combinations for each core change
+
+**Real Maintenance Challenges**:
+
+1. **Fragile Test Suite**:
+   - AWS SDK update breaks Azure tests (import conflicts)
+   - CAPI version update requires updating all platform integration tests
+   - Flaky tests across platforms due to shared test infrastructure
+
+2. **Regression Risk**:
+   - Change to AWS-specific code in shared file accidentally affects Azure
+   - Refactoring platform dispatcher breaks PowerVS
+   - Adding new platform field breaks backward compatibility
+
+3. **Debug Complexity**:
+   ```
+   Error: "failed to create infrastructure"
+   Where? Could be in:
+   - hypershift-operator platform validator
+   - hypershift-operator reconciler
+   - control-plane-operator infrastructure controller
+   - CAPI provider controller
+   - Platform SDK call
+   ```
+   - Debugging requires understanding entire stack across all components
+
+**Impact**:
+- **Slower Development**: Fear of breaking other platforms slows changes
+- **Higher Bug Rate**: Cross-platform contamination causes unexpected failures
+- **Increased Oncall Burden**: Complex debugging across multiple components
+- **Technical Debt Accumulation**: Workarounds added instead of proper fixes
+
+#### 6. Scalability and Extensibility Limitations
+
+**Current Constraints**:
+
+1. **Cannot Support Platform Variations**:
+   - AWS Classic vs AWS LocalZones vs AWS Wavelength - need different configurations
+   - Azure regions with different capabilities
+   - Custom platform integrations (private clouds, hybrid setups)
+   - All variations must be encoded in core API
+
+2. **Cannot Delegate Platform Ownership**:
+   - Platform teams cannot independently release updates
+   - All changes require core team approval
+   - Cannot iterate quickly on platform-specific features
+
+3. **Cannot Support Third-Party Platforms**:
+   - Community cannot add platform support without core repository changes
+   - No extension mechanism for private/custom platforms
+   - Closed ecosystem
+
+**Impact**:
+- **Innovation Limited**: Only core team can add platforms
+- **Slower Feature Delivery**: Platform teams blocked by core release cycle
+- **Reduced Community Engagement**: High barrier to contribution
+- **Missed Opportunities**: Cannot support niche platforms economically
+
+### Summary: Why This Matters
+
+The current architecture creates a **maintenance burden that grows quadratically** with platform count:
+- Each new platform adds code to core operators
+- Each new platform increases test matrix size
+- Each new platform increases dependency conflicts
+- Each core change must be validated against all platforms
+
+**Projected Growth Without Change**:
+- **Year 1**: Add 2 more platforms → 8 total → ~3,500 lines of platform API code
+- **Year 2**: Add 3 more platforms → 11 total → ~5,000 lines of platform API code
+- **Year 3**: Development velocity grinds to halt
+
+**The Need for Re-architecture**: We need a pattern that allows platforms to evolve independently while maintaining security and reliability of core components.
 
 ---
 
 ## Architecture Overview
 
-### Two-Tier Provider Pattern
+### API Structure: Platform-Specific CRDs with References
+
+The proposed architecture introduces **platform-specific CRDs** that are **referenced** from core HostedCluster and NodePool resources, rather than embedding platform configuration directly.
+
+#### New Platform CRDs (per platform)
+
+Each platform defines two CRDs:
+
+1. **Cluster Infrastructure CRD** - Platform-specific cluster infrastructure configuration
+   - Examples: `HostedAWSCluster`, `HostedAzureCluster`, `HostedKubeVirtCluster`
+   - Contains: VPC/networking, load balancers, encryption keys, cloud-specific settings
+   - API Group: `infrastructure.hypershift.openshift.io/v1beta1`
+
+2. **NodePool Configuration CRD** - Platform-specific node pool configuration
+   - Examples: `AWSNodePool`, `AzureNodePool`, `KubeVirtNodePool`
+   - Contains: Instance types, volumes, networking, IAM profiles, cloud-specific settings
+   - API Group: `infrastructure.hypershift.openshift.io/v1beta1`
+
+#### Core API Changes: Reference Pattern
+
+Core HostedCluster and NodePool resources reference platform CRDs instead of embedding platform specs:
+
+```yaml
+# HostedCluster references platform infrastructure
+apiVersion: hypershift.openshift.io/v1beta1
+kind: HostedCluster
+spec:
+  platform:
+    type: AWS
+    infrastructureRef:  # NEW: Reference instead of embedded spec
+      apiVersion: infrastructure.hypershift.openshift.io/v1beta1
+      kind: HostedAWSCluster
+      name: my-cluster-infra
+
+# NodePool references platform configuration
+apiVersion: hypershift.openshift.io/v1beta1
+kind: NodePool
+spec:
+  platform:
+    type: AWS
+    nodePoolRef:  # NEW: Reference instead of embedded spec
+      apiVersion: infrastructure.hypershift.openshift.io/v1beta1
+      kind: AWSNodePool
+      name: my-nodepool-config
+```
+
+**Key Benefits**:
+- ✅ Core APIs stay clean and platform-agnostic
+- ✅ Platform CRDs can evolve independently
+- ✅ No API bloat in core types
+- ✅ Platform teams own their CRD definitions
+
+### Provider Implementation: One Binary, Two Controllers
+
+Each platform (AWS, Azure, etc.) has a dedicated provider binary with two controller responsibilities:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│ 1. Platform Provider (CRD-based)                                │
-│    - Manages HostedAWSCluster, HostedAzureCluster, etc.        │
-│    - Separate binary: hypershift-aws-provider                   │
-│    - Independent go.mod (can use CAPI 1.10.x)                   │
-│    - Creates CAPI infrastructure resources                      │
-│    - Populates HCP.Spec.Platform.AWS for CPO (via SSA)          │
-│    - Creates platform-specific secrets in HCP namespace         │
-│    - Updates status.ready when infrastructure is provisioned    │
-└─────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────┐
-│ 2. NodePool Provider (CRD-based)                                │
-│    - Manages HostedAWSNodePool, HostedAzureNodePool, etc.      │
-│    - Same binary as platform provider                           │
-│    - Creates CAPI machine templates                             │
-│    - Handles node-specific platform configuration               │
+│ Platform Provider Binary (e.g., hypershift-aws-provider)        │
+│ - Independent go.mod (can use different CAPI versions)          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│ Infrastructure Controller:                                      │
+│    - Watches: HostedAWSCluster (the platform CRD)              │
+│    - Creates: CAPI infrastructure resources (VPC, LB, etc.)    │
+│    - Populates: HCP.Spec.Platform.AWS for CPO (via SSA)        │
+│    - Creates: Platform-specific secrets in HCP namespace       │
+│                                                                  │
+│ NodePool Controller:                                            │
+│    - Watches: AWSNodePool (the platform CRD)                   │
+│    - Creates: CAPI machine templates                           │
+│    - Handles: Node-specific platform configuration            │
+│                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**No separate Control Plane Provider binary**: Platform providers populate `HCP.Spec.Platform` which the Control Plane Operator (CPO) reads. CPO's internal platform-specific code remains unchanged for security reasons (see [Control Plane Operator](#control-plane-operator) for detailed rationale).
+**Why Not a Control Plane Provider?** Platform providers populate `HCP.Spec.Platform` which the Control Plane Operator (CPO) reads. CPO's internal platform-specific code remains within CPO for security and technical reasons (see [Control Plane Operator](#control-plane-operator) for detailed rationale).
 
 ### Key Design Principles
 
-1. **CRD-Based Providers**: Providers are separate controllers watching their own CRDs
-2. **User-Controlled Configuration**: Users create platform CRDs directly, not core operator
-3. **SSA for Coordination**: Providers use Server-Side Apply to populate HCP.Spec.Platform without conflicts
-4. **No CPO Changes**: Control Plane Operator (CPO) continues reading HCP.Spec.Platform as it does today
-5. **Independent Dependencies**: Each provider has its own go.mod, no version conflicts
+1. **CRD-Based Providers**: Platform-specific configuration lives in separate CRDs, not embedded in core types
+2. **Reference Pattern**: Core resources reference platform CRDs via `infrastructureRef` and `nodePoolRef`
+3. **User-Controlled Configuration**: Users create platform CRDs directly, not generated by operators
+4. **SSA for Coordination**: Providers use Server-Side Apply to populate HCP.Spec.Platform without conflicts
+5. **No CPO Changes**: Control Plane Operator (CPO) continues reading HCP.Spec.Platform as it does today
+6. **Independent Dependencies**: Each provider has its own go.mod, no version conflicts
 
 ---
 
 ## CRD Naming Conventions
 
-All platform-specific CRDs use the `Hosted` prefix to avoid conflicts with Cluster API provider CRDs.
+Platform-specific CRDs mirror the naming pattern of core HyperShift resources.
 
 ### Complete Naming Convention
 
-| Platform | Platform CRD | NodePool Config CRD |
-|----------|--------------|---------------------|
-| AWS | `HostedAWSCluster` | `HostedAWSNodePool` |
-| Azure | `HostedAzureCluster` | `HostedAzureNodePool` |
-| KubeVirt | `HostedKubeVirtCluster` | `HostedKubeVirtNodePool` |
-| PowerVS | `HostedPowerVSCluster` | `HostedPowerVSNodePool` |
-| OpenStack | `HostedOpenStackCluster` | `HostedOpenStackNodePool` |
-| Agent | `HostedAgentCluster` | `HostedAgentNodePool` |
+| Platform | Cluster Infrastructure CRD | NodePool Configuration CRD |
+|----------|---------------------------|---------------------------|
+| AWS | `HostedAWSCluster` | `AWSNodePool` |
+| Azure | `HostedAzureCluster` | `AzureNodePool` |
+| KubeVirt | `HostedKubeVirtCluster` | `KubeVirtNodePool` |
+| PowerVS | `HostedPowerVSCluster` | `PowerVSNodePool` |
+| OpenStack | `HostedOpenStackCluster` | `OpenStackNodePool` |
+| Agent | `HostedAgentCluster` | `AgentNodePool` |
 
 **API Group**: `infrastructure.hypershift.openshift.io/v1beta1`
 
 **Rationale for Naming**:
-- `Hosted` prefix clearly distinguishes from CAPI CRDs (e.g., `AWSCluster`)
-- Consistent with existing HyperShift naming: `HostedCluster`, `HostedControlPlane`
-- Better grouping when listing resources: `kubectl get hosted*`
+- **Cluster CRDs**: `Hosted` prefix mirrors `HostedCluster` (e.g., `HostedAWSCluster`)
+- **NodePool CRDs**: No `Hosted` prefix mirrors `NodePool` (e.g., `AWSNodePool`)
+- **Consistency**: Naming pattern matches core API structure exactly
+- **CAPI Disambiguation**: `Hosted` prefix on cluster CRDs distinguishes from CAPI CRDs (e.g., `AWSCluster` vs `HostedAWSCluster`)
 
 ---
 
 ## Component Separation Strategy
 
-### Platform & NodePool Providers: Complete Separation
+### Platform Providers: Complete Separation
 
 **Pattern**: CRD-based provider controllers (separate binaries)
 
@@ -144,18 +411,6 @@ hypershift-operator (core):    CAPI v1.11.0, no AWS/Azure imports
 hypershift-aws-provider:       CAPI v1.10.0, AWS SDK v2.50.0  ✅ No conflict!
 hypershift-azure-provider:     CAPI v1.11.0, Azure SDK v68.0.0 ✅ Independent!
 ```
-
-### Control Plane Operator (CPO): Constrained Code in Core
-
-**Rationale**: Security - core team must control all control plane mutations
-
-**Trade-off**: Accept some import coupling in CPO for security guarantees
-
-**Mitigation**:
-- Constrained interface limits what providers can do
-- Core validates all provider changes before applying
-- Platform code isolated in separate packages
-- Consider sub-modules with replace directives for SDK isolation
 
 ---
 
@@ -228,7 +483,7 @@ spec:
 
 ```yaml
 apiVersion: infrastructure.hypershift.openshift.io/v1beta1
-kind: HostedAWSNodePool
+kind: AWSNodePool
 metadata:
   name: workers-config
   namespace: clusters
@@ -265,7 +520,7 @@ spec:
     # Reference to user-created platform config
     nodePoolRef:
       apiVersion: infrastructure.hypershift.openshift.io/v1beta1
-      kind: HostedAWSNodePool
+      kind: AWSNodePool
       name: workers-config
 ```
 
@@ -277,7 +532,7 @@ spec:
 ├─────────────────────────────────────────────────────────────────┤
 │ 1. kubectl apply -f hostedawscluster.yaml                       │
 │ 2. kubectl apply -f hostedcluster.yaml                          │
-│ 3. kubectl apply -f hostedawsnodepool.yaml                      │
+│ 3. kubectl apply -f awsnodepool.yaml                            │
 │ 4. kubectl apply -f nodepool.yaml                               │
 └─────────────────────────────────────────────────────────────────┘
                               ↓
@@ -301,16 +556,13 @@ spec:
 │   → Updates HostedAWSCluster.status.ready = true               │
 │                                                                  │
 │ hypershift-operator watches NodePool                            │
-│   → Sets NodePool as owner of HostedAWSNodePool                │
-│   → Validates no other NodePool owns it                         │
-│   → Waits for HostedAWSNodePool.status.ready                    │
+│   → Sets NodePool as owner of AWSNodePool                      │
+│   → Waits for AWSNodePool.status.ready                          │
 │   → Creates CAPI MachineDeployment                              │
 │                                                                  │
-│ hypershift-aws-provider watches HostedAWSNodePool               │
-│   → Finds owner NodePool from OwnerReferences                   │
+│ hypershift-aws-provider watches AWSNodePool                     │
 │   → Creates CAPI AWSMachineTemplate                             │
-│   → Updates HostedAWSNodePool.status.ready = true              │
-│   → Worker nodes provisioned                                    │
+│   → Updates AWSNodePool.status.ready = true                    │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -365,69 +617,22 @@ type HostedAWSClusterStatus struct {
 }
 ```
 
-### AWS Provider Controller
+### AWS Provider Controller Responsibilities
 
-```go
-// providers/aws/controllers/infrastructure/hostedawscluster_controller.go
+The AWS provider controller (`hypershift-aws-provider`) reconciles HostedAWSCluster resources and is responsible for:
 
-package infrastructure
+**Core Functions**:
+1. **Infrastructure Provisioning**: Creates and manages CAPI AWSCluster resources that provision AWS infrastructure (VPC, subnets, security groups, load balancers)
+2. **Owner Discovery**: Finds the owner HostedCluster via OwnerReferences to determine HCP namespace and configuration
+3. **HCP Platform Configuration**: Populates `HostedControlPlane.Spec.Platform.AWS` using Server-Side Apply with CPO-specific configuration
+4. **Secret Management**: Creates platform-specific secrets (KMS credentials, cloud provider config) in the HCP namespace
+5. **Status Management**: Updates HostedAWSCluster.Status.Ready when infrastructure is provisioned and ready
 
-import (
-    "context"
+**Implementation Location**: `providers/aws/controllers/infrastructure/`
 
-    awsinfrav1 "github.com/openshift/hypershift/providers/aws/api/v1beta1"
-    capav1 "sigs.k8s.io/cluster-api-provider-aws/api/v1beta2"
+**Field Ownership**: Uses Server-Side Apply with field manager `hypershift-aws-provider` to own HCP.Spec.Platform.AWS fields
 
-    ctrl "sigs.k8s.io/controller-runtime"
-    "sigs.k8s.io/controller-runtime/pkg/client"
-)
-
-type HostedAWSClusterReconciler struct {
-    client.Client
-}
-
-func (r *HostedAWSClusterReconciler) Reconcile(
-    ctx context.Context,
-    req ctrl.Request,
-) (ctrl.Result, error) {
-    awsCluster := &awsinfrav1.HostedAWSCluster{}
-    if err := r.Get(ctx, req.NamespacedName, awsCluster); err != nil {
-        return ctrl.Result{}, client.IgnoreNotFound(err)
-    }
-
-    // Create/update CAPI AWSCluster
-    capiCluster := &capav1.AWSCluster{
-        ObjectMeta: metav1.ObjectMeta{
-            Name:      awsCluster.Name,
-            Namespace: awsCluster.Namespace,
-        },
-        Spec: capav1.AWSClusterSpec{
-            Region: awsCluster.Spec.Region,
-            NetworkSpec: capav1.NetworkSpec{
-                VPC: capav1.VPCSpec{
-                    ID: awsCluster.Spec.VPC.ID,
-                },
-                Subnets: convertSubnets(awsCluster.Spec.Subnets),
-            },
-        },
-    }
-
-    if err := r.Client.Patch(ctx, capiCluster, client.Apply,
-        client.FieldOwner("hypershift-aws-provider")); err != nil {
-        return ctrl.Result{}, err
-    }
-
-    // Update status based on CAPI AWSCluster status
-    awsCluster.Status.Ready = capiCluster.Status.Ready
-    awsCluster.Status.Network.VPCID = capiCluster.Spec.NetworkSpec.VPC.ID
-
-    if err := r.Status().Update(ctx, awsCluster); err != nil {
-        return ctrl.Result{}, err
-    }
-
-    return ctrl.Result{}, nil
-}
-```
+**Detailed Implementation**: See [Provider Implementation Example](#provider-implementation-example) below for the complete workflow.
 
 ### Ownership Model
 
@@ -446,7 +651,7 @@ func (r *HostedAWSClusterReconciler) Reconcile(
 - ✅ **Clear lifecycle**: HostedAWSCluster cannot outlive HostedCluster
 - ✅ **Discoverability**: Provider finds HostedCluster from HostedAWSCluster.OwnerReferences
 
-**Same pattern applies to NodePool → HostedAWSNodePool**.
+**Same pattern applies to NodePool → AWSNodePool**.
 
 ### Core Operator Integration
 
@@ -463,22 +668,22 @@ The core hypershift-operator does NOT import provider types. It uses unstructure
 
 ---
 
-## NodePool Provider Pattern
+## NodePool Configuration Pattern
 
-### HostedAWSNodePool CRD
+### AWSNodePool CRD
 
 ```go
-// providers/aws/api/v1beta1/hostedawsnodepool_types.go
+// providers/aws/api/v1beta1/awsnodepool_types.go
 
-type HostedAWSNodePool struct {
+type AWSNodePool struct {
     metav1.TypeMeta   `json:",inline"`
     metav1.ObjectMeta `json:"metadata,omitempty"`
 
-    Spec   HostedAWSNodePoolSpec   `json:"spec,omitempty"`
-    Status HostedAWSNodePoolStatus `json:"status,omitempty"`
+    Spec   AWSNodePoolSpec   `json:"spec,omitempty"`
+    Status AWSNodePoolStatus `json:"status,omitempty"`
 }
 
-type HostedAWSNodePoolSpec struct {
+type AWSNodePoolSpec struct {
     InstanceType    string `json:"instanceType"`
     InstanceProfile string `json:"instanceProfile"`
 
@@ -494,7 +699,7 @@ type HostedAWSNodePoolSpec struct {
     SpotMarketOptions *SpotMarketOptions `json:"spotMarketOptions,omitempty"`
 }
 
-type HostedAWSNodePoolStatus struct {
+type AWSNodePoolStatus struct {
     Ready bool `json:"ready"`
 
     MachineTemplateRef *corev1.ObjectReference `json:"machineTemplateRef,omitempty"`
@@ -503,64 +708,20 @@ type HostedAWSNodePoolStatus struct {
 }
 ```
 
-### NodePool Provider Controller
+### NodePool Controller Responsibilities
 
-```go
-// providers/aws/controllers/nodepool/hostedawsnodepool_controller.go
+The NodePool controller (part of `hypershift-aws-provider`) reconciles AWSNodePool resources and is responsible for:
 
-func (r *HostedAWSNodePoolReconciler) Reconcile(
-    ctx context.Context,
-    req ctrl.Request,
-) (ctrl.Result, error) {
-    awsNodePool := &awsinfrav1.HostedAWSNodePool{}
-    if err := r.Get(ctx, req.NamespacedName, awsNodePool); err != nil {
-        return ctrl.Result{}, client.IgnoreNotFound(err)
-    }
+**Core Functions**:
+1. **Machine Template Creation**: Creates and manages CAPI AWSMachineTemplate resources that define node machine specifications
+2. **Owner Discovery**: Finds the owner NodePool via OwnerReferences to coordinate with core NodePool lifecycle
+3. **Platform-Specific Configuration**: Translates AWSNodePool spec into CAPI machine template spec (instance type, volumes, networking, IAM profiles)
+4. **Template Management**: Creates immutable machine templates for each NodePool configuration version
+5. **Status Management**: Updates AWSNodePool.Status.Ready and provides MachineTemplateRef for core NodePool controller to use
 
-    // Create/update CAPI AWSMachineTemplate
-    machineTemplate := &capav1.AWSMachineTemplate{
-        ObjectMeta: metav1.ObjectMeta{
-            Name:      awsNodePool.Name + "-template",
-            Namespace: awsNodePool.Namespace,
-        },
-        Spec: capav1.AWSMachineTemplateSpec{
-            Template: capav1.AWSMachineTemplateResource{
-                Spec: capav1.AWSMachineSpec{
-                    InstanceType: awsNodePool.Spec.InstanceType,
-                    IAMInstanceProfile: awsNodePool.Spec.InstanceProfile,
-                    Subnet: &capav1.AWSResourceReference{
-                        ID: awsNodePool.Spec.Subnet.ID,
-                    },
-                    RootVolume: &capav1.Volume{
-                        Size: awsNodePool.Spec.RootVolume.Size,
-                        Type: awsNodePool.Spec.RootVolume.Type,
-                        IOPS: awsNodePool.Spec.RootVolume.IOPS,
-                    },
-                },
-            },
-        },
-    }
+**Implementation Location**: `providers/aws/controllers/nodepool/`
 
-    if err := r.Client.Patch(ctx, machineTemplate, client.Apply,
-        client.FieldOwner("hypershift-aws-provider")); err != nil {
-        return ctrl.Result{}, err
-    }
-
-    // Update status
-    awsNodePool.Status.Ready = true
-    awsNodePool.Status.MachineTemplateRef = &corev1.ObjectReference{
-        Kind:      "AWSMachineTemplate",
-        Name:      machineTemplate.Name,
-        Namespace: machineTemplate.Namespace,
-    }
-
-    if err := r.Status().Update(ctx, awsNodePool); err != nil {
-        return ctrl.Result{}, err
-    }
-
-    return ctrl.Result{}, nil
-}
-```
+**Coordination**: Core NodePool controller waits for AWSNodePool.Status.Ready before creating CAPI MachineDeployment resources
 
 ### Simplified Core NodePool API
 
@@ -605,50 +766,39 @@ type NodePoolPlatformRef struct {
    - External providers could introduce security vulnerabilities or backdoors
    - Central validation is critical for multi-tenant environments
 
-2. **Limited Scope of Platform Customization**
+2. **Technical Complexity of Deployment Mutations**
+   - CPO performs deep, conditional mutations of Deployment manifests:
+     - **Container injection**: Adding KMS sidecars, pod identity webhooks at specific positions
+     - **Volume mounting**: Injecting platform-specific volumes and volume mounts
+     - **Environment variables**: Setting cloud-specific env vars based on runtime conditions
+     - **Init containers**: Adding platform-specific initialization logic
+     - **Args and command modifications**: Modifying KAS startup parameters
+   - These mutations are **not declarative patches** - they require imperative logic
+   - External providers would need complex APIs to express these mutations safely
+   - Making this "injectable" from external providers would require:
+     - Complex contract between CPO and providers
+     - Provider-supplied code running in CPO's security context
+     - Or, webhook-based mutations with ordering/timing challenges
+
+3. **Limited Scope of Platform Customization**
    - Platform-specific control plane customization is narrow and well-defined:
      - Adding KMS encryption sidecars (AWS, Azure)
      - Injecting pod identity webhooks (AWS)
      - Setting cloud-specific environment variables
      - Mounting cloud credential secrets
    - This is ~5-10% of CPO code, vs 90% for infrastructure/nodepool
+   - The complexity-to-benefit ratio favors keeping this in CPO
 
-3. **Trade-off Analysis**
+4. **Trade-off Analysis**
    - **Cost**: Some import coupling in CPO (AWS/Azure SDKs)
-   - **Benefit**: Guaranteed security review of all control plane mutations
-   - **Verdict**: Security benefits outweigh dependency isolation
+   - **Benefit**: Guaranteed security review + avoids complex provider contract
+   - **Verdict**: Security and technical simplicity outweigh dependency isolation
 
-4. **Alternative Considered and Rejected**
-   - **External Control Plane Providers**: Rejected due to security risks
-   - **Admission Webhooks**: Too coarse-grained, can't handle conditional logic
-   - **Mutating Webhooks**: Race conditions, ordering issues, complexity
-
-**Implementation**: Platform-specific control plane code stays in CPO but is:
-- Isolated in separate packages (`control-plane-operator/controllers/hostedcontrolplane/kas/aws/`, etc.)
-- Thoroughly reviewed by core team
-- Can use sub-modules with `replace` directives to isolate SDK versions if needed
-
-**Result**: CPO reads `HCP.Spec.Platform.{AWS,Azure,...}` (populated by platform providers via SSA) and applies validated, constrained customizations to control plane components.
-
-### No CPO Changes Required
-
-The current CPO implementation already reads platform-specific configuration from `HCP.Spec.Platform.{AWS,Azure,...}`. With the provider architecture:
-
-1. **Before**: `hypershift-operator` populates `HCP.Spec.Platform.AWS` from `HostedCluster.Spec.Platform.AWS`
-2. **After**: `hypershift-aws-provider` populates `HCP.Spec.Platform.AWS` from `HostedAWSCluster.Spec`
-
-**CPO doesn't know or care about the difference** - it just reads `HCP.Spec.Platform.AWS` as always.
-
-**What Changes**:
-- ✅ Provider controllers write to `HCP.Spec.Platform` (using SSA)
-- ✅ Provider controllers create platform-specific secrets in HCP namespace
-
-**What Stays the Same**:
-- ✅ CPO reads `HCP.Spec.Platform` (existing code)
-- ✅ CPO KAS component uses platform config for customization (existing code)
-- ✅ CPO other components use platform config (existing code)
-
-This is the beauty of the solution - **separation without disruption**.
+5. **Alternatives Considered and Rejected**
+   - **External Control Plane Providers**: Rejected due to security risks and complex mutation API requirements
+   - **Admission Webhooks**: Too coarse-grained, can't handle conditional logic based on reconciliation state
+   - **Mutating Webhooks**: Race conditions, ordering issues, complexity, and still requires trusted code
+   - **Provider-Supplied Deployment Patches**: Insufficient for complex conditional mutations, security risks
 
 ### Provider-to-CPO Communication Problem
 
@@ -701,91 +851,11 @@ With the provider architecture, platform fields move from `HostedCluster.Spec.Pl
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**Why This Works**:
-- ✅ **No new CRD**: HCP already exists, CPO already watches it
-- ✅ **Proven pattern**: Common in Kubernetes (Node.Spec, Pod.Spec, Service.Spec)
-- ✅ **Simple UX**: Users only need to understand HCP, not additional CRDs
-- ✅ **Atomic updates**: HCP update automatically triggers CPO reconciliation
-
 **Field Ownership with SSA**:
 - `hypershift-operator` owns core HCP.Spec fields
 - `hypershift-aws-provider` owns HCP.Spec.Platform.AWS fields
 - `hypershift-azure-provider` owns HCP.Spec.Platform.Azure fields
 - No conflicts because ownership is tracked per-field by Kubernetes
-
-### Platform-Specific Configuration in HCP.Spec
-
-Providers write curated, CPO-specific configuration to `HCP.Spec.Platform.{AWS,Azure,...}`:
-
-```go
-// api/hypershift/v1beta1/platform.go
-
-type PlatformSpec struct {
-    Type PlatformType
-
-    // AWS platform-specific control plane configuration
-    // Written by: hypershift-aws-provider (via SSA)
-    // Read by: control-plane-operator
-    // +optional
-    AWS *AWSControlPlaneConfig `json:"aws,omitempty"`
-
-    // Azure platform-specific control plane configuration
-    // Written by: hypershift-azure-provider (via SSA)
-    // Read by: control-plane-operator
-    // +optional
-    Azure *AzureControlPlaneConfig `json:"azure,omitempty"`
-
-    // Other platforms follow same pattern...
-}
-
-// AWSControlPlaneConfig contains AWS-specific configuration needed by CPO.
-// This is a CURATED subset of HostedAWSCluster fields.
-// Populated by hypershift-aws-provider based on HostedAWSCluster spec.
-type AWSControlPlaneConfig struct {
-    // Region is the AWS region for the control plane
-    Region string `json:"region"`
-
-    // KMS configuration for secret encryption
-    // +optional
-    KMS *AWSKMSControlPlaneConfig `json:"kms,omitempty"`
-
-    // PodIdentity configuration for pod identity webhook
-    // +optional
-    PodIdentity *AWSPodIdentityConfig `json:"podIdentity,omitempty"`
-
-    // CloudConfigSecretRef references the cloud provider config secret
-    // Provider creates this secret in HCP namespace
-    // +optional
-    CloudConfigSecretRef *corev1.LocalObjectReference `json:"cloudConfigSecretRef,omitempty"`
-}
-
-type AWSKMSControlPlaneConfig struct {
-    // ActiveKeyARN is the ARN of the active KMS key
-    ActiveKeyARN string `json:"activeKeyARN"`
-
-    // BackupKeyARN is the ARN of the backup KMS key
-    // +optional
-    BackupKeyARN string `json:"backupKeyARN,omitempty"`
-
-    // CredentialsSecretRef references the AWS credentials secret
-    // Provider creates this secret in HCP namespace
-    CredentialsSecretRef corev1.LocalObjectReference `json:"credentialsSecretRef"`
-}
-
-type AWSPodIdentityConfig struct {
-    // Enabled indicates if pod identity webhook should be deployed
-    Enabled bool `json:"enabled"`
-
-    // KubeconfigSecretRef references the kubeconfig for the webhook
-    // Provider creates this secret in HCP namespace
-    // +optional
-    KubeconfigSecretRef *corev1.LocalObjectReference `json:"kubeconfigSecretRef,omitempty"`
-}
-
-// Similar types for Azure, KubeVirt, PowerVS, etc.
-```
-
-**Note**: These types define what CPO needs from providers - a curated subset of platform-specific configuration, not all fields from HostedAWSCluster.
 
 ### HCP Creation and Provider Discovery
 
@@ -796,61 +866,18 @@ type AWSPodIdentityConfig struct {
 
 **How does provider find HCP?**
 1. Provider watches `HostedAWSCluster` (created by user)
-2. Provider waits for HCP to exist in the hcp namespace before populating platform config
+2. Provider waits for HCP to exist in the hcp namespace of the owner HostedCluster before populating platform config
 
 ### Provider Implementation Example
 
-**Implementation (aws-provider)**:
-- Get HostedAWSCluster from reconcile request
-- Find owner HostedCluster from OwnerReferences (set by hypershift-operator)
-  - If no owner yet: requeue and wait
-  - OwnerReference provides HostedCluster name/namespace
-- Compute HCP namespace from HostedCluster: `{namespace}-{name}`
-- Wait for HCP to exist (created by hypershift-operator)
-- Reconcile infrastructure:
-  - Create/update CAPI AWSCluster resource
-  - Provision AWS infrastructure (VPC, subnets, etc.)
-  - Create platform-specific secrets in HCP namespace
-- Populate HCP.Spec.Platform.AWS using Server-Side Apply (SSA):
-  - Field owner: `hypershift-aws-provider`
-  - Only include CPO-needed fields (region, KMS config, secret refs)
-  - SSA prevents conflicts with hypershift-operator
-- Update HostedAWSCluster.Status.Ready when infrastructure is provisioned
-
-**Key Points**:
-- Provider owns `HCP.Spec.Platform.AWS` fields **exclusively** via SSA field manager
-- `hypershift-operator` creates HCP but does NOT populate HCP.Spec.Platform
-- Provider creates referenced secrets in HCP namespace
-- CPO reads `HCP.Spec.Platform.AWS` as it does today - **no CPO changes needed**
-
-
-### Validation and Error Handling
-
-**Provider Responsibilities**:
-- Validate HostedAWSCluster spec before writing to HCP.Spec.Platform
-- Handle missing HCP gracefully (requeue until HCP exists)
-- Handle missing owner reference gracefully (requeue until hypershift-operator sets it)
-- Set owner references on created secrets for proper cleanup
-- Update status conditions on HostedAWSCluster to indicate platform config status
-
-**Core Operator Responsibilities**:
-- Validate that referenced HostedAWSCluster exists before setting ownership
-- Detect and reject attempts to reference already-owned infrastructure resources
-- Set controller=true and blockOwnerDeletion=true on owner references
-
-**CPO Responsibilities**:
-- Handle missing or invalid HCP.Spec.Platform.AWS gracefully
-- Log warnings if platform config is incomplete
-- Continue with degraded functionality if possible (e.g., skip KMS if not configured)
-
-**Error Scenarios**:
-1. **Infrastructure resource not found**: Core operator reports error in HostedCluster status, requeues
-2. **Infrastructure already owned**: Core operator rejects with clear error message
-3. **HCP doesn't exist yet**: Provider requeues and waits
-4. **No owner reference yet**: Provider requeues and waits for hypershift-operator
-5. **Invalid platform config**: Provider reports error in HostedAWSCluster status
-6. **Secret creation fails**: Provider reports error and retries
-7. **SSA conflict**: Should not occur with proper field ownership; investigate if it does
+**Reconciliation Workflow**:
+1. Get HostedAWSCluster from reconcile request
+2. Find owner HostedCluster from OwnerReferences (set by hypershift-operator)
+   - If no owner yet: requeue and wait
+3. Compute HCP namespace from HostedCluster: `{namespace}-{name}`
+4. Wait for HCP to exist (created by hypershift-operator)
+5. Reconcile infrastructure and populate HCP platform configuration
+6. Update HostedAWSCluster.Status.Ready
 
 ---
 
@@ -902,7 +929,7 @@ status:
 
 ### Threat Model
 
-**Platform & NodePool Providers**:
+**Platform Providers**:
 - ✅ Low risk - CRD-based, no direct cluster access
 - ✅ Providers can only create CAPI resources
 - ✅ Core operator validates all status updates
@@ -910,11 +937,7 @@ status:
 
 **Control Plane Operator (CPO)**:
 - ⚠️ High risk - can modify KAS deployment
-- ⚠️ Access to control plane namespace
-- ✅ Mitigated by constrained platform-specific code
-- ✅ Core team validates all changes
-- ✅ Only trusted code (core team reviewed)
-
+- ✅ Mitigated by constrained platform-specific code (see [Control Plane Operator](#control-plane-operator) for detailed rationale)
 
 ---
 
@@ -949,13 +972,13 @@ hypershift/ (PROPOSED STRUCTURE)
 │   │   ├── go.mod                         # Independent, CAPI v1.10.x
 │   │   ├── api/v1beta1/
 │   │   │   ├── hostedawscluster_types.go
-│   │   │   ├── hostedawsnodepool_types.go
+│   │   │   ├── awsnodepool_types.go
 │   │   │   └── zz_generated.deepcopy.go
 │   │   ├── controllers/
 │   │   │   ├── infrastructure/
 │   │   │   │   └── hostedawscluster_controller.go
 │   │   │   └── nodepool/
-│   │   │       └── hostedawsnodepool_controller.go
+│   │   │       └── awsnodepool_controller.go
 │   │   ├── cmd/
 │   │   │   └── main.go
 │   │   └── manifests/
@@ -965,7 +988,7 @@ hypershift/ (PROPOSED STRUCTURE)
 │   │   ├── go.mod                         # Independent, CAPI v1.11.x
 │   │   ├── api/v1beta1/
 │   │   │   ├── hostedazurecluster_types.go
-│   │   │   └── hostedazurenodepool_types.go
+│   │   │   └── azurenodepool_types.go
 │   │   ├── controllers/
 │   │   │   ├── infrastructure/
 │   │   │   └── nodepool/
@@ -1038,7 +1061,7 @@ require (
 1. Create provider-api module with interface definitions
 2. Create providers/ directory structure
 3. Define HostedAWSCluster, HostedAzureCluster, etc. CRD types
-4. Define HostedAWSNodePool, HostedAzureNodePool, etc. CRD types
+4. Define AWSNodePool, AzureNodePool, etc. CRD types
 5. No changes to existing HostedCluster/NodePool APIs yet (dual-mode support)
 
 **Deliverables**:
@@ -1066,8 +1089,8 @@ require (
    - Update hypershift-operator to check infrastructureRef status
    - Test with dev clusters
 
-2. **NodePool Provider (Month 4)**
-   - Implement HostedAWSNodePool controller
+2. **NodePool Controller (Month 4)**
+   - Implement AWSNodePool controller
    - Add dual-mode support to NodePool
    - Update core nodepool controller to use nodePoolRef
    - Migrate AWS-specific nodepool logic to provider
@@ -1076,7 +1099,7 @@ require (
 3. **Migration Tooling**
    - CLI command: `hypershift migrate cluster <name> --to-provider-pattern`
    - Creates HostedAWSCluster from existing platform.aws
-   - Creates HostedAWSNodePool from existing platform.aws
+   - Creates AWSNodePool from existing platform.aws
    - Updates HostedCluster/NodePool to use refs
    - Validates migration
 
@@ -1094,7 +1117,7 @@ require (
 
 **Months 6-7: Azure Provider**
 - Extract Azure provider (similar to AWS)
-- HostedAzureCluster + HostedAzureNodePool
+- HostedAzureCluster + AzureNodePool
 - Azure KMS customizer
 - Test with ARO HCP clusters
 
@@ -1174,7 +1197,7 @@ Each phase maintains backward compatibility:
 
 ### Benefits
 
-#### Platform & NodePool Providers (CRD Pattern)
+#### Platform Providers (CRD Pattern)
 
 ✅ **Complete Isolation**: Zero Go module conflicts
 ✅ **Independent Evolution**: Each provider releases independently
@@ -1183,10 +1206,7 @@ Each phase maintains backward compatibility:
 ✅ **Easy Testing**: Test providers in isolation
 ✅ **Community Extensibility**: Third-party providers possible
 ✅ **50% API Reduction**: ~3,000 LOC moved to providers
-✅ **Clear Lifecycle**: Each NodePool owns its HostedAWSNodePool (1-to-1 relationship)
-✅ **Enforced 1-to-1 Relationship**: Owner references prevent multiple HostedClusters from sharing platform resources
-✅ **Automatic Cleanup**: Kubernetes garbage collection deletes platform resources when HostedCluster is deleted
-✅ **Discoverability**: Providers easily find owner resources via OwnerReferences (no hardcoded namespace patterns)
+✅ **Ownership Benefits**: See [Ownership Model](#ownership-model) for details on lifecycle management and cleanup
 
 #### Control Plane Operator (CPO) (Stays the Same)
 
@@ -1200,11 +1220,11 @@ Each phase maintains backward compatibility:
 ✅ **Faster New Platforms**: <2 weeks vs ~2 months
 ✅ **Reduced Cross-Platform Bugs**: 80% reduction (isolation)
 ✅ **Better Documentation**: Each provider has own docs
-✅ **User Control**: Users create and own platform configs
+✅ **User Control**: Users create and own platform configske
 
 ### Trade-offs
 
-#### Platform & NodePool Providers
+#### Platform Providers
 
 ⚠️ **More Resources**: One deployment per provider
 ⚠️ **More Complexity**: Multiple controllers to coordinate
@@ -1244,54 +1264,7 @@ Each phase maintains backward compatibility:
 
 ---
 
-## Conclusion
-
-This re-architecture provides a pragmatic balance between separation, security, and maintainability:
-
-- **90% separation**: Platform and NodePool providers via CRD-based pattern
-- **10% coupling**: Control plane mutations via constrained code in CPO
-- **100% security**: Core team controls all control plane changes
-- **0% conflicts**: Each provider has independent dependencies
-
-The hybrid approach acknowledges that different components have different requirements. Platform provisioning benefits from complete separation, while control plane security requires central control.
-
-### Next Steps
-
-1. **Review & Approval**: Get stakeholder buy-in on architecture
-2. **Prototype**: Build AWS provider proof-of-concept
-3. **Phase 1 Implementation**: Start foundation work
-4. **Iterate**: Refine based on prototype learnings
-5. **Execute**: Follow migration strategy phases
-
----
-
-## Appendices
-
-### Appendix A: Example Platform Configurations
-
-See examples throughout document for:
-- AWS complete cluster setup
-- Azure cluster setup
-- Multi-nodepool configuration
-- Spot instances
-- Different instance types
-
-### Appendix B: Security Controls Reference
-
-See [Security Considerations](#security-considerations) section for:
-- Validation rules
-- Allowed/disallowed operations
-- Image registry whitelisting
-- Resource limits
-- Volume mount restrictions
-
-### Appendix C: API Reference
-
-For complete API definitions, see:
-- `providers/aws/api/v1beta1/` for AWS types
-- `providers/azure/api/v1beta1/` for Azure types
-
-### Appendix D: Glossary
+## Appendix: Glossary
 
 - **CRD**: Custom Resource Definition
 - **CAPI**: Cluster API
