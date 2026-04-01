@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -142,6 +143,20 @@ func DeleteIfNeededWithPredicate[T client.Object](ctx context.Context, c client.
 	}
 
 	return true, nil
+}
+
+func DeleteAllIfNeeded(ctx context.Context, c client.Client, o ...client.Object) error {
+	errs := []error{}
+	for _, obj := range o {
+		_, err := DeleteIfNeededWithOptions(ctx, c, obj)
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	return nil
 }
 
 func DeleteIfNeeded(ctx context.Context, c client.Client, o client.Object) (exists bool, err error) {

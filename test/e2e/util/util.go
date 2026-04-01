@@ -87,6 +87,7 @@ import (
 var (
 	expectedKasManagementComponents = []string{
 		"cluster-network-operator",
+		"endpoint-resolver",
 		"ignition-server",
 		"cluster-storage-operator",
 		"csi-snapshot-controller-operator",

@@ -1,6 +1,10 @@
 package metricsproxy
 
 import (
+	"fmt"
+	"strings"
+
+	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	component "github.com/openshift/hypershift/support/controlplane-component"
 	"github.com/openshift/hypershift/support/util"
 
@@ -15,8 +19,21 @@ func (mp *metricsProxy) adaptRoute(cpContext component.WorkloadContext, route *r
 		return util.ReconcileInternalRoute(route, hcp.Name, serviceName)
 	}
 
+	// Derive hostname from the Ignition route's domain when an explicit hostname
+	// is configured. On platforms using External DNS (e.g. Azure), the CLI sets
+	// explicit hostnames on service publishing strategies. Since metrics-proxy has
+	// no strategy entry, derive from the Ignition strategy's domain.
+	hostname := ""
+	ignitionStrategy := util.ServicePublishingStrategyByTypeForHCP(hcp, hyperv1.Ignition)
+	if ignitionStrategy != nil && ignitionStrategy.Route != nil && ignitionStrategy.Route.Hostname != "" {
+		parts := strings.SplitN(ignitionStrategy.Route.Hostname, ".", 2)
+		if len(parts) == 2 {
+			hostname = fmt.Sprintf("metrics-proxy-%s.%s", hcp.Name, parts[1])
+		}
+	}
+
 	labelHCPRoutes := util.LabelHCPRoutes(hcp)
-	if err := util.ReconcileExternalRoute(route, "", mp.defaultIngressDomain, serviceName, labelHCPRoutes); err != nil {
+	if err := util.ReconcileExternalRoute(route, hostname, mp.defaultIngressDomain, serviceName, labelHCPRoutes); err != nil {
 		return err
 	}
 
