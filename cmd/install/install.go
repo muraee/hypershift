@@ -973,7 +973,8 @@ func isClusterAPIRegistered(discoveryClient groupVersionDiscoverer) (bool, error
 // ensureUnmanagedCRDs ensures the singleton ClusterAPI config resource exists and has
 // HyperShift's CAPI CRD names listed in unmanagedCustomResourceDefinitions. This tells
 // the Cluster CAPI Operator to skip these CRDs during its own installation.
-// The field is append-only (CEL enforced), so existing entries are always preserved.
+// Server-Side Apply is used so the API server handles create-or-update atomically and
+// merges set entries across field owners without conflicts.
 func ensureUnmanagedCRDs(ctx context.Context, out io.Writer, client crclient.Client, capiCRDs []crclient.Object) error {
 	// Collect CAPI CRD names (groups ending in .cluster.x-k8s.io)
 	capiCRDNames := set.New[string]()
@@ -987,47 +988,25 @@ func ensureUnmanagedCRDs(ctx context.Context, out io.Writer, client crclient.Cli
 		return nil
 	}
 
-	clusterAPI := &operatorv1alpha1.ClusterAPI{}
-	err := client.Get(ctx, crclient.ObjectKey{Name: "cluster"}, clusterAPI)
-	if apierrors.IsNotFound(err) {
-		// Create the singleton with our CAPI CRD names
-		clusterAPI = &operatorv1alpha1.ClusterAPI{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "cluster",
-			},
-			Spec: &operatorv1alpha1.ClusterAPISpec{
-				UnmanagedCustomResourceDefinitions: capiCRDNames.SortedList(),
-			},
-		}
-		if err := client.Create(ctx, clusterAPI); err != nil {
-			return fmt.Errorf("failed to create ClusterAPI config: %w", err)
-		}
-		fmt.Fprintf(out, "Created ClusterAPI config with %d unmanaged CRDs\n", capiCRDNames.Len())
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("failed to get ClusterAPI config: %w", err)
+	clusterAPI := &operatorv1alpha1.ClusterAPI{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "cluster",
+		},
+		Spec: &operatorv1alpha1.ClusterAPISpec{
+			UnmanagedCustomResourceDefinitions: capiCRDNames.SortedList(),
+		},
 	}
 
-	// Merge with existing entries
-	existing := set.New[string]()
-	if clusterAPI.Spec != nil {
-		existing.Insert(clusterAPI.Spec.UnmanagedCustomResourceDefinitions...)
+	var buf bytes.Buffer
+	if err := hyperapi.YamlSerializer.Encode(clusterAPI, &buf); err != nil {
+		return fmt.Errorf("failed to encode ClusterAPI config: %w", err)
 	}
-	merged := existing.Union(capiCRDNames)
-	if merged.Len() == existing.Len() {
-		// No new entries to add
-		return nil
+	if err := client.Patch(ctx, clusterAPI, crclient.RawPatch(types.ApplyPatchType, buf.Bytes()),
+		crclient.ForceOwnership, crclient.FieldOwner("hypershift"),
+	); err != nil {
+		return fmt.Errorf("failed to apply ClusterAPI config: %w", err)
 	}
-
-	if clusterAPI.Spec == nil {
-		clusterAPI.Spec = &operatorv1alpha1.ClusterAPISpec{}
-	}
-	clusterAPI.Spec.UnmanagedCustomResourceDefinitions = merged.SortedList()
-	if err := client.Update(ctx, clusterAPI); err != nil {
-		return fmt.Errorf("failed to update ClusterAPI config: %w", err)
-	}
-	fmt.Fprintf(out, "Updated ClusterAPI config with %d unmanaged CRDs (was %d)\n", merged.Len(), existing.Len())
+	fmt.Fprintf(out, "Applied ClusterAPI config with %d unmanaged CRDs\n", capiCRDNames.Len())
 	return nil
 }
 

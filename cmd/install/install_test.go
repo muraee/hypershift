@@ -1,6 +1,7 @@
 package install
 
 import (
+	"context"
 	"io"
 	"io/fs"
 	"path/filepath"
@@ -21,10 +22,12 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/set"
 
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 func TestOptions_Validate(t *testing.T) {
@@ -636,12 +639,31 @@ func TestEnsureUnmanagedCRDs(t *testing.T) {
 		&apiextensionsv1.CustomResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: "nodepools.hypershift.openshift.io"}},
 	}
 
+	// ssaInterceptor converts SSA Patch calls into Create/Update for the fake client,
+	// which does not support ApplyPatchType natively.
+	ssaInterceptor := interceptor.Funcs{
+		Patch: func(ctx context.Context, c crclient.WithWatch, obj crclient.Object, patch crclient.Patch, opts ...crclient.PatchOption) error {
+			if patch.Type() != types.ApplyPatchType {
+				return c.Patch(ctx, obj, patch, opts...)
+			}
+			existing := obj.DeepCopyObject().(crclient.Object)
+			err := c.Get(ctx, crclient.ObjectKeyFromObject(obj), existing)
+			if apierrors.IsNotFound(err) {
+				return c.Create(ctx, obj)
+			}
+			if err != nil {
+				return err
+			}
+			obj.SetResourceVersion(existing.GetResourceVersion())
+			return c.Update(ctx, obj)
+		},
+	}
+
 	tests := []struct {
 		name             string
 		existingConfig   *operatorv1alpha1.ClusterAPI
 		crds             []crclient.Object
 		expectedCRDNames []string
-		expectCreate     bool
 		expectNoChange   bool
 	}{
 		{
@@ -652,10 +674,9 @@ func TestEnsureUnmanagedCRDs(t *testing.T) {
 				"clusters.cluster.x-k8s.io",
 				"machines.cluster.x-k8s.io",
 			},
-			expectCreate: true,
 		},
 		{
-			name: "When ClusterAPI config exists it should merge unmanaged CRDs with existing entries",
+			name: "When ClusterAPI config exists it should apply unmanaged CRDs",
 			existingConfig: &operatorv1alpha1.ClusterAPI{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "cluster",
@@ -668,14 +689,16 @@ func TestEnsureUnmanagedCRDs(t *testing.T) {
 				},
 			},
 			crds: capiCRDs,
+			// SSA with listType=set would merge entries from different field owners on a real
+			// API server. Since the fake client cannot simulate set-based merge semantics,
+			// this test verifies that HyperShift's apply succeeds and contains its own entries.
 			expectedCRDNames: []string{
 				"clusters.cluster.x-k8s.io",
 				"machines.cluster.x-k8s.io",
-				"machinesets.cluster.x-k8s.io",
 			},
 		},
 		{
-			name: "When all CRDs already listed it should not update",
+			name: "When all CRDs already listed it should apply idempotently",
 			existingConfig: &operatorv1alpha1.ClusterAPI{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "cluster",
@@ -687,8 +710,11 @@ func TestEnsureUnmanagedCRDs(t *testing.T) {
 					},
 				},
 			},
-			crds:           capiCRDs,
-			expectNoChange: true,
+			crds: capiCRDs,
+			expectedCRDNames: []string{
+				"clusters.cluster.x-k8s.io",
+				"machines.cluster.x-k8s.io",
+			},
 		},
 		{
 			name:           "When populating unmanaged CRDs it should only include CAPI CRDs",
@@ -704,7 +730,9 @@ func TestEnsureUnmanagedCRDs(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewGomegaWithT(t)
-			builder := fake.NewClientBuilder().WithScheme(hyperapi.Scheme)
+			builder := fake.NewClientBuilder().
+				WithScheme(hyperapi.Scheme).
+				WithInterceptorFuncs(ssaInterceptor)
 			if tc.existingConfig != nil {
 				builder = builder.WithObjects(tc.existingConfig)
 			}
