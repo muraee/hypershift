@@ -85,6 +85,7 @@ func adaptSecretEncryptionConfig(cpContext component.WorkloadContext, secret *co
 	}
 
 	secret.Data[secretEncryptionConfigurationKey] = data
+
 	return nil
 }
 

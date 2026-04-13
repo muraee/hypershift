@@ -243,6 +243,14 @@ const (
 	// **False / AutoNodeProgressing** means AutoNode is being enabled or disabled — the operation is in progress.
 	// **False / AutoNodeNotConfigured** means AutoNode is not configured in the spec and all Karpenter components have been removed.
 	AutoNodeEnabled ConditionType = "AutoNodeEnabled"
+
+	// EtcdDataEncryptionUpToDate indicates whether all etcd data is encrypted
+	// with the currently active encryption key.
+	// **True** means all data has been confirmed encrypted with the active key.
+	// **False** means the KAS deployment has not yet converged, re-encryption
+	// is in progress, or re-encryption has failed. Check the Reason field for specifics.
+	// **Absent** means encryption is not configured or no key rotation has occurred.
+	EtcdDataEncryptionUpToDate ConditionType = "EtcdDataEncryptionUpToDate"
 )
 
 // Reasons.
@@ -322,6 +330,11 @@ const (
 	AutoNodeNotConfiguredReason    = "AutoNodeNotConfigured"
 	AutoNodeProgressingReason      = "AutoNodeProgressing"
 	AutoNodeEvaluationFailedReason = "AutoNodeEvaluationFailed"
+
+	ReEncryptionInProgressReason = "ReEncryptionInProgress"
+	ReEncryptionCompletedReason  = "ReEncryptionCompleted"
+	ReEncryptionFailedReason     = "ReEncryptionFailed"
+	ReEncryptionWaitingForKASReason = "WaitingForKASConvergence"
 )
 
 // Messages.

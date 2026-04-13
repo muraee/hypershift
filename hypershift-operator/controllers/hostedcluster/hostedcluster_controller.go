@@ -894,6 +894,17 @@ func (r *HostedClusterReconciler) reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 
+	// Bubble up the EtcdDataEncryptionUpToDate condition from HCP when encryption is configured.
+	// Remove it when encryption is disabled, HCP is missing, or HCP no longer reports the condition.
+	if hcluster.Spec.SecretEncryption == nil || hcp == nil {
+		meta.RemoveStatusCondition(&hcluster.Status.Conditions, string(hyperv1.EtcdDataEncryptionUpToDate))
+	} else if cond := meta.FindStatusCondition(hcp.Status.Conditions, string(hyperv1.EtcdDataEncryptionUpToDate)); cond != nil {
+		cond.ObservedGeneration = hcluster.Generation
+		meta.SetStatusCondition(&hcluster.Status.Conditions, *cond)
+	} else {
+		meta.RemoveStatusCondition(&hcluster.Status.Conditions, string(hyperv1.EtcdDataEncryptionUpToDate))
+	}
+
 	// Reconcile unmanaged etcd client tls secret validation error status. Note only update status on validation error case to
 	// provide clear status to the user on the resource without having to look at operator logs.
 	{

@@ -5837,6 +5837,13 @@ A failure here often means a software bug or a non-stable cluster.</p>
 most recent etcd backup. True means the last backup completed successfully;
 False means a backup is in progress or the last backup failed.</p>
 </td>
+</tr><tr><td><p>&#34;EtcdDataEncryptionUpToDate&#34;</p></td>
+<td><p>EtcdDataEncryptionUpToDate indicates whether all etcd data is encrypted
+with the currently active encryption key.
+<strong>True</strong> means all data has been confirmed encrypted with the active key.
+<strong>False</strong> means re-encryption is in progress or has failed.
+Absent: encryption is not configured or no key rotation has occurred.</p>
+</td>
 </tr><tr><td><p>&#34;EtcdRecoveryActive&#34;</p></td>
 <td><p>EtcdRecoveryActive indicates that the Etcd cluster is failing and the
 recovery job was triggered.</p>

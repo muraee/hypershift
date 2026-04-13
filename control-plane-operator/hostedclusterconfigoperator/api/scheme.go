@@ -27,6 +27,7 @@ import (
 	apiregistrationv1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
 
 	capiv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	svmv1alpha1 "sigs.k8s.io/kube-storage-version-migrator/pkg/apis/migration/v1alpha1"
 
 	snapshotv1 "github.com/kubernetes-csi/external-snapshotter/client/v6/apis/volumesnapshot/v1"
 	operatorsv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
@@ -74,4 +75,5 @@ func init() {
 	_ = imageregistryv1.AddToScheme(Scheme)
 	_ = operatorsv1alpha1.AddToScheme(Scheme)
 	_ = snapshotv1.AddToScheme(Scheme)
+	_ = svmv1alpha1.AddToScheme(Scheme)
 }
