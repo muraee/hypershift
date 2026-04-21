@@ -705,7 +705,7 @@ k8s.io/cloud-provider/api
 # k8s.io/component-base v0.35.1
 ## explicit; go 1.25.0
 k8s.io/component-base/cli/flag
-# k8s.io/component-helpers v0.35.0
+# k8s.io/component-helpers v0.35.1
 ## explicit; go 1.25.0
 k8s.io/component-helpers/resource
 # k8s.io/csi-translation-lib v0.35.0

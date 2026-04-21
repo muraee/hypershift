@@ -104,15 +104,15 @@ require (
 	k8s.io/apimachinery v0.35.1
 	k8s.io/apiserver v0.35.1
 	k8s.io/autoscaler/vertical-pod-autoscaler v1.3.0
-	k8s.io/cli-runtime v0.34.2
+	k8s.io/cli-runtime v0.35.1
 	k8s.io/client-go v0.35.1
 	k8s.io/component-base v0.35.1
 	k8s.io/klog v1.0.0
 	k8s.io/klog/v2 v2.130.1
-	k8s.io/kube-aggregator v0.34.2
-	k8s.io/kube-scheduler v0.34.2
-	k8s.io/kubectl v0.34.2
-	k8s.io/pod-security-admission v0.34.2
+	k8s.io/kube-aggregator v0.35.1
+	k8s.io/kube-scheduler v0.35.1
+	k8s.io/kubectl v0.35.1
+	k8s.io/pod-security-admission v0.35.1
 	k8s.io/utils v0.0.0-20260108192941-914a6e750570
 	kubevirt.io/api v1.7.1
 	kubevirt.io/containerized-data-importer-api v1.64.0
@@ -298,7 +298,7 @@ require (
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	k8s.io/cloud-provider v0.35.0 // indirect
-	k8s.io/component-helpers v0.35.0 // indirect
+	k8s.io/component-helpers v0.35.1 // indirect
 	k8s.io/csi-translation-lib v0.35.0 // indirect
 	k8s.io/kms v0.35.1 // indirect
 	k8s.io/kube-openapi v0.0.0-20251125145642-4e65d59e963e // indirect
