@@ -14,11 +14,17 @@ import (
 	utiluuid "k8s.io/apimachinery/pkg/util/uuid"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
 const (
 	conditionPayloadGenerated = "PayloadGenerated"
 	conditionIgnitionReached  = "IgnitionReached"
+
+	// storeCleanupFinalizer is removed only after every PayloadStore token for the CR has
+	// been freed. It keeps store reclamation consumer-agnostic (the consumer owns its own
+	// finalizer separately).
+	storeCleanupFinalizer = "hypershift.openshift.io/ignition-payload-store-cleanup"
 )
 
 // Reconciler generates ignition payloads for IgnitionPayload CRs: it reads the config the CR
@@ -38,6 +44,28 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	owner := payloadstore.OwnerRef{Namespace: cr.Namespace, Name: cr.Name}
+
+	// Teardown: free every remaining store token for the CR, then drop the finalizer.
+	if !cr.DeletionTimestamp.IsZero() {
+		if controllerutil.ContainsFinalizer(cr, storeCleanupFinalizer) {
+			if err := r.freeAllTokens(ctx, owner); err != nil {
+				return ctrl.Result{}, err
+			}
+			controllerutil.RemoveFinalizer(cr, storeCleanupFinalizer)
+			if err := r.Update(ctx, cr); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// Ensure the store-cleanup finalizer is present before we write anything to the store.
+	if !controllerutil.ContainsFinalizer(cr, storeCleanupFinalizer) {
+		controllerutil.AddFinalizer(cr, storeCleanupFinalizer)
+		if err := r.Update(ctx, cr); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 
 	// Read the credential/global-config inputs the CR names. Read failures are transient
 	// (the referenced object may not exist yet) and requeue.
@@ -79,6 +107,15 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 	identity := payloadIdentityHash(in)
 	ro := rolloutHash(in)
+
+	// Retirement: once the consumer signals a generation has drained, free the previous token.
+	if cr.Status.Previous.Token != "" && cr.Spec.RetiredGeneration > 0 &&
+		cr.Status.Previous.Generation <= cr.Spec.RetiredGeneration {
+		if err := r.Store.Delete(ctx, cr.Status.Previous.Token); err != nil {
+			return ctrl.Result{}, err
+		}
+		cr.Status.Previous = hyperv1.PayloadReference{}
+	}
 
 	gen := genInputs{
 		releaseImage:        cr.Spec.ReleaseImage,
@@ -130,6 +167,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			Type: conditionPayloadGenerated, Status: metav1.ConditionTrue, Reason: "AsExpected",
 			Message: "payload generated for the current config",
 		})
+		if err := r.sweepOrphans(ctx, owner, cr); err != nil {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{}, r.Status().Update(ctx, cr)
 	}
 
@@ -145,7 +185,50 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		Type: conditionPayloadGenerated, Status: metav1.ConditionTrue, Reason: "AsExpected",
 		Message: "payload generated for the current config",
 	})
+	if err := r.sweepOrphans(ctx, owner, cr); err != nil {
+		return ctrl.Result{}, err
+	}
 	return ctrl.Result{}, r.Status().Update(ctx, cr)
+}
+
+// freeAllTokens deletes every store entry owned by owner.
+func (r *Reconciler) freeAllTokens(ctx context.Context, owner payloadstore.OwnerRef) error {
+	toks, err := r.Store.ListByOwner(ctx, owner)
+	if err != nil {
+		return err
+	}
+	for _, t := range toks {
+		if err := r.Store.Delete(ctx, t); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// sweepOrphans deletes any owner token that is not referenced by status.current or
+// status.previous. It is level-triggered, single-active (the manager is leader-elected), and
+// scoped to the one CR being reconciled, so it cannot race a concurrent generator. This reclaims
+// entries an interrupted generation left unreferenced (crash between Put and the status write).
+func (r *Reconciler) sweepOrphans(ctx context.Context, owner payloadstore.OwnerRef, cr *hyperv1.IgnitionPayload) error {
+	keep := map[string]bool{}
+	if cr.Status.Current.Token != "" {
+		keep[cr.Status.Current.Token] = true
+	}
+	if cr.Status.Previous.Token != "" {
+		keep[cr.Status.Previous.Token] = true
+	}
+	toks, err := r.Store.ListByOwner(ctx, owner)
+	if err != nil {
+		return err
+	}
+	for _, t := range toks {
+		if !keep[t] {
+			if err := r.Store.Delete(ctx, t); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // readSecretKey returns the bytes under key in the named Secret, or nil if name is empty.
