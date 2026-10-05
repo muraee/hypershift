@@ -37,63 +37,65 @@ func rolloutGlobalConfigMapName(crName string) string {
 	return netutil.ShortenName("rollout-global-config", crName, validation.DNS1123SubdomainMaxLength)
 }
 
-// projectConfigs writes the CR-owned projected ConfigMaps into hcpNamespace and
-// returns the classified reference lists plus the rolloutGlobalConfig ConfigMap name.
+// classifyConfigs computes the rollout/mgmt reference lists and the rolloutGlobalConfig
+// ConfigMap name deterministically from the source ConfigMaps, WITHOUT touching the
+// cluster. Because the projected names are stable functions of the CR name and the source
+// names, the full CR spec can be authored in a single write before the ConfigMaps are
+// materialized — avoiding an intermediate empty-ref spec that would churn the CR (and,
+// once the PayloadController is wired, thrash fleet rollouts).
 //
-//   - user configs are COPIED (they live in the NodePool namespace) and classified rollout;
-//   - core and NTO configs are referenced IN PLACE (already in the HCP namespace, owned
-//     elsewhere) and classified rollout — they are not copied and not owned by the CR;
-//   - the HAProxy raw config is materialized CR-owned and classified mgmt, so a
-//     management-side HAProxy bump does not churn the rollout hash;
-//   - the rolloutGlobalConfig bytes are authored into a CR-owned ConfigMap whose name is
-//     returned separately (it is referenced by the dedicated spec.rolloutGlobalConfig
-//     field, not by rolloutConfigMaps).
-//
-// owner is the IgnitionPayload CR (in hcpNamespace) used as the controller owner of
-// every copied/authored ConfigMap, so they cascade-delete with the CR.
-func projectConfigs(ctx context.Context, c client.Client, hcpNamespace string, owner *hyperv1.IgnitionPayload,
-	userConfigs, coreConfigs, ntoConfigs []corev1.ConfigMap, haproxyRaw string, rolloutGlobalConfig []byte,
-) (rolloutRefs, mgmtRefs []hyperv1.ConfigMapReference, rolloutGlobalConfigName string, err error) {
-	crName := owner.GetName()
-
-	// 1. User configs: copy into the HCP namespace, CR-owned.
+//   - user configs are copied, so they are classified rollout under their copy name;
+//   - core and NTO configs are referenced in place (by their own name), classified rollout;
+//   - the HAProxy config is classified mgmt, so a management-side bump does not churn the
+//     rollout hash;
+//   - the rolloutGlobalConfig name is returned separately (it is referenced by the
+//     dedicated spec.rolloutGlobalConfig field, not by rolloutConfigMaps).
+func classifyConfigs(crName string, userConfigs, coreConfigs, ntoConfigs []corev1.ConfigMap,
+) (rolloutRefs, mgmtRefs []hyperv1.ConfigMapReference, rolloutGlobalConfigName string) {
 	for i := range userConfigs {
-		src := &userConfigs[i]
-		name := userConfigCopyName(crName, src.GetName())
-		if err := upsertOwnedConfigMap(ctx, c, hcpNamespace, name, owner, src.Data); err != nil {
-			return nil, nil, "", err
-		}
-		rolloutRefs = append(rolloutRefs, hyperv1.ConfigMapReference{Name: name})
+		rolloutRefs = append(rolloutRefs, hyperv1.ConfigMapReference{Name: userConfigCopyName(crName, userConfigs[i].GetName())})
 	}
-
-	// 2. & 3. Core and NTO configs: reference in place.
 	for i := range coreConfigs {
 		rolloutRefs = append(rolloutRefs, hyperv1.ConfigMapReference{Name: coreConfigs[i].GetName()})
 	}
 	for i := range ntoConfigs {
 		rolloutRefs = append(rolloutRefs, hyperv1.ConfigMapReference{Name: ntoConfigs[i].GetName()})
 	}
-
-	// 4. rolloutGlobalConfig: author CR-owned ConfigMap, referenced via the dedicated
-	// spec field (returned name), not via rolloutConfigMaps.
-	rolloutGlobalConfigName = rolloutGlobalConfigMapName(crName)
-	if err := upsertOwnedConfigMap(ctx, c, hcpNamespace, rolloutGlobalConfigName, owner,
-		map[string]string{TokenSecretConfigKey: string(rolloutGlobalConfig)}); err != nil {
-		return nil, nil, "", err
-	}
-
-	// 5. HAProxy: materialize CR-owned ConfigMap, classified mgmt.
-	haproxyName := haproxyConfigMapName(crName)
-	if err := upsertOwnedConfigMap(ctx, c, hcpNamespace, haproxyName, owner,
-		map[string]string{TokenSecretConfigKey: haproxyRaw}); err != nil {
-		return nil, nil, "", err
-	}
-	mgmtRefs = append(mgmtRefs, hyperv1.ConfigMapReference{Name: haproxyName})
+	mgmtRefs = append(mgmtRefs, hyperv1.ConfigMapReference{Name: haproxyConfigMapName(crName)})
 
 	// Deterministic ordering so the authored spec is stable across reconciles.
 	sortRefs(rolloutRefs)
 	sortRefs(mgmtRefs)
-	return rolloutRefs, mgmtRefs, rolloutGlobalConfigName, nil
+	return rolloutRefs, mgmtRefs, rolloutGlobalConfigMapName(crName)
+}
+
+// materializeConfigs creates or updates the CR-owned projected ConfigMaps in hcpNamespace:
+// copied user configs, the materialized HAProxy config, and the authored
+// rolloutGlobalConfig. Core and NTO configs are referenced in place (already in the HCP
+// namespace, owned elsewhere) and are not materialized here. owner is the IgnitionPayload
+// CR used as the controller owner of every ConfigMap so they cascade-delete with the CR.
+// Names match classifyConfigs exactly.
+func materializeConfigs(ctx context.Context, c client.Client, hcpNamespace string, owner *hyperv1.IgnitionPayload,
+	userConfigs []corev1.ConfigMap, haproxyRaw string, rolloutGlobalConfig []byte) error {
+	crName := owner.GetName()
+
+	for i := range userConfigs {
+		src := &userConfigs[i]
+		if err := upsertOwnedConfigMap(ctx, c, hcpNamespace, userConfigCopyName(crName, src.GetName()), owner, src.Data); err != nil {
+			return err
+		}
+	}
+	if err := upsertOwnedConfigMap(ctx, c, hcpNamespace, rolloutGlobalConfigMapName(crName), owner,
+		map[string]string{TokenSecretConfigKey: string(rolloutGlobalConfig)}); err != nil {
+		return err
+	}
+	// HAProxy is always classified mgmt (classifyConfigs always lists it), so materialize it
+	// unconditionally to keep the mgmt reference and its ConfigMap consistent.
+	if err := upsertOwnedConfigMap(ctx, c, hcpNamespace, haproxyConfigMapName(crName), owner,
+		map[string]string{TokenSecretConfigKey: haproxyRaw}); err != nil {
+		return err
+	}
+	return nil
 }
 
 func sortRefs(refs []hyperv1.ConfigMapReference) {

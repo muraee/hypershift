@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
+	"github.com/openshift/hypershift/support/api"
 	payloadstore "github.com/openshift/hypershift/support/ignitionpayload"
 	supportutil "github.com/openshift/hypershift/support/util"
 
@@ -56,11 +57,12 @@ func userDataSecretForToken(nodePool *hyperv1.NodePool, hcpNamespace, endpoint s
 // coexistence. For InPlace NodePools it writes a token-{machineSet}-{configHash} Secret
 // in the HCP namespace carrying the rendered payload (fetched from the store by
 // current.Token, compressed+encoded) under "payload" and the release version under
-// "release-version" — both required by the InPlaceUpgrader. It is a no-op for Replace
-// NodePools, whose rollout is driven by the userdata Secret, not the token Secret.
+// "release-version" — both required by the InPlaceUpgrader. The Secret is owned by the CR
+// so it cascade-deletes with it; owner references do not affect the HCCO read. It is a
+// no-op for Replace NodePools, whose rollout is driven by the userdata Secret.
 func reconcileLegacyInPlaceSecret(ctx context.Context, c client.Client, store payloadstore.PayloadStore,
 	hcpNamespace, machineSetName string, upgradeType hyperv1.UpgradeType, releaseVersion string,
-	current hyperv1.PayloadReference) error {
+	current hyperv1.PayloadReference, owner *hyperv1.IgnitionPayload) error {
 	if upgradeType != hyperv1.UpgradeTypeInPlace {
 		return nil
 	}
@@ -81,6 +83,9 @@ func reconcileLegacyInPlaceSecret(ctx context.Context, c client.Client, store pa
 		},
 	}
 	if _, err := controllerutil.CreateOrUpdate(ctx, c, secret, func() error {
+		if err := controllerutil.SetControllerReference(owner, secret, api.Scheme); err != nil {
+			return err
+		}
 		if secret.Data == nil {
 			secret.Data = map[string][]byte{}
 		}

@@ -39,17 +39,26 @@ func (r *NodePoolReconciler) enqueueNodePoolForIgnitionPayload(_ context.Context
 }
 
 // advanceRetiredGeneration moves spec.retiredGeneration forward to gen once that
-// generation has drained. It is level-triggered and monotonic: a gen at or below the
-// current value is a no-op.
+// generation has drained. It is level-triggered and monotonic. The guard is evaluated
+// against a freshly-read object and the patch carries an optimistic lock, so the contract
+// holds even when the caller passes a stale cr: a gen at or below the server value never
+// regresses it, and a concurrent writer causes a conflict the caller can retry. The
+// caller's cr is synced to the resulting value.
 func advanceRetiredGeneration(ctx context.Context, c client.Client, cr *hyperv1.IgnitionPayload, gen int64) error {
-	if gen <= cr.Spec.RetiredGeneration {
+	fresh := &hyperv1.IgnitionPayload{}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(cr), fresh); err != nil {
+		return fmt.Errorf("failed to read IgnitionPayload before advancing retiredGeneration: %w", err)
+	}
+	if gen <= fresh.Spec.RetiredGeneration {
+		cr.Spec.RetiredGeneration = fresh.Spec.RetiredGeneration
 		return nil
 	}
-	patch := client.MergeFrom(cr.DeepCopy())
-	cr.Spec.RetiredGeneration = gen
-	if err := c.Patch(ctx, cr, patch); err != nil {
+	patch := client.MergeFromWithOptions(fresh.DeepCopy(), client.MergeFromWithOptimisticLock{})
+	fresh.Spec.RetiredGeneration = gen
+	if err := c.Patch(ctx, fresh, patch); err != nil {
 		return fmt.Errorf("failed to advance retiredGeneration to %d: %w", gen, err)
 	}
+	cr.Spec.RetiredGeneration = gen
 	return nil
 }
 
@@ -86,23 +95,19 @@ func reconcileIgnitionPayloadConsumer(ctx context.Context, c client.Client, stor
 		return "", err
 	}
 
-	// Ensure the CR exists with a valid scalar spec first so it owns the projected
-	// ConfigMaps (owner references require the owner's UID).
-	scalarSpec := ignitionPayloadSpec(nodePool, hc, nil, nil, "", in.osStream)
-	cr, err := reconcileIgnitionPayloadCR(ctx, c, hcpNamespace, nodePool, scalarSpec)
-	if err != nil {
-		return "", err
-	}
-
-	rolloutRefs, mgmtRefs, globalName, err := projectConfigs(ctx, c, hcpNamespace, cr,
-		in.userConfigs, in.coreConfigs, in.ntoConfigs, in.haproxyRaw, rolloutGlobalConfig)
-	if err != nil {
-		return "", err
-	}
-
+	// Classify the configs into deterministic reference names first, so the full CR spec is
+	// authored in a single write (no intermediate empty-ref spec that would churn the CR).
+	rolloutRefs, mgmtRefs, globalName := classifyConfigs(nodePool.GetName(), in.userConfigs, in.coreConfigs, in.ntoConfigs)
 	fullSpec := ignitionPayloadSpec(nodePool, hc, rolloutRefs, mgmtRefs, globalName, in.osStream)
-	cr, err = reconcileIgnitionPayloadCR(ctx, c, hcpNamespace, nodePool, fullSpec)
+	cr, err := reconcileIgnitionPayloadCR(ctx, c, hcpNamespace, nodePool, fullSpec)
 	if err != nil {
+		return "", err
+	}
+
+	// Materialize the CR-owned ConfigMaps the spec references (owner refs need the CR's UID,
+	// now available). A brief window where the spec references not-yet-created ConfigMaps is
+	// benign: the PayloadController treats a missing ConfigMap as a transient requeue.
+	if err := materializeConfigs(ctx, c, hcpNamespace, cr, in.userConfigs, in.haproxyRaw, rolloutGlobalConfig); err != nil {
 		return "", err
 	}
 
@@ -124,7 +129,7 @@ func reconcileIgnitionPayloadConsumer(ctx context.Context, c client.Client, stor
 	}
 
 	if err := reconcileLegacyInPlaceSecret(ctx, c, store, hcpNamespace, in.machineSetName,
-		nodePool.Spec.Management.UpgradeType, in.releaseVersion, cr.Status.Current); err != nil {
+		nodePool.Spec.Management.UpgradeType, in.releaseVersion, cr.Status.Current, cr); err != nil {
 		return "", err
 	}
 

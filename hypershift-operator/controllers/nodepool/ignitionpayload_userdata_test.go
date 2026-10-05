@@ -14,6 +14,7 @@ import (
 	supportutil "github.com/openshift/hypershift/support/util"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -69,13 +70,15 @@ func TestReconcileLegacyInPlaceSecret(t *testing.T) {
 	ctx := context.Background()
 	current := hyperv1.PayloadReference{Token: "tok-abc", ConfigHash: "cfg1", RolloutHash: "roll1", Generation: 1}
 
+	owner := &hyperv1.IgnitionPayload{ObjectMeta: metav1.ObjectMeta{Name: "np-1", Namespace: "hcp", UID: "uid-1"}}
+
 	t.Run("InPlace writes a byte-compatible token Secret", func(t *testing.T) {
 		g := NewWithT(t)
 		c := fake.NewClientBuilder().WithScheme(api.Scheme).Build()
 		store := payloadstore.NewMemStore()
 		g.Expect(store.Put(ctx, payloadstore.OwnerRef{Namespace: "hcp", Name: "np-1"}, "tok-abc", "id-1", []byte("PAYLOAD"))).To(Succeed())
 
-		err := reconcileLegacyInPlaceSecret(ctx, c, store, "hcp", "ms-1", hyperv1.UpgradeTypeInPlace, "4.23.0", current)
+		err := reconcileLegacyInPlaceSecret(ctx, c, store, "hcp", "ms-1", hyperv1.UpgradeTypeInPlace, "4.23.0", current, owner)
 		g.Expect(err).ToNot(HaveOccurred())
 
 		secret := &corev1.Secret{}
@@ -86,6 +89,11 @@ func TestReconcileLegacyInPlaceSecret(t *testing.T) {
 		g.Expect(secret.Data["payload"]).To(Equal(wantPayload.Bytes()))
 		// The HCCO InPlaceUpgrader errors without a non-empty release-version key.
 		g.Expect(string(secret.Data["release-version"])).To(Equal("4.23.0"))
+		// Finding #3: the compat Secret is CR-owned so it cascade-deletes with the CR.
+		g.Expect(secret.OwnerReferences).To(HaveLen(1))
+		g.Expect(secret.OwnerReferences[0].Name).To(Equal("np-1"))
+		g.Expect(secret.OwnerReferences[0].Controller).ToNot(BeNil())
+		g.Expect(*secret.OwnerReferences[0].Controller).To(BeTrue())
 	})
 
 	t.Run("Replace writes nothing", func(t *testing.T) {
@@ -94,7 +102,7 @@ func TestReconcileLegacyInPlaceSecret(t *testing.T) {
 		store := payloadstore.NewMemStore()
 		g.Expect(store.Put(ctx, payloadstore.OwnerRef{Namespace: "hcp", Name: "np-1"}, "tok-abc", "id-1", []byte("PAYLOAD"))).To(Succeed())
 
-		err := reconcileLegacyInPlaceSecret(ctx, c, store, "hcp", "ms-1", hyperv1.UpgradeTypeReplace, "4.23.0", current)
+		err := reconcileLegacyInPlaceSecret(ctx, c, store, "hcp", "ms-1", hyperv1.UpgradeTypeReplace, "4.23.0", current, owner)
 		g.Expect(err).ToNot(HaveOccurred())
 
 		secret := &corev1.Secret{}
