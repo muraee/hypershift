@@ -59,14 +59,22 @@ func resolveAndValidate(ctx context.Context, c client.Client, cr *hyperv1.Igniti
 
 	rollout, err := parse(rolloutCMs)
 	if err != nil {
-		return ResolvedConfig{}, err
+		return ResolvedConfig{}, &validationError{err}
 	}
 	mgmt, err := parse(mgmtCMs)
 	if err != nil {
-		return ResolvedConfig{}, err
+		return ResolvedConfig{}, &validationError{err}
 	}
 	return ResolvedConfig{RolloutManifests: rollout, MgmtManifests: mgmt}, nil
 }
+
+// validationError marks a config-manifest validation failure, as distinct from a transient
+// read error (e.g. a ConfigMap that is briefly absent). The controller sets PayloadGenerated=False
+// for a validationError and requeues for any other error.
+type validationError struct{ err error }
+
+func (e *validationError) Error() string { return e.err.Error() }
+func (e *validationError) Unwrap() error { return e.err }
 
 // getConfigMaps fetches each named ConfigMap from namespace ns, in the CR's namespace.
 func getConfigMaps(ctx context.Context, c client.Client, ns string, refs []hyperv1.ConfigMapReference) ([]corev1.ConfigMap, error) {

@@ -7,11 +7,11 @@ import (
 	"time"
 
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
-	ignserver "github.com/openshift/hypershift/ignition-server/controllers"
 	ignitionpayload "github.com/openshift/hypershift/hypershift-operator/controllers/ignitionpayload"
+	ignserver "github.com/openshift/hypershift/ignition-server/controllers"
 	hyperapi "github.com/openshift/hypershift/support/api"
-	"github.com/openshift/hypershift/support/imageregistry"
 	payloadstore "github.com/openshift/hypershift/support/ignitionpayload"
+	"github.com/openshift/hypershift/support/imageregistry"
 	"github.com/openshift/hypershift/support/releaseinfo"
 
 	ctrl "sigs.k8s.io/controller-runtime"

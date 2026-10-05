@@ -2,6 +2,7 @@ package ignitionpayload
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
@@ -12,6 +13,7 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utiluuid "k8s.io/apimachinery/pkg/util/uuid"
+
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -25,6 +27,10 @@ const (
 	// been freed. It keeps store reclamation consumer-agnostic (the consumer owns its own
 	// finalizer separately).
 	storeCleanupFinalizer = "hypershift.openshift.io/ignition-payload-store-cleanup"
+
+	// trustBundleKey is the ConfigMap data key holding the additional trust bundle, matching the
+	// key GetPayload reads and hashes.
+	trustBundleKey = "ca-bundle.crt"
 )
 
 // Reconciler generates ignition payloads for IgnitionPayload CRs: it reads the config the CR
@@ -73,26 +79,31 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	trustBundleContent, err := r.readConfigMapKey(ctx, cr.Namespace, cr.Spec.AdditionalTrustBundle.Name)
+	trustBundleContent, err := r.readConfigMapKey(ctx, cr.Namespace, cr.Spec.AdditionalTrustBundle.Name, trustBundleKey)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	rolloutGlobalConfig, err := r.readConfigMapKey(ctx, cr.Namespace, cr.Spec.RolloutGlobalConfig.Name)
+	rolloutGlobalConfig, err := r.readConfigMapKey(ctx, cr.Namespace, cr.Spec.RolloutGlobalConfig.Name, configDataKey)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// Validation gate: an invalid config sets PayloadGenerated=False and stops. No hash advance,
-	// no token, no rollout.
+	// Validation gate: a manifest that fails defaulting/validation sets PayloadGenerated=False and
+	// stops (no hash advance, no token, no rollout). A transient read error (e.g. a ConfigMap that
+	// is briefly absent) is NOT a validation failure and requeues instead.
 	resolved, err := resolveAndValidate(ctx, r.Client, cr)
 	if err != nil {
-		apimeta.SetStatusCondition(&cr.Status.Conditions, metav1.Condition{
-			Type:    conditionPayloadGenerated,
-			Status:  metav1.ConditionFalse,
-			Reason:  "InvalidConfig",
-			Message: err.Error(),
-		})
-		return ctrl.Result{}, r.Status().Update(ctx, cr)
+		var ve *validationError
+		if errors.As(err, &ve) {
+			apimeta.SetStatusCondition(&cr.Status.Conditions, metav1.Condition{
+				Type:    conditionPayloadGenerated,
+				Status:  metav1.ConditionFalse,
+				Reason:  "InvalidConfig",
+				Message: err.Error(),
+			})
+			return ctrl.Result{}, r.Status().Update(ctx, cr)
+		}
+		return ctrl.Result{}, err
 	}
 
 	in := hashInputs{
@@ -120,9 +131,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	gen := genInputs{
 		releaseImage:        cr.Spec.ReleaseImage,
 		customConfig:        joinManifests(resolved),
-		pullSecretHash:      supportutil.HashSimple(string(pullSecretContent)),
-		trustBundleHash:     supportutil.HashSimple(string(trustBundleContent)),
-		hcConfigurationHash: supportutil.HashSimple(string(rolloutGlobalConfig)),
+		pullSecretHash:      supportutil.HashSimple(pullSecretContent),
+		trustBundleHash:     supportutil.HashSimple(trustBundleContent),
+		hcConfigurationHash: supportutil.HashSimple(rolloutGlobalConfig),
 		osStream:            cr.Spec.OSStream,
 		cloudConfigHash:     "", // Phase 2: cloud-config boundary resolved with Phase 4.
 	}
@@ -243,8 +254,8 @@ func (r *Reconciler) readSecretKey(ctx context.Context, ns, name, key string) ([
 	return s.Data[key], nil
 }
 
-// readConfigMapKey returns the "config" bytes of the named ConfigMap, or nil if name is empty.
-func (r *Reconciler) readConfigMapKey(ctx context.Context, ns, name string) ([]byte, error) {
+// readConfigMapKey returns the bytes under key in the named ConfigMap, or nil if name is empty.
+func (r *Reconciler) readConfigMapKey(ctx context.Context, ns, name, key string) ([]byte, error) {
 	if name == "" {
 		return nil, nil
 	}
@@ -252,7 +263,7 @@ func (r *Reconciler) readConfigMapKey(ctx context.Context, ns, name string) ([]b
 	if err := r.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, cm); err != nil {
 		return nil, err
 	}
-	return []byte(cm.Data[configDataKey]), nil
+	return []byte(cm.Data[key]), nil
 }
 
 func joinManifests(r ResolvedConfig) string {
