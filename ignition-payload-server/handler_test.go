@@ -37,6 +37,21 @@ func doGet(h http.HandlerFunc, token string) *httptest.ResponseRecorder {
 	return rec
 }
 
+// Final review #1: the detached OnServed context must carry a timeout so a slow apiserver can't
+// leak unbounded goroutines.
+func TestOnServedContextHasDeadline(t *testing.T) {
+	g := NewWithT(t)
+	withTok := seedStore(t, "tok-1")
+	done := make(chan bool, 1)
+	s := &Server{Namespace: "hcp", Cached: withTok, Uncached: withTok,
+		OnServed: func(ctx context.Context, _ payloadstore.OwnerRef, _ string) {
+			_, hasDeadline := ctx.Deadline()
+			done <- hasDeadline
+		}}
+	g.Expect(doGet(s.HandleIgnition, "tok-1").Code).To(Equal(http.StatusOK))
+	g.Eventually(done).Should(Receive(BeTrue()))
+}
+
 func TestServe(t *testing.T) {
 	g := NewWithT(t)
 	empty := fake.NewClientBuilder().WithScheme(scheme.Scheme).Build()

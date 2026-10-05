@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"regexp"
+	"time"
 
 	payloadstore "github.com/openshift/hypershift/support/ignitionpayload"
 	supportutil "github.com/openshift/hypershift/support/util"
@@ -15,6 +16,10 @@ import (
 )
 
 var ignPathPattern = regexp.MustCompile("^/ignition[^/ ]*$")
+
+// onServedTimeout bounds the detached IgnitionReached write so a slow apiserver cannot leak
+// goroutines under request load.
+const onServedTimeout = 10 * time.Second
 
 // Server serves ignition payloads from the PayloadStore with read-through on cache miss.
 type Server struct {
@@ -69,8 +74,13 @@ func (s *Server) HandleIgnition(w http.ResponseWriter, r *http.Request) {
 
 	if s.OnServed != nil {
 		// Detach from the request context so the IgnitionReached write completes after the
-		// response is written.
-		go s.OnServed(context.WithoutCancel(r.Context()), owner, token)
+		// response is written, but bound it with a timeout so a slow apiserver can't leak
+		// goroutines under request load.
+		go func() {
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), onServedTimeout)
+			defer cancel()
+			s.OnServed(ctx, owner, token)
+		}()
 	}
 }
 
