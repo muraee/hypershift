@@ -92,8 +92,16 @@ func (s *SecretBackedStore) Put(ctx context.Context, owner OwnerRef, token, iden
 }
 
 func (s *SecretBackedStore) Get(ctx context.Context, token string) (payload []byte, owner OwnerRef, err error) {
+	return ReadPayload(ctx, s.client, s.namespace, token)
+}
+
+// ReadPayload reads the payload bytes and owning CR for token from namespace using any
+// client.Reader. The serving tier uses it with both a cached manager client (informer) and the
+// uncached APIReader (read-through on cache miss). Returns ErrNotFound if the backing Secret
+// does not exist.
+func ReadPayload(ctx context.Context, r client.Reader, namespace, token string) (payload []byte, owner OwnerRef, err error) {
 	secret := &corev1.Secret{}
-	if err := s.client.Get(ctx, client.ObjectKey{Namespace: s.namespace, Name: secretName(token)}, secret); err != nil {
+	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: secretName(token)}, secret); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil, OwnerRef{}, ErrNotFound
 		}
