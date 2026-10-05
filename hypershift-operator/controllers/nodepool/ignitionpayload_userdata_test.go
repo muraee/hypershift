@@ -13,11 +13,12 @@ import (
 	payloadstore "github.com/openshift/hypershift/support/ignitionpayload"
 	supportutil "github.com/openshift/hypershift/support/util"
 
-	ignitionapi "github.com/coreos/ignition/v2/config/v3_2/types"
-
 	corev1 "k8s.io/api/core/v1"
+
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	ignitionapi "github.com/coreos/ignition/v2/config/v3_2/types"
 )
 
 func httpHeaderValue(cfg ignitionapi.Config, name string) string {
