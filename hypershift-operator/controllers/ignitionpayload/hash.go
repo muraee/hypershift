@@ -21,6 +21,14 @@ type hashInputs struct {
 	trustBundleContent  []byte
 	rolloutGlobalConfig []byte // bytes of the rolloutGlobalConfig ConfigMap ("" if unset)
 	osStream            string
+	// hcConfigHash is backwardcompat.GetBackwardCompatibleConfigHash(hcp.Spec.Configuration): the
+	// full cluster-configuration hash CPO writes into the machine-config-server ConfigMap. It feeds
+	// the identity hash (a full-config change refreshes the payload) but NOT the rollout hash
+	// (rollout triggers only on the proxy/image/TLS subset carried by rolloutGlobalConfig).
+	hcConfigHash string
+	// cloudConfigHash is the hash of the platform cloud-provider config ("" for AWS/None). It feeds
+	// the identity hash only (a cloud-config change refreshes the payload but does not roll).
+	cloudConfigHash string
 }
 
 // payloadIdentityHash covers EVERYTHING embedded in the rendered payload, including the
@@ -34,7 +42,9 @@ func payloadIdentityHash(in hashInputs) string {
 		string(in.pullSecretContent) +
 		string(in.trustBundleContent) +
 		string(in.rolloutGlobalConfig) +
-		in.osStream)
+		in.osStream +
+		in.hcConfigHash +
+		in.cloudConfigHash)
 }
 
 // rolloutHash covers only rollout-relevant inputs. It EXCLUDES the mgmt (HAProxy) manifests
