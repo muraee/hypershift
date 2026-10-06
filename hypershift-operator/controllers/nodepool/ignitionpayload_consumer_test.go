@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 
+	. "github.com/onsi/gomega"
+
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	pkgmanifests "github.com/openshift/hypershift/pkg/manifests"
 	"github.com/openshift/hypershift/support/api"
@@ -16,8 +18,6 @@ import (
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-
-	. "github.com/onsi/gomega"
 )
 
 func TestEnqueueNodePoolForIgnitionPayload(t *testing.T) {
@@ -280,10 +280,12 @@ func TestFinalizeIgnitionPayloadConsumer(t *testing.T) {
 
 	g.Expect(finalizeIgnitionPayloadConsumer(ctx, c, hcpNS, "np-1")).To(Succeed())
 
-	// The consumer finalizer is removed; other controllers' finalizers are left intact
-	// so their own cleanup can still run.
+	// The CR is deleted (so the PayloadController frees its token and owned resources GC); the
+	// consumer finalizer is removed; other controllers' finalizers are left intact so their own
+	// cleanup still runs (the other/keep finalizer keeps the object observable for this assertion).
 	fetched := &hyperv1.IgnitionPayload{}
 	g.Expect(c.Get(ctx, client.ObjectKey{Namespace: hcpNS, Name: "np-1"}, fetched)).To(Succeed())
+	g.Expect(fetched.DeletionTimestamp.IsZero()).To(BeFalse(), "CR must be marked for deletion")
 	g.Expect(sets.New(fetched.Finalizers...).Has(consumerFinalizer)).To(BeFalse())
 	g.Expect(sets.New(fetched.Finalizers...).Has("other/keep")).To(BeTrue())
 

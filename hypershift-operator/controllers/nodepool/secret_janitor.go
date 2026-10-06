@@ -63,6 +63,15 @@ func (r *secretJanitor) Reconcile(ctx context.Context, req reconcile.Request) (r
 		return ctrl.Result{}, nil
 	}
 
+	// Secrets owned by an IgnitionPayload CR belong to the re-architected ignition path: they are
+	// reconciled by the NodePool IgnitionPayload consumer and garbage-collected with the CR. The
+	// legacy janitor must not expire or delete them — under the IgnitionPayloadSystem gate the live
+	// userdata Secret is named on the payload rollout hash, which is not in this janitor's expected
+	// (legacy Hash()) name set, so without this guard the janitor would delete the in-use Secret.
+	if isOwnedByIgnitionPayload(secret) {
+		return ctrl.Result{}, nil
+	}
+
 	nodePool := &hyperv1.NodePool{}
 	if err := r.Client.Get(ctx, supportutil.ParseNamespacedName(nodePoolName), nodePool); err != nil && !apierrors.IsNotFound(err) {
 		log.Error(err, "error getting nodepool")
@@ -176,6 +185,18 @@ func (r *secretJanitor) Reconcile(ctx context.Context, req reconcile.Request) (r
 
 	log.WithValues("options", names, "valid", valid).Info("removing secret as it does not match the expected set of names")
 	return ctrl.Result{}, cleanup(ctx, r.Client, secret)
+}
+
+// isOwnedByIgnitionPayload reports whether obj carries a controller/owner reference to an
+// IgnitionPayload CR (the re-architected ignition path's owner). Such objects are managed and
+// garbage-collected by that path, not the legacy secret janitor.
+func isOwnedByIgnitionPayload(obj client.Object) bool {
+	for _, ref := range obj.GetOwnerReferences() {
+		if ref.Kind == "IgnitionPayload" && ref.APIVersion == hyperv1.GroupVersion.String() {
+			return true
+		}
+	}
+	return false
 }
 
 // shouldKeepOldUserData determines if the old user data should be kept.

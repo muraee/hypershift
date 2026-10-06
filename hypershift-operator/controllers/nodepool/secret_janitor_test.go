@@ -40,6 +40,39 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 )
 
+// TestSecretJanitor_SkipsIgnitionPayloadOwned pins that the legacy janitor never touches a
+// userdata/token Secret owned by an IgnitionPayload CR (the re-architected path manages + GCs it),
+// even when its name is not in the janitor's expected (legacy Hash()) set — the gate-ON live userdata
+// Secret is named on the payload rollout hash.
+func TestSecretJanitor_SkipsIgnitionPayloadOwned(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	const hcpNS = "clusters-hc"
+
+	owned := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   hcpNS,
+			Name:        "user-data-np-1-rollouthash", // not the legacy Hash()-based name
+			Annotations: map[string]string{nodePoolAnnotation: "clusters/np-1"},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: hyperv1.GroupVersion.String(),
+				Kind:       "IgnitionPayload",
+				Name:       "np-1",
+				Controller: func() *bool { b := true; return &b }(),
+			}},
+		},
+	}
+	c := fake.NewClientBuilder().WithScheme(api.Scheme).WithObjects(owned).Build()
+	r := &secretJanitor{NodePoolReconciler: &NodePoolReconciler{Client: c}, now: time.Now}
+
+	_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(owned)})
+	g.Expect(err).ToNot(HaveOccurred())
+
+	// The IgnitionPayload-owned Secret must still exist (not deleted/expired by the janitor).
+	got := &corev1.Secret{}
+	g.Expect(c.Get(ctx, client.ObjectKeyFromObject(owned), got)).To(Succeed())
+}
+
 func TestSecretJanitor_Reconcile(t *testing.T) {
 	ctx := ctrl.LoggerInto(t.Context(), zapr.NewLogger(zaptest.NewLogger(t)))
 	mockCtrl := gomock.NewController(t)

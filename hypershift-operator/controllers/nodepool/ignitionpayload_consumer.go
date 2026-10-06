@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"strings"
 
-	configv1 "github.com/openshift/api/config/v1"
-
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/v2/ignitionpayloadserver"
 	pkgmanifests "github.com/openshift/hypershift/pkg/manifests"
@@ -14,6 +12,8 @@ import (
 	"github.com/openshift/hypershift/support/capabilities"
 	payloadstore "github.com/openshift/hypershift/support/ignitionpayload"
 	"github.com/openshift/hypershift/support/releaseinfo"
+
+	configv1 "github.com/openshift/api/config/v1"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -258,10 +258,12 @@ func adoptUserDataSecretName(nodePool *hyperv1.NodePool, current hyperv1.Payload
 	return name
 }
 
-// finalizeIgnitionPayloadConsumer removes the consumer finalizer from the NodePool's
-// IgnitionPayload CR so it (and its owned ConfigMaps/userdata Secret, via owner-reference
-// garbage collection) can be reclaimed. Other controllers' finalizers are left intact. An
-// absent CR is a no-op.
+// finalizeIgnitionPayloadConsumer tears down the NodePool's IgnitionPayload CR when the NodePool is
+// deleted: it deletes the CR (so the PayloadController frees the CR's store tokens via its own
+// storeCleanupFinalizer, and the CR-owned projected ConfigMaps + userdata/compat Secrets are
+// garbage-collected) and removes the consumer finalizer. Without the delete the CR, its store token,
+// and its owned Secrets would leak until HostedCluster teardown. Both steps are idempotent; an absent
+// CR is a no-op.
 func finalizeIgnitionPayloadConsumer(ctx context.Context, c client.Client, hcpNamespace, nodePoolName string) error {
 	cr := &hyperv1.IgnitionPayload{}
 	if err := c.Get(ctx, client.ObjectKey{Namespace: hcpNamespace, Name: nodePoolName}, cr); err != nil {
@@ -270,13 +272,21 @@ func finalizeIgnitionPayloadConsumer(ctx context.Context, c client.Client, hcpNa
 		}
 		return err
 	}
-	if !sets.New(cr.Finalizers...).Has(consumerFinalizer) {
-		return nil
+	// Request deletion so the PayloadController runs its store-cleanup finalizer and owner-reference GC
+	// reclaims the CR-owned resources. Idempotent: no-op once a deletion timestamp is set.
+	if cr.DeletionTimestamp.IsZero() {
+		if err := c.Delete(ctx, cr); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete IgnitionPayload %s/%s: %w", hcpNamespace, nodePoolName, err)
+		}
 	}
-	patch := client.MergeFrom(cr.DeepCopy())
-	cr.Finalizers = sets.List(sets.New(cr.Finalizers...).Delete(consumerFinalizer))
-	if err := c.Patch(ctx, cr, patch); err != nil {
-		return fmt.Errorf("failed to remove consumer finalizer from IgnitionPayload %s/%s: %w", hcpNamespace, nodePoolName, err)
+	// Drop the consumer finalizer; the CR is reclaimed once the PayloadController also removes its
+	// store-cleanup finalizer. Other controllers' finalizers are left intact.
+	if sets.New(cr.Finalizers...).Has(consumerFinalizer) {
+		patch := client.MergeFrom(cr.DeepCopy())
+		cr.Finalizers = sets.List(sets.New(cr.Finalizers...).Delete(consumerFinalizer))
+		if err := c.Patch(ctx, cr, patch); err != nil {
+			return fmt.Errorf("failed to remove consumer finalizer from IgnitionPayload %s/%s: %w", hcpNamespace, nodePoolName, err)
+		}
 	}
 	return nil
 }
