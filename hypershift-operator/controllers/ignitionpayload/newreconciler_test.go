@@ -15,9 +15,10 @@ func TestNewReconciler(t *testing.T) {
 	g := NewWithT(t)
 	store := payloadstore.NewMemStore()
 	c := fake.NewClientBuilder().WithScheme(api.Scheme).Build()
-	r := NewReconciler(c, store, &fakeProvider{}, "hcp")
+	r := NewReconciler(c, store, &fakeProvider{}, &fakeReleaseProvider{}, "hcp")
 	g.Expect(r).ToNot(BeNil())
 	g.Expect(r.Store).To(Equal(store))
 	g.Expect(r.Generator).ToNot(BeNil())
+	g.Expect(r.ReleaseProvider).ToNot(BeNil())
 	g.Expect(r.Namespace).To(Equal("hcp"))
 }

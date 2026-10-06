@@ -3,10 +3,12 @@ package ignitionpayload
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	payloadstore "github.com/openshift/hypershift/support/ignitionpayload"
+	"github.com/openshift/hypershift/support/releaseinfo"
 	supportutil "github.com/openshift/hypershift/support/util"
 
 	corev1 "k8s.io/api/core/v1"
@@ -40,7 +42,10 @@ type Reconciler struct {
 	client.Client
 	Store     payloadstore.PayloadStore
 	Generator *payloadGenerator
-	Namespace string
+	// ReleaseProvider resolves a release-image pullspec to its OCP version for the rollout/identity
+	// hashes (matching the deployed ConfigGenerator.Hash, which keys on releaseImage.Version()).
+	ReleaseProvider releaseinfo.Provider
+	Namespace       string
 }
 
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -106,9 +111,17 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, err
 	}
 
+	// Resolve the release pullspec to its OCP version for the hashes, matching the deployed
+	// ConfigGenerator.Hash() which keys on releaseImage.Version() (not the pullspec). A Lookup
+	// failure is transient and requeues; it is not a config-validation failure.
+	releaseImage, err := r.ReleaseProvider.Lookup(ctx, cr.Spec.ReleaseImage, pullSecretContent)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to resolve release image %q: %w", cr.Spec.ReleaseImage, err)
+	}
+
 	in := hashInputs{
 		resolved:            resolved,
-		releaseVersion:      cr.Spec.ReleaseImage,
+		releaseVersion:      releaseImage.Version(),
 		pullSecretName:      cr.Spec.PullSecretName,
 		pullSecretContent:   pullSecretContent,
 		trustBundleName:     cr.Spec.AdditionalTrustBundle.Name,

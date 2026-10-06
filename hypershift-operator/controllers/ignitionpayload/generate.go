@@ -6,18 +6,21 @@ import (
 
 	ignserver "github.com/openshift/hypershift/ignition-server/controllers"
 	payloadstore "github.com/openshift/hypershift/support/ignitionpayload"
+	"github.com/openshift/hypershift/support/releaseinfo"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// NewReconciler builds a payload-controller Reconciler wired to the given store and MCO-pipeline
-// provider. It is the exported entry point for the ignition-payload-controller command.
-func NewReconciler(c client.Client, store payloadstore.PayloadStore, provider ignserver.IgnitionProvider, namespace string) *Reconciler {
+// NewReconciler builds a payload-controller Reconciler wired to the given store, MCO-pipeline
+// provider, and release provider. It is the exported entry point for the
+// ignition-payload-controller command.
+func NewReconciler(c client.Client, store payloadstore.PayloadStore, provider ignserver.IgnitionProvider, releaseProvider releaseinfo.Provider, namespace string) *Reconciler {
 	return &Reconciler{
-		Client:    c,
-		Store:     store,
-		Generator: &payloadGenerator{store: store, provider: provider},
-		Namespace: namespace,
+		Client:          c,
+		Store:           store,
+		Generator:       &payloadGenerator{store: store, provider: provider},
+		ReleaseProvider: releaseProvider,
+		Namespace:       namespace,
 	}
 }
 
