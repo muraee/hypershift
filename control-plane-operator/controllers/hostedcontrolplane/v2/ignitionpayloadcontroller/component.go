@@ -1,7 +1,6 @@
 package ignitionpayloadcontroller
 
 import (
-	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	component "github.com/openshift/hypershift/support/controlplane-component"
 	"github.com/openshift/hypershift/support/releaseinfo"
 )
@@ -50,11 +49,14 @@ func NewComponent(opts *Options) component.ControlPlaneComponent {
 		Build()
 }
 
-// predicate enables the component when the IgnitionPayloadSystem feature gate is on (threaded in
-// via Options.Enabled) and ignition is not disabled entirely via the DisableIgnitionServerAnnotation.
-// When it returns false the CPOv2 framework tears the component down, so flipping the gate off
-// removes it.
-func (o *Options) predicate(cpContext component.WorkloadContext) (bool, error) {
-	_, disableIgnition := cpContext.HCP.Annotations[hyperv1.DisableIgnitionServerAnnotation]
-	return o.Enabled && !disableIgnition, nil
+// predicate enables the component solely on Options.Enabled, which the HyperShift Operator computes as
+// "IgnitionPayloadSystem gate on AND the operator did not set DisableIgnitionServerAnnotation on the
+// HostedCluster". When it returns false the CPOv2 framework tears the component down.
+//
+// It deliberately does NOT read DisableIgnitionServerAnnotation from the HCP: that annotation also
+// carries the HO's legacy-standdown cutover signal, which must not disable the new components. Operator
+// intent ("no ignition at all") is already folded into Enabled, so a per-HostedCluster operator-disable
+// tears these down too.
+func (o *Options) predicate(_ component.WorkloadContext) (bool, error) {
+	return o.Enabled, nil
 }

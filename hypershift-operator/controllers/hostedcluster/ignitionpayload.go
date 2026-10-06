@@ -13,6 +13,7 @@ limitations under the License.
 package hostedcluster
 
 import (
+	"context"
 	"fmt"
 
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
@@ -34,26 +35,45 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// useIgnitionPayloadSystem reports whether the re-architected ignition payload stack
-// (ignition-payload-controller + ignition-payload-server + proxy) should back this
-// HostedCluster's ignition endpoint. It is true when the IgnitionPayloadSystem management
-// feature gate is enabled and ignition is not disabled entirely via the
-// DisableIgnitionServerAnnotation. When false, the legacy ignition-server stack is used.
-func useIgnitionPayloadSystem(hcluster *hyperv1.HostedCluster) bool {
-	if _, disabled := hcluster.Annotations[hyperv1.DisableIgnitionServerAnnotation]; disabled {
-		return false
-	}
-	return featuregate.Gate().Enabled(featuregate.IgnitionPayloadSystem)
+// hasDisableIgnitionServerAnnotation reports whether the operator set DisableIgnitionServerAnnotation
+// on the HostedCluster, i.e. requested no ignition at all. This reads the HostedCluster (operator
+// intent), which is distinct from the same annotation on the HostedControlPlane — the HO also sets
+// the HCP annotation purely as the legacy-standdown cutover signal, so the HCP value cannot be used
+// to infer operator intent.
+func hasDisableIgnitionServerAnnotation(hcluster *hyperv1.HostedCluster) bool {
+	_, ok := hcluster.Annotations[hyperv1.DisableIgnitionServerAnnotation]
+	return ok
 }
 
-// ignitionEndpointResources returns the empty Route, proxy Service, and backend server
-// Service objects (name + namespace only) whose cluster state the ignition endpoint is
-// derived from. When useIgnitionPayloadSystem is true the re-architected ignition-payload-*
-// stack names are returned; otherwise the legacy ignition-server stack names. The two
-// endpoint-derivation blocks (hostedcluster_controller.go and reconcile_legacy.go) share
-// this helper so their resource selection cannot drift.
-func ignitionEndpointResources(hcluster *hyperv1.HostedCluster, namespace string) (route *routev1.Route, proxyService *corev1.Service, serverService *corev1.Service) {
-	if useIgnitionPayloadSystem(hcluster) {
+// ignitionPayloadCutoverActive reports whether the data plane has cut over to the re-architected
+// ignition payload stack for this HostedControlPlane. It is true when the IgnitionPayloadSystem
+// management feature gate is enabled AND the new ignition-payload-server ControlPlaneComponent
+// reports Available. This drives both endpoint re-pointing and the legacy-standdown signal, so the
+// legacy ignition-server is only disabled once the new server is actually serving (no serving gap).
+func ignitionPayloadCutoverActive(ctx context.Context, c client.Client, hcpNamespace string) (bool, error) {
+	if !featuregate.Gate().Enabled(featuregate.IgnitionPayloadSystem) {
+		return false, nil
+	}
+	cr := &hyperv1.ControlPlaneComponent{
+		ObjectMeta: metav1.ObjectMeta{Namespace: hcpNamespace, Name: ignitionpayloadserver.ComponentName},
+	}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(cr), cr); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to get %s ControlPlaneComponent: %w", ignitionpayloadserver.ComponentName, err)
+	}
+	return meta.IsStatusConditionTrue(cr.Status.Conditions, string(hyperv1.ControlPlaneComponentAvailable)), nil
+}
+
+// ignitionEndpointResources returns the empty Route, proxy Service, and backend server Service
+// objects (name + namespace only) whose cluster state the ignition endpoint is derived from. When
+// the cutover to the re-architected stack is active the ignition-payload-* names are returned;
+// otherwise the legacy ignition-server names. The two endpoint-derivation blocks
+// (hostedcluster_controller.go and reconcile_legacy.go) share this helper so their resource
+// selection cannot drift.
+func ignitionEndpointResources(cutoverActive bool, namespace string) (route *routev1.Route, proxyService *corev1.Service, serverService *corev1.Service) {
+	if cutoverActive {
 		route = &routev1.Route{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: ignitionpayloadserver.ComponentName}}
 		proxyService = &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: ignitionpayloadserverproxy.ComponentName}}
 		serverService = &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: ignitionpayloadserver.ComponentName}}
@@ -70,12 +90,18 @@ func ignitionEndpointResources(hcluster *hyperv1.HostedCluster, namespace string
 // predicate-false delete path. When the gate is off and the components were never created, these are
 // no-op deletes, so the gate-off path leaves cluster state unchanged.
 //
-// After reconciling, it maintains the IgnitionPayloadActiveAnnotation on the HCP (the
-// legacy-standdown signal): set to "true" only once the new ignition-payload-server reports
-// Available, removed otherwise. The legacy ignition-server/proxy predicates stand down while it is
-// set, so the legacy stack is torn down only after the new one serves (no serving gap).
-func (r *HostedClusterReconciler) reconcileIgnitionPayloadComponents(cpContext controlplanecomponent.ControlPlaneContext, hypershiftOperatorImage string, releaseProvider releaseinfo.ProviderWithOpenShiftImageRegistryOverrides, defaultIngressDomain string) error {
-	enabled := featuregate.Gate().Enabled(featuregate.IgnitionPayloadSystem)
+// The legacy-standdown signal is handled separately (the HO sets the existing
+// DisableIgnitionServerAnnotation on the HCP once cutover is active, in
+// reconcileHostedControlPlaneAnnotations) rather than via a new annotation an older in-cluster CPO
+// would not understand during an N->N+1 upgrade.
+//
+// Enabled encodes BOTH the management gate AND the per-HostedCluster operator intent: if the operator
+// set DisableIgnitionServerAnnotation on the HostedCluster ("no ignition at all"), Enabled is false so
+// the new components are torn down — and the annotation mirror loop also disables the legacy stack, so
+// both are off. The component predicates key ONLY on this Enabled bool, never on the HCP annotation
+// (which also carries the HO's cutover signal and must not disable the new components).
+func (r *HostedClusterReconciler) reconcileIgnitionPayloadComponents(cpContext controlplanecomponent.ControlPlaneContext, hcluster *hyperv1.HostedCluster, hypershiftOperatorImage string, releaseProvider releaseinfo.ProviderWithOpenShiftImageRegistryOverrides, defaultIngressDomain string) error {
+	enabled := featuregate.Gate().Enabled(featuregate.IgnitionPayloadSystem) && !hasDisableIgnitionServerAnnotation(hcluster)
 
 	controller := ignitionpayloadcontroller.NewComponent(&ignitionpayloadcontroller.Options{
 		HyperShiftOperatorImage: hypershiftOperatorImage,
@@ -102,57 +128,5 @@ func (r *HostedClusterReconciler) reconcileIgnitionPayloadComponents(cpContext c
 		return fmt.Errorf("failed to reconcile ignition-payload-server-proxy component: %w", err)
 	}
 
-	return r.reconcileIgnitionPayloadActiveAnnotation(cpContext, enabled)
-}
-
-// reconcileIgnitionPayloadActiveAnnotation maintains the IgnitionPayloadActiveAnnotation on the
-// HostedControlPlane. It is set to "true" only when the IgnitionPayloadSystem gate is on AND the new
-// ignition-payload-server ControlPlaneComponent reports Available, and removed otherwise. This is the
-// legacy-standdown signal consumed by the legacy ignition-server/proxy component predicates, so the
-// legacy stack is torn down only once the new server is serving.
-func (r *HostedClusterReconciler) reconcileIgnitionPayloadActiveAnnotation(cpContext controlplanecomponent.ControlPlaneContext, gateEnabled bool) error {
-	serverAvailable := false
-	if gateEnabled {
-		cr := &hyperv1.ControlPlaneComponent{
-			ObjectMeta: metav1.ObjectMeta{
-				Namespace: cpContext.HCP.Namespace,
-				Name:      ignitionpayloadserver.ComponentName,
-			},
-		}
-		if err := cpContext.Client.Get(cpContext, client.ObjectKeyFromObject(cr), cr); err != nil {
-			if !apierrors.IsNotFound(err) {
-				return fmt.Errorf("failed to get %s ControlPlaneComponent: %w", ignitionpayloadserver.ComponentName, err)
-			}
-		} else {
-			serverAvailable = meta.IsStatusConditionTrue(cr.Status.Conditions, string(hyperv1.ControlPlaneComponentAvailable))
-		}
-	}
-
-	active := gateEnabled && serverAvailable
-
-	hcp := cpContext.HCP
-	if active {
-		if hcp.Annotations[hyperv1.IgnitionPayloadActiveAnnotation] == "true" {
-			return nil
-		}
-	} else if _, present := hcp.Annotations[hyperv1.IgnitionPayloadActiveAnnotation]; !present {
-		return nil
-	}
-
-	original := hcp.DeepCopy()
-	if active {
-		if hcp.Annotations == nil {
-			hcp.Annotations = map[string]string{}
-		}
-		hcp.Annotations[hyperv1.IgnitionPayloadActiveAnnotation] = "true"
-	} else {
-		delete(hcp.Annotations, hyperv1.IgnitionPayloadActiveAnnotation)
-	}
-	// Metadata (not status) patch, so the hcpstatuspatch linter does not apply; the optimistic lock
-	// mirrors the HCP finalizer patch in reconcileKarpenterOperator and surfaces concurrent writes
-	// as a conflict (retried on the next reconcile) rather than silently clobbering them.
-	if err := cpContext.Client.Patch(cpContext, hcp, client.MergeFromWithOptions(original, client.MergeFromWithOptimisticLock{})); err != nil {
-		return fmt.Errorf("failed to patch HostedControlPlane %s annotation: %w", hyperv1.IgnitionPayloadActiveAnnotation, err)
-	}
 	return nil
 }

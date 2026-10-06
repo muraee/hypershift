@@ -55,11 +55,15 @@ func NewComponent(opts *Options) component.ControlPlaneComponent {
 		Build()
 }
 
-// predicate deploys the proxy when the IgnitionPayloadSystem feature gate is on (threaded in via
-// Options.Enabled), on all platforms except IBMCloud (where the server Service is exposed directly),
-// unless ignition is disabled entirely via the DisableIgnitionServerAnnotation. When it returns
-// false the CPOv2 framework tears the component down, so flipping the gate off removes it.
+// predicate deploys the proxy on Options.Enabled — which the HyperShift Operator computes as
+// "IgnitionPayloadSystem gate on AND the operator did not set DisableIgnitionServerAnnotation on the
+// HostedCluster" — on all platforms except IBMCloud (where the server Service is exposed directly).
+// When it returns false the CPOv2 framework tears the component down.
+//
+// It deliberately does NOT read DisableIgnitionServerAnnotation from the HCP: that annotation also
+// carries the HO's legacy-standdown cutover signal, which must not disable the new proxy. Operator
+// intent ("no ignition at all") is already folded into Enabled, so a per-HostedCluster operator-disable
+// tears the proxy down too.
 func (o *Options) predicate(cpContext component.WorkloadContext) (bool, error) {
-	_, disableIgnition := cpContext.HCP.Annotations[hyperv1.DisableIgnitionServerAnnotation]
-	return o.Enabled && !disableIgnition && cpContext.HCP.Spec.Platform.Type != hyperv1.IBMCloudPlatform, nil
+	return o.Enabled && cpContext.HCP.Spec.Platform.Type != hyperv1.IBMCloudPlatform, nil
 }

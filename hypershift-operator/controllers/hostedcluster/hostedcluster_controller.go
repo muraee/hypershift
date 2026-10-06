@@ -1139,11 +1139,16 @@ func (r *HostedClusterReconciler) reconcile(ctx context.Context, req ctrl.Reques
 			log.Error(fmt.Errorf("ignition server service strategy not specified"), "")
 			return ctrl.Result{}, nil
 		}
-		// Select the ignition (Route, proxy Service, server Service) to read based on the
-		// IgnitionPayloadSystem feature gate: gate ON -> the new ignition-payload-* stack,
-		// gate OFF -> the legacy ignition-server stack. The same host serves either proxy, so
-		// the user-supplied Route.Hostname passthrough below is unaffected.
-		ignitionRoute, ignitionProxyService, ignitionBackendService := ignitionEndpointResources(hcluster, controlPlaneNamespace.GetName())
+		// Select the ignition (Route, proxy Service, server Service) to read based on whether the
+		// cutover to the re-architected ignition stack is active (gate ON && new ignition-payload-server
+		// Available): active -> the new ignition-payload-* stack, otherwise -> the legacy ignition-server
+		// stack. The same host serves either proxy, so the user-supplied Route.Hostname passthrough below
+		// is unaffected. Gate OFF short-circuits with no extra API call, so this path is unchanged.
+		ignitionPayloadActive, cutoverErr := ignitionPayloadCutoverActive(ctx, r.Client, controlPlaneNamespace.GetName())
+		if cutoverErr != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to determine ignition payload cutover state: %w", cutoverErr)
+		}
+		ignitionRoute, ignitionProxyService, ignitionBackendService := ignitionEndpointResources(ignitionPayloadActive, controlPlaneNamespace.GetName())
 		switch serviceStrategy.Type {
 		case hyperv1.Route:
 			if serviceStrategy.Route != nil && serviceStrategy.Route.Hostname != "" {
@@ -1737,9 +1742,14 @@ func (r *HostedClusterReconciler) reconcileCoreHCPChain(
 		return hcp, fmt.Errorf("failed to determine if AWS node termination handler is needed: %w", err)
 	}
 
+	cutoverActive, err := ignitionPayloadCutoverActive(ctx, r.Client, controlPlaneNamespace)
+	if err != nil {
+		return hcp, fmt.Errorf("failed to determine ignition payload cutover state: %w", err)
+	}
+
 	hcp = controlplaneoperator.HostedControlPlane(controlPlaneNamespace, hcluster.Name)
 	_, err = createOrUpdate(ctx, r.Client, hcp, func() error {
-		return reconcileHostedControlPlane(hcp, hcluster, isAutoscalingNeeded, isAWSNodeTerminationHandlerNeeded,
+		return reconcileHostedControlPlane(hcp, hcluster, isAutoscalingNeeded, isAWSNodeTerminationHandlerNeeded, cutoverActive,
 			annotationsForCertRenewal(log,
 				hcp,
 				shouldCheckForStaleCerts(hcluster, defaultToControlPlaneV2),
@@ -1863,7 +1873,7 @@ func (r *HostedClusterReconciler) reconcileOperatorDeployments(ctx context.Conte
 		}
 		ignitionPayloadIngressDomain = domain
 	}
-	if err := r.reconcileIgnitionPayloadComponents(cpContext,
+	if err := r.reconcileIgnitionPayloadComponents(cpContext, hcluster,
 		r.HypershiftOperatorImage, releaseProvider, ignitionPayloadIngressDomain); err != nil {
 		errs = append(errs, fmt.Errorf("failed to reconcile ignition payload components: %w", err))
 	}
@@ -2847,7 +2857,7 @@ func shouldCheckForStaleCerts(hc *hyperv1.HostedCluster, defaultingToControlPlan
 	}
 }
 
-func reconcileHostedControlPlaneAnnotations(hcp *hyperv1.HostedControlPlane, hcluster *hyperv1.HostedCluster, isAutoscalingNeeded bool, isAWSNodeTerminationHandlerNeeded bool, certRenewalAnnotations func() (map[string]string, error)) error {
+func reconcileHostedControlPlaneAnnotations(hcp *hyperv1.HostedControlPlane, hcluster *hyperv1.HostedCluster, isAutoscalingNeeded bool, isAWSNodeTerminationHandlerNeeded bool, ignitionPayloadCutoverActive bool, certRenewalAnnotations func() (map[string]string, error)) error {
 	if hcp.Annotations == nil {
 		hcp.Annotations = map[string]string{}
 	}
@@ -2915,6 +2925,17 @@ func reconcileHostedControlPlaneAnnotations(hcp *hyperv1.HostedControlPlane, hcl
 		}
 	}
 
+	// Cut the data plane over to the re-architected ignition stack by standing the legacy
+	// ignition-server down. This reuses the existing DisableIgnitionServerAnnotation — which the
+	// in-cluster CPO already honors across an N->N+1 upgrade — rather than a brand-new annotation an
+	// older CPO would silently ignore. It MUST run after the mirroredAnnotations loop above, which
+	// includes DisableIgnitionServerAnnotation and would otherwise clobber this write. Forward-only:
+	// we only set it when cutover is active; when inactive (gate off, or new server not yet
+	// Available) the mirror loop above already restores operator intent, so we never delete it here.
+	if ignitionPayloadCutoverActive {
+		hcp.Annotations[hyperv1.DisableIgnitionServerAnnotation] = "true"
+	}
+
 	prefixesToSync := []string{
 		hyperv1.IdentityProviderOverridesAnnotationPrefix,
 		hyperv1.ResourceRequestOverrideAnnotationPrefix,
@@ -2973,8 +2994,8 @@ func reconcileHostedControlPlaneAnnotations(hcp *hyperv1.HostedControlPlane, hcl
 
 // reconcileHostedControlPlane reconciles the given HostedControlPlane, which
 // will be mutated.
-func reconcileHostedControlPlane(hcp *hyperv1.HostedControlPlane, hcluster *hyperv1.HostedCluster, isAutoscalingNeeded bool, isAWSNodeTerminationHandlerNeeded bool, certRenewalAnnotations func() (map[string]string, error)) error {
-	if err := reconcileHostedControlPlaneAnnotations(hcp, hcluster, isAutoscalingNeeded, isAWSNodeTerminationHandlerNeeded, certRenewalAnnotations); err != nil {
+func reconcileHostedControlPlane(hcp *hyperv1.HostedControlPlane, hcluster *hyperv1.HostedCluster, isAutoscalingNeeded bool, isAWSNodeTerminationHandlerNeeded bool, ignitionPayloadCutoverActive bool, certRenewalAnnotations func() (map[string]string, error)) error {
+	if err := reconcileHostedControlPlaneAnnotations(hcp, hcluster, isAutoscalingNeeded, isAWSNodeTerminationHandlerNeeded, ignitionPayloadCutoverActive, certRenewalAnnotations); err != nil {
 		return err
 	}
 

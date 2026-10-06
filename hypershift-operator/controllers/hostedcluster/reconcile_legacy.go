@@ -334,10 +334,15 @@ func (r *HostedClusterReconciler) reconcileLegacy(ctx context.Context, req ctrl.
 			log.Error(nthErr, "failed to determine if AWS node termination handler is needed during pull secret recovery, defaulting to true")
 			isAWSNodeTerminationHandlerNeeded = true
 		}
+		cutoverActive, cutoverErr := ignitionPayloadCutoverActive(ctx, r.Client, controlPlaneNamespace.Name)
+		if cutoverErr != nil {
+			log.Error(cutoverErr, "failed to determine ignition payload cutover state during pull secret recovery, defaulting to false")
+			cutoverActive = false
+		}
 		_, hcpErr := createOrUpdate(ctx, r.Client, hcp, func() error {
 			// Skip cert annotation resolution during pull secret recovery — it requires
 			// the pull secret to resolve the CPO image, which is unavailable here.
-			return reconcileHostedControlPlane(hcp, hcluster, isAutoscalingNeeded, isAWSNodeTerminationHandlerNeeded,
+			return reconcileHostedControlPlane(hcp, hcluster, isAutoscalingNeeded, isAWSNodeTerminationHandlerNeeded, cutoverActive,
 				func() (map[string]string, error) { return nil, nil })
 		})
 		if hcpErr != nil {
@@ -758,11 +763,16 @@ func (r *HostedClusterReconciler) reconcileLegacy(ctx context.Context, req ctrl.
 			log.Error(fmt.Errorf("ignition server service strategy not specified"), "")
 			return ctrl.Result{}, nil
 		}
-		// Select the ignition (Route, proxy Service, server Service) to read based on the
-		// IgnitionPayloadSystem feature gate: gate ON -> the new ignition-payload-* stack,
-		// gate OFF -> the legacy ignition-server stack. The same host serves either proxy, so
-		// the user-supplied Route.Hostname passthrough below is unaffected.
-		ignitionRoute, ignitionProxyService, ignitionBackendService := ignitionEndpointResources(hcluster, controlPlaneNamespace.GetName())
+		// Select the ignition (Route, proxy Service, server Service) to read based on whether the
+		// cutover to the re-architected ignition stack is active (gate ON && new ignition-payload-server
+		// Available): active -> the new ignition-payload-* stack, otherwise -> the legacy ignition-server
+		// stack. The same host serves either proxy, so the user-supplied Route.Hostname passthrough below
+		// is unaffected. Gate OFF short-circuits with no extra API call, so this path is unchanged.
+		ignitionPayloadActive, cutoverErr := ignitionPayloadCutoverActive(ctx, r.Client, controlPlaneNamespace.GetName())
+		if cutoverErr != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to determine ignition payload cutover state: %w", cutoverErr)
+		}
+		ignitionRoute, ignitionProxyService, ignitionBackendService := ignitionEndpointResources(ignitionPayloadActive, controlPlaneNamespace.GetName())
 		switch serviceStrategy.Type {
 		case hyperv1.Route:
 			if serviceStrategy.Route != nil && serviceStrategy.Route.Hostname != "" {
@@ -1504,9 +1514,13 @@ func (r *HostedClusterReconciler) reconcileLegacy(ctx context.Context, req ctrl.
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to determine if AWS node termination handler is needed: %w", err)
 	}
+	cutoverActive, err := ignitionPayloadCutoverActive(ctx, r.Client, controlPlaneNamespace.Name)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to determine ignition payload cutover state: %w", err)
+	}
 	hcp = controlplaneoperator.HostedControlPlane(controlPlaneNamespace.Name, hcluster.Name)
 	_, err = createOrUpdate(ctx, r.Client, hcp, func() error {
-		return reconcileHostedControlPlane(hcp, hcluster, isAutoscalingNeeded, isAWSNodeTerminationHandlerNeeded,
+		return reconcileHostedControlPlane(hcp, hcluster, isAutoscalingNeeded, isAWSNodeTerminationHandlerNeeded, cutoverActive,
 			annotationsForCertRenewal(log,
 				hcp,
 				shouldCheckForStaleCerts(hcluster, defaultToControlPlaneV2),

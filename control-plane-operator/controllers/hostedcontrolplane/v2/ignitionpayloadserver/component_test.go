@@ -35,18 +35,18 @@ func TestOptionsWorkloadIdentity(t *testing.T) {
 
 func TestPredicate(t *testing.T) {
 	testCases := []struct {
-		name        string
-		enabled     bool
-		annotations map[string]string
-		expected    bool
+		name     string
+		enabled  bool
+		expected bool
 	}{
 		{name: "gate OFF -> false", enabled: false, expected: false},
-		{name: "gate ON, ignition enabled -> true", enabled: true, expected: true},
+		{name: "gate ON -> true", enabled: true, expected: true},
 		{
-			name:        "gate ON, DisableIgnitionServerAnnotation -> false",
-			enabled:     true,
-			annotations: map[string]string{hyperv1.DisableIgnitionServerAnnotation: "true"},
-			expected:    false,
+			// The predicate reads only Enabled, never the HCP DisableIgnitionServerAnnotation (which
+			// also carries the HO's cutover signal). Operator-disable is folded into Enabled upstream.
+			name:     "gate ON, HCP DisableIgnitionServerAnnotation set -> still true (predicate ignores it)",
+			enabled:  true,
+			expected: true,
 		},
 	}
 
@@ -54,7 +54,7 @@ func TestPredicate(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
 			hcp := &hyperv1.HostedControlPlane{
-				ObjectMeta: metav1.ObjectMeta{Name: "test-hcp", Namespace: "test-ns", Annotations: tc.annotations},
+				ObjectMeta: metav1.ObjectMeta{Name: "test-hcp", Namespace: "test-ns", Annotations: map[string]string{hyperv1.DisableIgnitionServerAnnotation: "true"}},
 			}
 			result, err := (&Options{Enabled: tc.enabled}).predicate(component.WorkloadContext{HCP: hcp})
 			g.Expect(err).ToNot(HaveOccurred())

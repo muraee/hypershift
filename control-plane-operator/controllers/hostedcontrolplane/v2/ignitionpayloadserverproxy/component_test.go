@@ -39,15 +39,17 @@ func TestPredicate(t *testing.T) {
 		expected    bool
 	}{
 		{name: "gate OFF -> false", enabled: false, platform: hyperv1.AWSPlatform, expected: false},
-		{name: "gate ON, AWS, ignition enabled -> true", enabled: true, platform: hyperv1.AWSPlatform, expected: true},
-		{name: "gate ON, Azure, ignition enabled -> true", enabled: true, platform: hyperv1.AzurePlatform, expected: true},
+		{name: "gate ON, AWS -> true", enabled: true, platform: hyperv1.AWSPlatform, expected: true},
+		{name: "gate ON, Azure -> true", enabled: true, platform: hyperv1.AzurePlatform, expected: true},
 		{name: "gate ON, IBMCloud -> false (server exposed directly)", enabled: true, platform: hyperv1.IBMCloudPlatform, expected: false},
 		{
-			name:        "gate ON, DisableIgnitionServerAnnotation -> false",
+			// The predicate reads only Enabled (and platform), never the HCP DisableIgnitionServerAnnotation
+			// (which also carries the HO's cutover signal). Operator-disable is folded into Enabled upstream.
+			name:        "gate ON, AWS, HCP DisableIgnitionServerAnnotation set -> still true (predicate ignores it)",
 			enabled:     true,
 			platform:    hyperv1.AWSPlatform,
 			annotations: map[string]string{hyperv1.DisableIgnitionServerAnnotation: "true"},
-			expected:    false,
+			expected:    true,
 		},
 	}
 
