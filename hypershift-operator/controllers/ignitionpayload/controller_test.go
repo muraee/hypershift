@@ -9,9 +9,13 @@ import (
 
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	"github.com/openshift/hypershift/support/api"
+	"github.com/openshift/hypershift/support/backwardcompat"
 	payloadstore "github.com/openshift/hypershift/support/ignitionpayload"
+	"github.com/openshift/hypershift/support/manifests"
 	"github.com/openshift/hypershift/support/releaseinfo"
+	supportutil "github.com/openshift/hypershift/support/util"
 
+	configv1 "github.com/openshift/api/config/v1"
 	imageapi "github.com/openshift/api/image/v1"
 
 	corev1 "k8s.io/api/core/v1"
@@ -62,12 +66,26 @@ func testCR() *hyperv1.IgnitionPayload {
 	}
 }
 
+// defaultHCP is the single HostedControlPlane the PayloadController reads for the full-config
+// (MCS gate) hash and the cloud-provider platform. Tests needing a specific platform/config
+// Get+Update it rather than adding a second HCP.
+func defaultHCP() *hyperv1.HostedControlPlane {
+	return &hyperv1.HostedControlPlane{
+		ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "hcp"},
+		Spec: hyperv1.HostedControlPlaneSpec{
+			Platform:      hyperv1.PlatformSpec{Type: hyperv1.NonePlatform},
+			Configuration: &hyperv1.ClusterConfiguration{},
+		},
+	}
+}
+
 func newTestReconciler(t *testing.T, objs ...client.Object) (*Reconciler, client.Client, *fakeProvider) {
 	store := payloadstore.NewMemStore()
 	fp := &fakeProvider{payload: []byte("PAYLOAD")}
+	all := append([]client.Object{defaultHCP()}, objs...)
 	c := fake.NewClientBuilder().
 		WithScheme(api.Scheme).
-		WithObjects(objs...).
+		WithObjects(all...).
 		WithStatusSubresource(&hyperv1.IgnitionPayload{}).
 		Build()
 	r := &Reconciler{Client: c, Store: store, Generator: &payloadGenerator{store: store, provider: fp}, ReleaseProvider: &fakeReleaseProvider{}, Namespace: testNS}
@@ -270,4 +288,93 @@ func TestReconcileReleaseLookupErrorRequeues(t *testing.T) {
 	g.Expect(cr.Status.Current.Token).To(BeEmpty(), "no token on transient Lookup failure")
 	g.Expect(fp.calls).To(Equal(0), "no render on transient Lookup failure")
 	g.Expect(apimeta.IsStatusConditionFalse(cr.Status.Conditions, "PayloadGenerated")).To(BeFalse(), "transient failure is not a validation failure")
+}
+
+// TestReconcileHCConfigurationGateHash pins RF#1: the hcConfigurationHash passed to GetPayload
+// equals the backward-compatible full-config hash CPO writes into the machine-config-server
+// ConfigMap, so the freshness gate passes (not HashSimple(rolloutGlobalConfig)).
+func TestReconcileHCConfigurationGateHash(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	r, c, fp := newTestReconciler(t,
+		testCR(), pullSecret("ps"),
+		cfgMap(testNS, "user-a", mc("00-user-a")),
+		cfgMap(testNS, "core-fips", mc("00-core-fips")),
+		cfgMap(testNS, "haproxy", mc("00-haproxy")),
+	)
+	reconcileCR(t, r)
+
+	hcp := &hyperv1.HostedControlPlane{}
+	g.Expect(c.Get(ctx, client.ObjectKey{Namespace: testNS, Name: "hcp"}, hcp)).To(Succeed())
+	want, err := backwardcompat.GetBackwardCompatibleConfigHash(hcp.Spec.Configuration)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(fp.lastHCConfigHash).To(Equal(want), "gate hash must match CPO's backward-compatible full-config hash")
+	// None platform → no cloud-config gate.
+	g.Expect(fp.lastCloudConfigHash).To(BeEmpty())
+}
+
+// TestReconcileFullConfigChangeRefreshes pins RF#4: a change to hcp.Spec.Configuration changes the
+// identity hash (payload refreshes) but not the rollout hash (the rolloutGlobalConfig ConfigMap is
+// separate and unchanged here), so it refreshes without rolling.
+func TestReconcileFullConfigChangeRefreshes(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	r, c, fp := newTestReconciler(t,
+		testCR(), pullSecret("ps"),
+		cfgMap(testNS, "user-a", mc("00-user-a")),
+		cfgMap(testNS, "core-fips", mc("00-core-fips")),
+		cfgMap(testNS, "haproxy", mc("00-haproxy")),
+	)
+	reconcileCR(t, r)
+	cr := getCR(t, c)
+	token := cr.Status.Current.Token
+	g.Expect(fp.calls).To(Equal(1))
+
+	hcp := &hyperv1.HostedControlPlane{}
+	g.Expect(c.Get(ctx, client.ObjectKey{Namespace: testNS, Name: "hcp"}, hcp)).To(Succeed())
+	hcp.Spec.Configuration = &hyperv1.ClusterConfiguration{Ingress: &configv1.IngressSpec{Domain: "example.com"}}
+	g.Expect(c.Update(ctx, hcp)).To(Succeed())
+
+	reconcileCR(t, r)
+	cr = getCR(t, c)
+	g.Expect(fp.calls).To(Equal(2), "full-config change must refresh the payload")
+	g.Expect(cr.Status.Current.Token).To(Equal(token), "refresh keeps the same token (Policy A)")
+	g.Expect(cr.Status.Current.Generation).To(Equal(int64(1)), "full-config change must not roll")
+}
+
+// TestReconcileCloudConfigRefreshes pins RF#3: the cloud-config hash is computed for Azure/OpenStack
+// and feeds the identity hash (a cloud-config change refreshes) but not the rollout hash.
+func TestReconcileCloudConfigRefreshes(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	azureCM := manifests.AzureProviderConfig(testNS)
+	azureCM.Data = map[string]string{"config": "azure-v1"}
+	r, c, fp := newTestReconciler(t,
+		testCR(), pullSecret("ps"),
+		cfgMap(testNS, "user-a", mc("00-user-a")),
+		cfgMap(testNS, "core-fips", mc("00-core-fips")),
+		cfgMap(testNS, "haproxy", mc("00-haproxy")),
+		azureCM,
+	)
+	hcp := &hyperv1.HostedControlPlane{}
+	g.Expect(c.Get(ctx, client.ObjectKey{Namespace: testNS, Name: "hcp"}, hcp)).To(Succeed())
+	hcp.Spec.Platform.Type = hyperv1.AzurePlatform
+	g.Expect(c.Update(ctx, hcp)).To(Succeed())
+
+	reconcileCR(t, r)
+	cr := getCR(t, c)
+	token := cr.Status.Current.Token
+	g.Expect(fp.calls).To(Equal(1))
+	g.Expect(fp.lastCloudConfigHash).To(Equal(supportutil.HashConfigMapData(azureCM.Data)), "Azure cloud-config hash must be computed")
+
+	cm := &corev1.ConfigMap{}
+	g.Expect(c.Get(ctx, client.ObjectKeyFromObject(azureCM), cm)).To(Succeed())
+	cm.Data["config"] = "azure-v2"
+	g.Expect(c.Update(ctx, cm)).To(Succeed())
+
+	reconcileCR(t, r)
+	cr = getCR(t, c)
+	g.Expect(fp.calls).To(Equal(2), "cloud-config change must refresh the payload")
+	g.Expect(cr.Status.Current.Token).To(Equal(token))
+	g.Expect(cr.Status.Current.Generation).To(Equal(int64(1)), "cloud-config change must not roll")
 }
