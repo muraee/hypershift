@@ -8,9 +8,11 @@ import (
 
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	"github.com/openshift/hypershift/support/api"
+	"github.com/openshift/hypershift/support/manifests"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -42,6 +44,35 @@ func TestEnqueueForConfigMap(t *testing.T) {
 	g.Expect(r.enqueueIgnitionPayloadsForConfigMap(ctx, cfgMap(testNS, "haproxy-b", ""))).To(ConsistOf(reqFor("b")))
 	g.Expect(r.enqueueIgnitionPayloadsForConfigMap(ctx, cfgMap(testNS, "gc-b", ""))).To(ConsistOf(reqFor("b")))
 	g.Expect(r.enqueueIgnitionPayloadsForConfigMap(ctx, cfgMap(testNS, "unrelated", ""))).To(BeEmpty())
+}
+
+func TestEnqueueForCloudConfig(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	// Neither CR references the cloud-config ConfigMap by name; it is HCP-level, consumed via the
+	// HCP's platform, not a CR ref.
+	crA := crWithRefs("a", hyperv1.IgnitionPayloadSpec{RolloutConfigMaps: []hyperv1.ConfigMapReference{{Name: "user-a"}}})
+	crB := crWithRefs("b", hyperv1.IgnitionPayloadSpec{PullSecretName: "ps-b"})
+	c := fake.NewClientBuilder().WithScheme(api.Scheme).WithObjects(crA, crB).Build()
+	r := &Reconciler{Client: c, Namespace: testNS}
+
+	// A cloud-config ConfigMap change (its hash is HCP-level) enqueues every CR in the namespace.
+	g.Expect(r.enqueueIgnitionPayloadsForConfigMap(ctx, cfgMap(testNS, manifests.AzureProviderConfig(testNS).Name, ""))).To(ConsistOf(reqFor("a"), reqFor("b")))
+	g.Expect(r.enqueueIgnitionPayloadsForConfigMap(ctx, cfgMap(testNS, manifests.OpenStackProviderConfig(testNS).Name, ""))).To(ConsistOf(reqFor("a"), reqFor("b")))
+}
+
+func TestEnqueueForHostedControlPlane(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	crA := crWithRefs("a", hyperv1.IgnitionPayloadSpec{})
+	crB := crWithRefs("b", hyperv1.IgnitionPayloadSpec{})
+	c := fake.NewClientBuilder().WithScheme(api.Scheme).WithObjects(crA, crB).Build()
+	r := &Reconciler{Client: c, Namespace: testNS}
+
+	// The full cluster-configuration (MCS gate) hash is HCP-level, so an HCP change must re-reconcile
+	// every CR in the namespace.
+	hcp := &hyperv1.HostedControlPlane{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "hcp"}}
+	g.Expect(r.enqueueIgnitionPayloadsForHostedControlPlane(ctx, hcp)).To(ConsistOf(reqFor("a"), reqFor("b")))
 }
 
 func TestEnqueueForSecret(t *testing.T) {

@@ -35,5 +35,9 @@ func (o *Options) NeedsManagementKASAccess() bool { return true }
 func NewComponent(opts *Options) component.ControlPlaneComponent {
 	return component.NewDeploymentComponent(ComponentName, opts).
 		WithAdaptFunction(opts.adaptDeployment).
+		WithManifestAdapter(
+			"podmonitor.yaml",
+			component.WithAdaptFunction(adaptPodMonitor),
+		).
 		Build()
 }

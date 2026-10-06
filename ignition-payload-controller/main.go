@@ -16,6 +16,7 @@ import (
 
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	"github.com/spf13/cobra"
 )
@@ -74,7 +75,13 @@ func run(ctx context.Context, opts Options) error {
 	retryPeriod := time.Second * 15
 
 	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
-		Scheme:                        hyperapi.Scheme,
+		Scheme: hyperapi.Scheme,
+		// Serve the generator's metrics (incl. the ignition payload generation/cache collectors
+		// registered by the ignition-server controllers package) over plain HTTP on :8080, matching
+		// the legacy ignition-server so the PodMonitor keeps scraping ignition metrics after cutover.
+		Metrics: metricsserver.Options{
+			BindAddress: ":8080",
+		},
 		LeaderElection:                true,
 		LeaderElectionID:              "ignition-payload-controller-leader-elect",
 		LeaderElectionResourceLock:    "leases",

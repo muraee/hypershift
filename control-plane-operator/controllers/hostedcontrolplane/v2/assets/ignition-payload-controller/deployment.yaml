@@ -33,6 +33,10 @@ spec:
           value: =
         image: hypershift-operator
         name: ignition-payload-controller
+        ports:
+        - containerPort: 8080
+          name: metrics
+          protocol: TCP
         resources:
           requests:
             cpu: 10m

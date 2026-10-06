@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	prometheusoperatorv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	"go.uber.org/mock/gomock"
 )
 
@@ -77,9 +78,19 @@ func TestReconcileRendersController(t *testing.T) {
 	g.Expect(c.Args).To(ContainElement("--platform"))
 	g.Expect(volumeNames(dep)).To(ContainElements("payloads", "shared"))
 	g.Expect(initContainerNames(dep)).To(ContainElement("fetch-feature-gate"))
-	// No serving-cert / ports on the generator.
+	// No serving-cert on the generator (it renders payloads; it does not serve ignition).
 	g.Expect(volumeNames(dep)).ToNot(ContainElement("serving-cert"))
-	g.Expect(c.Ports).To(BeEmpty())
+
+	// Metrics: the generator's controller-runtime manager serves /metrics on :8080; the container
+	// exposes that port and a PodMonitor scrapes it.
+	metricsPort := containerPortByName(c, "metrics")
+	g.Expect(metricsPort).ToNot(BeNil())
+	g.Expect(metricsPort.ContainerPort).To(Equal(int32(8080)))
+
+	pm := &prometheusoperatorv1.PodMonitor{}
+	g.Expect(cpContext.Client.Get(t.Context(), client.ObjectKey{Namespace: ns, Name: ComponentName}, pm)).To(Succeed())
+	g.Expect(pm.Spec.NamespaceSelector.MatchNames).To(ConsistOf(ns))
+	g.Expect(pm.Spec.PodMetricsEndpoints).ToNot(BeEmpty())
 
 	// Role: leader-election lease + ignitionpayloads + secrets.
 	role := &rbacv1.Role{}
@@ -93,6 +104,15 @@ func containerByName(cs []corev1.Container, name string) *corev1.Container {
 	for i := range cs {
 		if cs[i].Name == name {
 			return &cs[i]
+		}
+	}
+	return nil
+}
+
+func containerPortByName(c *corev1.Container, name string) *corev1.ContainerPort {
+	for i := range c.Ports {
+		if c.Ports[i].Name == name {
+			return &c.Ports[i]
 		}
 	}
 	return nil
