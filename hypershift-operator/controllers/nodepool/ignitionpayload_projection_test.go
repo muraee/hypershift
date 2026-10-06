@@ -5,8 +5,6 @@ import (
 	"sort"
 	"testing"
 
-	. "github.com/onsi/gomega"
-
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	"github.com/openshift/hypershift/support/api"
 
@@ -15,6 +13,8 @@ import (
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	. "github.com/onsi/gomega"
 )
 
 func refNames(refs []hyperv1.ConfigMapReference) []string {
@@ -36,6 +36,10 @@ var (
 	testNTOConfigs = []corev1.ConfigMap{
 		{ObjectMeta: metav1.ObjectMeta{Name: "nto-cfg", Namespace: "hcp"}, Data: map[string]string{TokenSecretConfigKey: "nto-data"}},
 	}
+	// Platform configs are generated in memory and have no source name.
+	testPlatformConfigs = []corev1.ConfigMap{
+		{Data: map[string]string{TokenSecretConfigKey: "platform-data"}},
+	}
 )
 
 // TestClassifyConfigs pins the classification (RF#1) and that it is pure (no cluster
@@ -47,10 +51,11 @@ func TestClassifyConfigs(t *testing.T) {
 
 	userCopy := userConfigCopyName("np-1", "user-mc")
 	haproxyName := haproxyConfigMapName("np-1")
+	platformCopy := platformConfigCopyName("np-1", 0)
 
-	rolloutRefs, mgmtRefs, globalName := classifyConfigs("np-1", testUserConfigs, testCoreConfigs, testNTOConfigs)
+	rolloutRefs, mgmtRefs, globalName := classifyConfigs("np-1", testUserConfigs, testCoreConfigs, testNTOConfigs, testPlatformConfigs)
 
-	g.Expect(refNames(rolloutRefs)).To(Equal([]string{"core-cfg", "nto-cfg", userCopy}))
+	g.Expect(refNames(rolloutRefs)).To(Equal([]string{"core-cfg", "nto-cfg", platformCopy, userCopy}))
 	g.Expect(refNames(mgmtRefs)).To(Equal([]string{haproxyName}))
 	g.Expect(globalName).To(Equal(rolloutGlobalConfigMapName("np-1")))
 	g.Expect(refNames(rolloutRefs)).ToNot(ContainElement(globalName))
@@ -69,7 +74,7 @@ func TestMaterializeConfigs(t *testing.T) {
 	}
 	c := fake.NewClientBuilder().WithScheme(api.Scheme).Build()
 
-	g.Expect(materializeConfigs(ctx, c, hcpNS, owner, testUserConfigs, "haproxy-raw", []byte("global-bytes"))).To(Succeed())
+	g.Expect(materializeConfigs(ctx, c, hcpNS, owner, testUserConfigs, testPlatformConfigs, "haproxy-raw", []byte("global-bytes"))).To(Succeed())
 
 	assertOwnedCM := func(name, wantData string) {
 		cm := &corev1.ConfigMap{}
@@ -82,6 +87,7 @@ func TestMaterializeConfigs(t *testing.T) {
 	}
 
 	assertOwnedCM(userConfigCopyName("np-1", "user-mc"), "user-data")
+	assertOwnedCM(platformConfigCopyName("np-1", 0), "platform-data")
 	assertOwnedCM(haproxyConfigMapName("np-1"), "haproxy-raw")
 	assertOwnedCM(rolloutGlobalConfigMapName("np-1"), "global-bytes")
 

@@ -7,6 +7,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/clarketm/json"
+	ignitionapi "github.com/coreos/ignition/v2/config/v3_2/types"
+	"github.com/go-logr/logr"
+	"github.com/google/uuid"
+
+	configv1 "github.com/openshift/api/config/v1"
+
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/manifests/ignitionserver"
 	"github.com/openshift/hypershift/support/backwardcompat"
@@ -17,8 +24,6 @@ import (
 	"github.com/openshift/hypershift/support/upsert"
 	supportutil "github.com/openshift/hypershift/support/util"
 
-	configv1 "github.com/openshift/api/config/v1"
-
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -26,11 +31,6 @@ import (
 
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-
-	"github.com/clarketm/json"
-	ignitionapi "github.com/coreos/ignition/v2/config/v3_2/types"
-	"github.com/go-logr/logr"
-	"github.com/google/uuid"
 )
 
 const (
@@ -65,6 +65,17 @@ type Token struct {
 	globalConfigHash          []byte
 	cloudConfigHash           []byte
 	userData                  *userData
+
+	// ignitionPayloadConsumerActive is true on the gate-ON path where the IgnitionPayload consumer,
+	// not this Token, owns userdata generation for the NodePool. When true, UserDataSecret() returns
+	// userDataSecretNameOverride instead of the computed legacy name, and CAPI treats an empty
+	// override as "no userdata published yet" (leave the existing DataSecretName untouched) rather
+	// than re-pointing Machines at a legacy-named Secret this Token never wrote.
+	ignitionPayloadConsumerActive bool
+	// userDataSecretNameOverride, when non-empty, replaces the computed userdata Secret name returned
+	// by UserDataSecret(). The consumer sets it to the name of the Secret it reconciled so CAPI
+	// re-points Machines at the consumer-authored userdata.
+	userDataSecretNameOverride string
 }
 
 // userData contains the input necessary to generate the user data secret
@@ -269,10 +280,14 @@ func (t *Token) Reconcile(ctx context.Context) error {
 const UserDataSecrePrefix = "user-data"
 
 func (t *Token) UserDataSecret() *corev1.Secret {
+	name := t.userDataSecretNameOverride
+	if name == "" {
+		name = fmt.Sprintf("%s-%s-%s", UserDataSecrePrefix, t.ConfigGenerator.nodePool.GetName(), t.ConfigGenerator.Hash())
+	}
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: t.controlplaneNamespace,
-			Name:      fmt.Sprintf("%s-%s-%s", UserDataSecrePrefix, t.ConfigGenerator.nodePool.GetName(), t.ConfigGenerator.Hash()),
+			Name:      name,
 		},
 	}
 }

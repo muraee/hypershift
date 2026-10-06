@@ -8,12 +8,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/blang/semver"
+	"github.com/go-logr/logr"
+
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	"github.com/openshift/hypershift/api/util/configrefs"
 	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/imageprovider"
 	cpomanifests "github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/manifests"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/hostedcluster/internal/platform"
 	hcmetrics "github.com/openshift/hypershift/hypershift-operator/controllers/hostedcluster/metrics"
+	"github.com/openshift/hypershift/hypershift-operator/controllers/ignitionpayloadcutover"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/manifests"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/manifests/controlplaneoperator"
 	controlplanepkioperatormanifests "github.com/openshift/hypershift/hypershift-operator/controllers/manifests/controlplanepkioperator"
@@ -44,9 +48,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-
-	"github.com/blang/semver"
-	"github.com/go-logr/logr"
 )
 
 // reconcileLegacy is the original reconcile implementation preserved for
@@ -334,7 +335,7 @@ func (r *HostedClusterReconciler) reconcileLegacy(ctx context.Context, req ctrl.
 			log.Error(nthErr, "failed to determine if AWS node termination handler is needed during pull secret recovery, defaulting to true")
 			isAWSNodeTerminationHandlerNeeded = true
 		}
-		cutoverActive, cutoverErr := ignitionPayloadCutoverActive(ctx, r.Client, controlPlaneNamespace.Name)
+		cutoverActive, cutoverErr := ignitionpayloadcutover.Active(ctx, r.Client, controlPlaneNamespace.Name)
 		if cutoverErr != nil {
 			log.Error(cutoverErr, "failed to determine ignition payload cutover state during pull secret recovery, defaulting to false")
 			cutoverActive = false
@@ -768,7 +769,7 @@ func (r *HostedClusterReconciler) reconcileLegacy(ctx context.Context, req ctrl.
 		// Available): active -> the new ignition-payload-* stack, otherwise -> the legacy ignition-server
 		// stack. The same host serves either proxy, so the user-supplied Route.Hostname passthrough below
 		// is unaffected. Gate OFF short-circuits with no extra API call, so this path is unchanged.
-		ignitionPayloadActive, cutoverErr := ignitionPayloadCutoverActive(ctx, r.Client, controlPlaneNamespace.GetName())
+		ignitionPayloadActive, cutoverErr := ignitionpayloadcutover.Active(ctx, r.Client, controlPlaneNamespace.GetName())
 		if cutoverErr != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to determine ignition payload cutover state: %w", cutoverErr)
 		}
@@ -1514,7 +1515,7 @@ func (r *HostedClusterReconciler) reconcileLegacy(ctx context.Context, req ctrl.
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to determine if AWS node termination handler is needed: %w", err)
 	}
-	cutoverActive, err := ignitionPayloadCutoverActive(ctx, r.Client, controlPlaneNamespace.Name)
+	cutoverActive, err := ignitionpayloadcutover.Active(ctx, r.Client, controlPlaneNamespace.Name)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to determine ignition payload cutover state: %w", err)
 	}

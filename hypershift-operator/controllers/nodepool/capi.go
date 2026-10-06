@@ -8,12 +8,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
+
+	agentv1 "github.com/openshift/cluster-api-provider-agent/api/v1beta1"
+
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	"github.com/openshift/hypershift/support/api"
 	"github.com/openshift/hypershift/support/upsert"
 	supportutil "github.com/openshift/hypershift/support/util"
-
-	agentv1 "github.com/openshift/cluster-api-provider-agent/api/v1beta1"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -36,8 +38,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
-
-	"github.com/go-logr/logr"
 )
 
 const (
@@ -84,6 +84,16 @@ func newCAPI(token *Token, capiClusterName string) (*CAPI, error) {
 		capiClusterName: capiClusterName,
 		ApplyProvider:   upsert.NewApplyProvider(false),
 	}, nil
+}
+
+// skipUserDataRepoint reports whether CAPI must leave an existing Machine/MachineSet DataSecretName
+// untouched this reconcile. On the gate-ON IgnitionPayload path the consumer owns userdata
+// generation; when it has not published a userdata Secret yet (empty override) there is nothing to
+// point Machines at, and re-pointing them at the computed legacy name would reference a Secret this
+// controller never wrote. On the gate-OFF path this is always false, so the legacy re-point is
+// byte-for-byte unchanged.
+func (c *CAPI) skipUserDataRepoint() bool {
+	return c.ignitionPayloadConsumerActive && c.userDataSecretNameOverride == ""
 }
 
 func (c *CAPI) Reconcile(ctx context.Context) error {
@@ -612,7 +622,7 @@ func (c *CAPI) propagateVersionAndTemplate(log logr.Logger, machineDeployment *c
 	targetConfigHash := c.HashWithoutVersion()
 	isUpdating := false
 
-	if userDataSecret.Name != ptr.Deref(machineDeployment.Spec.Template.Spec.Bootstrap.DataSecretName, "") {
+	if !c.skipUserDataRepoint() && userDataSecret.Name != ptr.Deref(machineDeployment.Spec.Template.Spec.Bootstrap.DataSecretName, "") {
 		log.Info("New user data Secret has been generated",
 			"current", machineDeployment.Spec.Template.Spec.Bootstrap.DataSecretName,
 			"target", userDataSecret.Name)
@@ -1042,7 +1052,7 @@ func (c *CAPI) reconcileMachineSet(ctx context.Context,
 
 	isUpdating := false
 	// Propagate version and userData Secret to the MachineSet.
-	if userDataSecret.Name != ptr.Deref(machineSet.Spec.Template.Spec.Bootstrap.DataSecretName, "") {
+	if !c.skipUserDataRepoint() && userDataSecret.Name != ptr.Deref(machineSet.Spec.Template.Spec.Bootstrap.DataSecretName, "") {
 		log.Info("New user data Secret has been generated",
 			"current", machineSet.Spec.Template.Spec.Bootstrap.DataSecretName,
 			"target", userDataSecret.Name)

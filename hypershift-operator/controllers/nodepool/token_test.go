@@ -7,7 +7,16 @@ import (
 	"testing"
 	"time"
 
-	. "github.com/onsi/gomega"
+	ignitionapi "github.com/coreos/ignition/v2/config/v3_2/types"
+	"github.com/coreos/stream-metadata-go/stream"
+	"github.com/go-logr/logr/testr"
+	"github.com/go-logr/zapr"
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
+
+	configv1 "github.com/openshift/api/config/v1"
+	imageapi "github.com/openshift/api/image/v1"
 
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/manifests/ignitionserver"
@@ -17,9 +26,6 @@ import (
 	"github.com/openshift/hypershift/support/releaseinfo/testutils"
 	"github.com/openshift/hypershift/support/testutil"
 	supportutil "github.com/openshift/hypershift/support/util"
-
-	configv1 "github.com/openshift/api/config/v1"
-	imageapi "github.com/openshift/api/image/v1"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -31,13 +37,7 @@ import (
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	ignitionapi "github.com/coreos/ignition/v2/config/v3_2/types"
-	"github.com/coreos/stream-metadata-go/stream"
-	"github.com/go-logr/logr/testr"
-	"github.com/go-logr/zapr"
-	"github.com/google/uuid"
-	"go.uber.org/zap"
-	"go.uber.org/zap/zaptest/observer"
+	. "github.com/onsi/gomega"
 )
 
 func TestNewToken(t *testing.T) {
@@ -1442,4 +1442,52 @@ func TestReconcileUserDataSecret(t *testing.T) {
 			g.Expect(err).NotTo(HaveOccurred())
 		})
 	}
+}
+
+// TestUserDataSecretNameOverride proves the gate-ON override mechanism without disturbing the
+// gate-OFF path: with no override (gate OFF / legacy), UserDataSecret() returns the computed
+// user-data-{np}-{Hash()} name byte-for-byte as before; with an override set (gate ON, the
+// IgnitionPayload consumer authored the Secret), it returns that name verbatim.
+func TestUserDataSecretNameOverride(t *testing.T) {
+	g := NewWithT(t)
+
+	nodePool := &hyperv1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "np-1"}}
+	cg := &ConfigGenerator{
+		nodePool:              nodePool,
+		controlplaneNamespace: "hcp",
+		rolloutConfig: &rolloutConfig{
+			releaseImage: &releaseinfo.ReleaseImage{
+				ImageStream: &imageapi.ImageStream{ObjectMeta: metav1.ObjectMeta{Name: "v"}},
+			},
+		},
+	}
+	token := &Token{ConfigGenerator: cg}
+
+	// Gate-OFF: byte-for-byte the legacy computed name.
+	legacy := token.UserDataSecret()
+	g.Expect(legacy.Name).To(Equal(fmt.Sprintf("%s-%s-%s", UserDataSecrePrefix, "np-1", cg.Hash())))
+	g.Expect(legacy.Namespace).To(Equal("hcp"))
+
+	// Gate-ON: the consumer-authored name is returned verbatim.
+	token.userDataSecretNameOverride = "user-data-np-1-roll1"
+	overridden := token.UserDataSecret()
+	g.Expect(overridden.Name).To(Equal("user-data-np-1-roll1"))
+	g.Expect(overridden.Namespace).To(Equal("hcp"))
+}
+
+// TestSkipUserDataRepoint pins the CAPI re-point guard: on the gate-OFF path (consumer inactive) it
+// is always false so the legacy re-point runs unchanged; on the gate-ON path it is true only while
+// the consumer has not published a userdata Secret yet (empty override), so CAPI leaves the existing
+// DataSecretName untouched instead of re-pointing Machines at a Secret that does not exist.
+func TestSkipUserDataRepoint(t *testing.T) {
+	g := NewWithT(t)
+
+	// Gate-OFF: never skip.
+	g.Expect((&CAPI{Token: &Token{}}).skipUserDataRepoint()).To(BeFalse())
+
+	// Gate-ON, no userdata published yet: skip (leave existing DataSecretName).
+	g.Expect((&CAPI{Token: &Token{ignitionPayloadConsumerActive: true}}).skipUserDataRepoint()).To(BeTrue())
+
+	// Gate-ON, userdata published: do not skip (re-point to the consumer-authored Secret).
+	g.Expect((&CAPI{Token: &Token{ignitionPayloadConsumerActive: true, userDataSecretNameOverride: "user-data-np-1-roll1"}}).skipUserDataRepoint()).To(BeFalse())
 }

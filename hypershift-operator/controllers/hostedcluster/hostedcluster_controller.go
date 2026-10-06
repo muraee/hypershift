@@ -29,6 +29,22 @@ import (
 	"strings"
 	"time"
 
+	"github.com/blang/semver"
+	"github.com/go-logr/logr"
+	"github.com/google/uuid"
+	orcv1alpha1 "github.com/k-orc/openstack-resource-controller/v2/api/v1alpha1"
+	prometheusoperatorv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+	"gopkg.in/ini.v1"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+
+	configv1 "github.com/openshift/api/config/v1"
+	routev1 "github.com/openshift/api/route/v1"
+
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	hyperkarpenterv1 "github.com/openshift/hypershift/api/karpenter/v1"
 	"github.com/openshift/hypershift/api/util/configrefs"
@@ -44,6 +60,7 @@ import (
 	"github.com/openshift/hypershift/hypershift-operator/controllers/hostedcluster/internal/proxy"
 	hcmetrics "github.com/openshift/hypershift/hypershift-operator/controllers/hostedcluster/metrics"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/hostedcluster/validations"
+	"github.com/openshift/hypershift/hypershift-operator/controllers/ignitionpayloadcutover"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/manifests"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/manifests/clusterapi"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/manifests/controlplaneoperator"
@@ -81,13 +98,6 @@ import (
 	hyperutil "github.com/openshift/hypershift/support/util"
 	supportvalidations "github.com/openshift/hypershift/support/validations"
 
-	configv1 "github.com/openshift/api/config/v1"
-	routev1 "github.com/openshift/api/route/v1"
-
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
-
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -119,15 +129,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-
-	"github.com/blang/semver"
-	"github.com/go-logr/logr"
-	"github.com/google/uuid"
-	orcv1alpha1 "github.com/k-orc/openstack-resource-controller/v2/api/v1alpha1"
-	prometheusoperatorv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
-	"go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/trace"
-	"gopkg.in/ini.v1"
 )
 
 const (
@@ -1144,7 +1145,7 @@ func (r *HostedClusterReconciler) reconcile(ctx context.Context, req ctrl.Reques
 		// Available): active -> the new ignition-payload-* stack, otherwise -> the legacy ignition-server
 		// stack. The same host serves either proxy, so the user-supplied Route.Hostname passthrough below
 		// is unaffected. Gate OFF short-circuits with no extra API call, so this path is unchanged.
-		ignitionPayloadActive, cutoverErr := ignitionPayloadCutoverActive(ctx, r.Client, controlPlaneNamespace.GetName())
+		ignitionPayloadActive, cutoverErr := ignitionpayloadcutover.Active(ctx, r.Client, controlPlaneNamespace.GetName())
 		if cutoverErr != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to determine ignition payload cutover state: %w", cutoverErr)
 		}
@@ -1742,7 +1743,7 @@ func (r *HostedClusterReconciler) reconcileCoreHCPChain(
 		return hcp, fmt.Errorf("failed to determine if AWS node termination handler is needed: %w", err)
 	}
 
-	cutoverActive, err := ignitionPayloadCutoverActive(ctx, r.Client, controlPlaneNamespace)
+	cutoverActive, err := ignitionpayloadcutover.Active(ctx, r.Client, controlPlaneNamespace)
 	if err != nil {
 		return hcp, fmt.Errorf("failed to determine ignition payload cutover state: %w", err)
 	}

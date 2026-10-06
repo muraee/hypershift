@@ -4,19 +4,20 @@ import (
 	"context"
 	"testing"
 
-	. "github.com/onsi/gomega"
-
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	pkgmanifests "github.com/openshift/hypershift/pkg/manifests"
 	"github.com/openshift/hypershift/support/api"
 	payloadstore "github.com/openshift/hypershift/support/ignitionpayload"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	. "github.com/onsi/gomega"
 )
 
 func TestEnqueueNodePoolForIgnitionPayload(t *testing.T) {
@@ -126,8 +127,9 @@ func TestReconcileIgnitionPayloadConsumer(t *testing.T) {
 		machineSetName: "np-1",
 	}
 
-	userDataName, err := reconcileIgnitionPayloadConsumer(ctx, c, store, nodePool, hc, in)
+	userDataName, cr0, err := reconcileIgnitionPayloadConsumer(ctx, c, store, nodePool, hc, true, in)
 	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(cr0).ToNot(BeNil())
 	g.Expect(userDataName).To(Equal("user-data-np-1-roll1"))
 
 	// CR spec authored with the classified refs + finalizer, status preserved.
@@ -184,12 +186,12 @@ func TestReconcileIgnitionPayloadConsumerNoChurn(t *testing.T) {
 		machineSetName: "np-1",
 	}
 
-	_, err := reconcileIgnitionPayloadConsumer(ctx, c, store, nodePool, hc, in)
+	_, _, err := reconcileIgnitionPayloadConsumer(ctx, c, store, nodePool, hc, true, in)
 	g.Expect(err).ToNot(HaveOccurred())
 	cr1 := &hyperv1.IgnitionPayload{}
 	g.Expect(c.Get(ctx, client.ObjectKey{Namespace: hcpNS, Name: "np-1"}, cr1)).To(Succeed())
 
-	_, err = reconcileIgnitionPayloadConsumer(ctx, c, store, nodePool, hc, in)
+	_, _, err = reconcileIgnitionPayloadConsumer(ctx, c, store, nodePool, hc, true, in)
 	g.Expect(err).ToNot(HaveOccurred())
 	cr2 := &hyperv1.IgnitionPayload{}
 	g.Expect(c.Get(ctx, client.ObjectKey{Namespace: hcpNS, Name: "np-1"}, cr2)).To(Succeed())
@@ -214,10 +216,55 @@ func TestReconcileIgnitionPayloadConsumerNoPayloadYet(t *testing.T) {
 
 	in := ignitionConsumerInputs{releaseVersion: "4.23.0", haproxyRaw: "h", machineSetName: "np-1"}
 	// No status.current yet: the consumer authors the CR but emits no userdata Secret.
-	userDataName, err := reconcileIgnitionPayloadConsumer(ctx, c, store, nodePool, hc, in)
+	userDataName, cr, err := reconcileIgnitionPayloadConsumer(ctx, c, store, nodePool, hc, true, in)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(userDataName).To(BeEmpty())
+	g.Expect(cr).ToNot(BeNil())
 	g.Expect(c.Get(ctx, client.ObjectKey{Namespace: hcpNS, Name: "np-1"}, &hyperv1.IgnitionPayload{})).To(Succeed())
+}
+
+// TestReconcileIgnitionPayloadConsumerNotCutover proves that before the data plane cuts over
+// (cutoverActive=false) the consumer still authors the CR + projects configs — so the
+// PayloadController can generate a payload the new server will serve — but does NOT publish a
+// userdata Secret, so existing Machines stay on their live legacy userdata.
+func TestReconcileIgnitionPayloadConsumerNotCutover(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+
+	nodePool := testNodePool("np-1")
+	nodePool.Spec.Management.UpgradeType = hyperv1.UpgradeTypeInPlace
+	hc := &hyperv1.HostedCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "hc", Namespace: "clusters"},
+		Spec:       hyperv1.HostedClusterSpec{PullSecret: corev1.LocalObjectReference{Name: "ps"}},
+	}
+	hcpNS := pkgmanifests.HostedControlPlaneNamespace("clusters", "hc")
+
+	seedCR := &hyperv1.IgnitionPayload{
+		ObjectMeta: metav1.ObjectMeta{Name: "np-1", Namespace: hcpNS},
+		Spec:       hyperv1.IgnitionPayloadSpec{ReleaseImage: "img", PullSecretName: "ps"},
+	}
+	c := fake.NewClientBuilder().WithScheme(api.Scheme).
+		WithStatusSubresource(&hyperv1.IgnitionPayload{}).
+		WithObjects(seedCR).Build()
+	// A payload IS available, but the data plane has not cut over yet.
+	seedCR.Status.Current = hyperv1.PayloadReference{Token: "tok-abc", ConfigHash: "cfg1", RolloutHash: "roll1", Generation: 1}
+	g.Expect(c.Status().Update(ctx, seedCR)).To(Succeed())
+
+	store := payloadstore.NewMemStore()
+	g.Expect(store.Put(ctx, payloadstore.OwnerRef{Namespace: hcpNS, Name: "np-1"}, "tok-abc", "id-1", []byte("PAYLOAD"))).To(Succeed())
+
+	in := ignitionConsumerInputs{releaseVersion: "4.23.0", haproxyRaw: "h", machineSetName: "np-1", caCert: []byte("CA"), endpoint: "ign.example.com"}
+
+	userDataName, cr, err := reconcileIgnitionPayloadConsumer(ctx, c, store, nodePool, hc, false, in)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(cr).ToNot(BeNil())
+	// No re-point name is returned, and no userdata / legacy compat Secret is written.
+	g.Expect(userDataName).To(BeEmpty())
+	g.Expect(apierrors.IsNotFound(c.Get(ctx, client.ObjectKey{Namespace: hcpNS, Name: "user-data-np-1-roll1"}, &corev1.Secret{}))).To(BeTrue())
+	g.Expect(apierrors.IsNotFound(c.Get(ctx, client.ObjectKey{Namespace: hcpNS, Name: "token-np-1-cfg1"}, &corev1.Secret{}))).To(BeTrue())
+	// But the CR and its projected configs ARE authored so the PayloadController can serve the payload.
+	g.Expect(refNames(cr.Spec.MgmtConfigMaps)).To(ContainElement(haproxyConfigMapName("np-1")))
+	g.Expect(c.Get(ctx, client.ObjectKey{Namespace: hcpNS, Name: haproxyConfigMapName("np-1")}, &corev1.ConfigMap{})).To(Succeed())
 }
 
 func TestFinalizeIgnitionPayloadConsumer(t *testing.T) {
