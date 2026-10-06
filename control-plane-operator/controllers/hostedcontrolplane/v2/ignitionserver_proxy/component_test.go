@@ -71,6 +71,14 @@ func TestPredicate(t *testing.T) {
 			},
 			expected: false,
 		},
+		{
+			name:     "When IgnitionPayloadActiveAnnotation is true, it should stand down and return false",
+			platform: hyperv1.AWSPlatform,
+			annotations: map[string]string{
+				hyperv1.IgnitionPayloadActiveAnnotation: "true",
+			},
+			expected: false,
+		},
 	}
 
 	for _, tc := range testCases {

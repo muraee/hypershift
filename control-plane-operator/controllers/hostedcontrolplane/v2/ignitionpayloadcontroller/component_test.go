@@ -33,6 +33,36 @@ func TestOptionsWorkloadIdentity(t *testing.T) {
 	g.Expect(o.NeedsManagementKASAccess()).To(BeTrue())
 }
 
+func TestPredicate(t *testing.T) {
+	testCases := []struct {
+		name        string
+		enabled     bool
+		annotations map[string]string
+		expected    bool
+	}{
+		{name: "gate OFF -> false", enabled: false, expected: false},
+		{name: "gate ON, ignition enabled -> true", enabled: true, expected: true},
+		{
+			name:        "gate ON, DisableIgnitionServerAnnotation -> false",
+			enabled:     true,
+			annotations: map[string]string{hyperv1.DisableIgnitionServerAnnotation: "true"},
+			expected:    false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			hcp := &hyperv1.HostedControlPlane{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-hcp", Namespace: "test-ns", Annotations: tc.annotations},
+			}
+			result, err := (&Options{Enabled: tc.enabled}).predicate(component.WorkloadContext{HCP: hcp})
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(result).To(Equal(tc.expected))
+		})
+	}
+}
+
 func TestReconcileRendersController(t *testing.T) {
 	g := NewWithT(t)
 	const ns = "hcp"

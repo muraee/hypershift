@@ -49,6 +49,7 @@ import (
 	"github.com/openshift/hypershift/hypershift-operator/controllers/manifests/controlplaneoperator"
 	controlplanepkioperatormanifests "github.com/openshift/hypershift/hypershift-operator/controllers/manifests/controlplanepkioperator"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/manifests/ignitionserver"
+	"github.com/openshift/hypershift/hypershift-operator/featuregate"
 	kvinfra "github.com/openshift/hypershift/kubevirtexternalinfra"
 	cpconst "github.com/openshift/hypershift/pkg/controlplane"
 	pkgmanifests "github.com/openshift/hypershift/pkg/manifests"
@@ -1848,6 +1849,23 @@ func (r *HostedClusterReconciler) reconcileOperatorDeployments(ctx context.Conte
 	if err := r.reconcileKarpenterOperator(cpContext, hcluster,
 		r.HypershiftOperatorImage, controlPlaneOperatorImage); err != nil {
 		errs = append(errs, fmt.Errorf("failed to reconcile karpenter operator: %w", err))
+	}
+
+	// Reconcile the re-architected ignition payload components (gated on IgnitionPayloadSystem).
+	// Always invoked so a gate-off flip tears them down via their predicate-false delete path; a
+	// no-op (state unchanged) when the gate is off and the components were never created. The
+	// ingress domain is only resolved when the gate is on so the gate-off path adds no new behavior.
+	var ignitionPayloadIngressDomain string
+	if featuregate.Gate().Enabled(featuregate.IgnitionPayloadSystem) {
+		domain, domainErr := r.defaultIngressDomain(ctx)
+		if domainErr != nil {
+			errs = append(errs, fmt.Errorf("failed to determine default ingress domain for ignition payload components: %w", domainErr))
+		}
+		ignitionPayloadIngressDomain = domain
+	}
+	if err := r.reconcileIgnitionPayloadComponents(cpContext,
+		r.HypershiftOperatorImage, releaseProvider, ignitionPayloadIngressDomain); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile ignition payload components: %w", err))
 	}
 	return utilerrors.NewAggregate(errs)
 }

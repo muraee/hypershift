@@ -429,6 +429,15 @@ const (
 	// DisableIgnitionServerAnnotation controls skipping of the ignition server deployment.
 	DisableIgnitionServerAnnotation = "hypershift.openshift.io/disable-ignition-server"
 
+	// IgnitionPayloadActiveAnnotation signals that the re-architected ignition payload stack
+	// (ignition-payload-server + proxy) is deployed and reporting Available for this
+	// HostedControlPlane. The HyperShift Operator sets it to "true" when the IgnitionPayloadSystem
+	// management feature gate is enabled AND the new ignition-payload-server ControlPlaneComponent
+	// is Available, and removes it otherwise. The legacy ignition-server/ignition-server-proxy
+	// component predicates stand down (delete) while it is "true", so the legacy stack is torn down
+	// only once the new stack is serving — guaranteeing no serving gap during cutover.
+	IgnitionPayloadActiveAnnotation = "hypershift.openshift.io/ignition-payload-active"
+
 	// KubeAPIServerGoAwayChance allows the --goaway-chance parameter of the kube-apiserver to be overridden from its default of 0
 	KubeAPIServerGoAwayChance = "hypershift.openshift.io/kube-apiserver-goaway-chance"
 

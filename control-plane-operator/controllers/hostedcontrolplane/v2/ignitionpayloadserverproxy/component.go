@@ -19,7 +19,13 @@ var _ component.ComponentOptions = &Options{}
 // Options configures the ignition-payload-server-proxy component. The proxy is the request-serving
 // isolation boundary: it terminates node TLS with the node-facing serving cert and forwards to the
 // stateless ignition-payload-server backend, verifying it against the self-contained CA.
-type Options struct{}
+type Options struct {
+	// Enabled gates the whole component on the HO-side IgnitionPayloadSystem feature gate.
+	// It is computed by the HostedCluster reconciler (which owns the gate) and threaded in here:
+	// this package lives under control-plane-operator and must NOT import
+	// hypershift-operator/featuregate (that would create an import cycle).
+	Enabled bool
+}
 
 // IsRequestServing implements controlplanecomponent.ComponentOptions.
 func (o *Options) IsRequestServing() bool { return true }
@@ -33,10 +39,10 @@ func (o *Options) NeedsManagementKASAccess() bool { return false }
 // NewComponent returns the ignition-payload-server-proxy ControlPlaneComponent. It depends on the
 // ignition-payload-server component. It is NOT yet wired into the HostedCluster reconcile; Phase 5c
 // reconciles it (gated on the IgnitionPayloadSystem feature gate).
-func NewComponent() component.ControlPlaneComponent {
-	return component.NewDeploymentComponent(ComponentName, &Options{}).
+func NewComponent(opts *Options) component.ControlPlaneComponent {
+	return component.NewDeploymentComponent(ComponentName, opts).
 		WithAdaptFunction(adaptDeployment).
-		WithPredicate(predicate).
+		WithPredicate(opts.predicate).
 		WithManifestAdapter(
 			"haproxy-config.yaml",
 			component.WithAdaptFunction(adaptHAProxyConfig),
@@ -49,9 +55,11 @@ func NewComponent() component.ControlPlaneComponent {
 		Build()
 }
 
-// predicate deploys the proxy on all platforms except IBMCloud (where the server Service is exposed
-// directly), unless ignition is disabled entirely via the DisableIgnitionServerAnnotation.
-func predicate(cpContext component.WorkloadContext) (bool, error) {
+// predicate deploys the proxy when the IgnitionPayloadSystem feature gate is on (threaded in via
+// Options.Enabled), on all platforms except IBMCloud (where the server Service is exposed directly),
+// unless ignition is disabled entirely via the DisableIgnitionServerAnnotation. When it returns
+// false the CPOv2 framework tears the component down, so flipping the gate off removes it.
+func (o *Options) predicate(cpContext component.WorkloadContext) (bool, error) {
 	_, disableIgnition := cpContext.HCP.Annotations[hyperv1.DisableIgnitionServerAnnotation]
-	return !disableIgnition && cpContext.HCP.Spec.Platform.Type != hyperv1.IBMCloudPlatform, nil
+	return o.Enabled && !disableIgnition && cpContext.HCP.Spec.Platform.Type != hyperv1.IBMCloudPlatform, nil
 }

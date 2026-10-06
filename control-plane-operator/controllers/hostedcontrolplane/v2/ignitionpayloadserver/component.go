@@ -35,6 +35,12 @@ var _ component.ComponentOptions = &Options{}
 type Options struct {
 	HyperShiftOperatorImage string
 	DefaultIngressDomain    string
+
+	// Enabled gates the whole component on the HO-side IgnitionPayloadSystem feature gate.
+	// It is computed by the HostedCluster reconciler (which owns the gate) and threaded in here:
+	// this package lives under control-plane-operator and must NOT import
+	// hypershift-operator/featuregate (that would create an import cycle).
+	Enabled bool
 }
 
 // IsRequestServing implements controlplanecomponent.ComponentOptions.
@@ -52,6 +58,7 @@ func (o *Options) NeedsManagementKASAccess() bool { return true }
 func NewComponent(opts *Options) component.ControlPlaneComponent {
 	return component.NewDeploymentComponent(ComponentName, opts).
 		WithAdaptFunction(opts.adaptDeployment).
+		WithPredicate(opts.predicate).
 		WithManifestAdapter(
 			"service.yaml",
 			component.WithAdaptFunction(adaptService),
@@ -80,4 +87,13 @@ func NewComponent(opts *Options) component.ControlPlaneComponent {
 			component.ReconcileExisting(),
 		).
 		Build()
+}
+
+// predicate enables the component when the IgnitionPayloadSystem feature gate is on (threaded in
+// via Options.Enabled) and ignition is not disabled entirely via the DisableIgnitionServerAnnotation.
+// When it returns false the CPOv2 framework tears the component down, so flipping the gate off
+// removes it.
+func (o *Options) predicate(cpContext component.WorkloadContext) (bool, error) {
+	_, disableIgnition := cpContext.HCP.Annotations[hyperv1.DisableIgnitionServerAnnotation]
+	return o.Enabled && !disableIgnition, nil
 }

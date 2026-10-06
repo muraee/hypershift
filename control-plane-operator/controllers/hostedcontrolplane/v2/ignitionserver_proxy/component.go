@@ -52,6 +52,12 @@ func NewComponent(defaultIngressDomain string) component.ControlPlaneComponent {
 }
 
 func predicate(cpContext component.WorkloadContext) (bool, error) {
+	// Stand down the legacy ignition-server-proxy once the re-architected ignition-payload stack is
+	// deployed and Available. The HyperShift Operator sets this annotation (gate ON + new server
+	// Available), so the legacy stack is torn down only after the new one serves (no serving gap).
+	if cpContext.HCP.Annotations[hyperv1.IgnitionPayloadActiveAnnotation] == "true" {
+		return false, nil
+	}
 	_, disableIgnition := cpContext.HCP.Annotations[hyperv1.DisableIgnitionServerAnnotation]
 	return !disableIgnition && cpContext.HCP.Spec.Platform.Type != hyperv1.IBMCloudPlatform, nil
 }
