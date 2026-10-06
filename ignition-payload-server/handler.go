@@ -34,6 +34,14 @@ type Server struct {
 	OnServed func(ctx context.Context, owner payloadstore.OwnerRef, token string)
 }
 
+// HandleHealthz serves GET /healthz. It always returns 200 OK so the kubelet liveness and
+// readiness probes can confirm the serving process is up, independent of TLS client auth or
+// payload state.
+func HandleHealthz(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok"))
+}
+
 // HandleIgnition serves GET /ignition. It authorizes the Bearer token, resolves the payload from
 // the store (cached, then read-through to the API on a miss), serves the sanitized payload, and
 // triggers the OnServed callback.

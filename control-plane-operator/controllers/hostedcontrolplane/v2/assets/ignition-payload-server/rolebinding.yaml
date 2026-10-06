@@ -1,0 +1,11 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ignition-payload-server
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ignition-payload-server
+subjects:
+- kind: ServiceAccount
+  name: ignition-payload-server

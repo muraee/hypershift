@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ignition-payload-server
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ignition-payload-server
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: ignition-payload-server
+    spec:
+      containers:
+      - command:
+        - /usr/bin/hypershift-operator
+        args:
+        - ignition-payload-server
+        - --cert-file
+        - /var/run/secrets/ignition/serving-cert/tls.crt
+        - --key-file
+        - /var/run/secrets/ignition/serving-cert/tls.key
+        env:
+        - name: MY_NAMESPACE
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.namespace
+        image: hypershift-operator
+        livenessProbe:
+          failureThreshold: 6
+          httpGet:
+            path: /healthz
+            port: 9090
+            scheme: HTTPS
+          initialDelaySeconds: 120
+          periodSeconds: 60
+          successThreshold: 1
+          timeoutSeconds: 5
+        name: ignition-payload-server
+        ports:
+        - containerPort: 9090
+          name: https
+          protocol: TCP
+        readinessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /healthz
+            port: 9090
+            scheme: HTTPS
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 5
+        resources:
+          requests:
+            cpu: 10m
+            memory: 40Mi
+        volumeMounts:
+        - mountPath: /var/run/secrets/ignition/serving-cert
+          name: serving-cert
+      serviceAccountName: ignition-payload-server
+      terminationGracePeriodSeconds: 10
+      volumes:
+      - name: serving-cert
+        secret:
+          defaultMode: 416
+          secretName: ignition-payload-server-tls
