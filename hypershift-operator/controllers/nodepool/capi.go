@@ -56,6 +56,16 @@ type CAPI struct {
 	capiClusterName       string
 	scaleFromZeroPlatform hyperv1.PlatformType
 	upsert.ApplyProvider
+
+	// ignitionPayloadCR is the NodePool's IgnitionPayload CR on the gate-ON path, used to advance
+	// spec.retiredGeneration once a rollout completes so the previous payload's store token is freed.
+	// nil on the gate-OFF path.
+	ignitionPayloadCR *hyperv1.IgnitionPayload
+	// ignitionPayloadConfigHash is status.current.configHash on the gate-ON path: the payload-identity
+	// hash HCCO's in-place upgrader converges on. An InPlace re-point stamps it as the MachineSet
+	// TargetConfigVersion (instead of the legacy Token.Hash()) so HCCO finds the token-{ms}-{configHash}
+	// compat Secret reconcileLegacyInPlaceSecret writes. Empty on the gate-OFF path.
+	ignitionPayloadConfigHash string
 }
 
 // hasStatusCapacity checks if a machine template has Status.Capacity populated
@@ -94,6 +104,50 @@ func newCAPI(token *Token, capiClusterName string) (*CAPI, error) {
 // byte-for-byte unchanged.
 func (c *CAPI) skipUserDataRepoint() bool {
 	return c.ignitionPayloadConsumerActive && c.userDataSecretNameOverride == ""
+}
+
+// currentUserDataSecretName returns the userdata Secret name the NodePool's Machines currently boot
+// from — the live Bootstrap.DataSecretName of the MachineSet (InPlace) or MachineDeployment (Replace)
+// — or "" when the object does not exist yet (never-provisioned NodePool). The IgnitionPayload
+// consumer adopts off this live name so an already-provisioned NodePool keeps its exact userdata name
+// across the gate flip (no roll).
+func (c *CAPI) currentUserDataSecretName(ctx context.Context) (string, error) {
+	var dataSecretName *string
+	if c.nodePool.Spec.Management.UpgradeType == hyperv1.UpgradeTypeInPlace {
+		ms := c.machineSet()
+		if err := c.Get(ctx, client.ObjectKeyFromObject(ms), ms); err != nil {
+			if apierrors.IsNotFound(err) {
+				return "", nil
+			}
+			return "", fmt.Errorf("failed to get MachineSet %s: %w", ms.Name, err)
+		}
+		dataSecretName = ms.Spec.Template.Spec.Bootstrap.DataSecretName
+	} else {
+		md := c.machineDeployment()
+		if err := c.Get(ctx, client.ObjectKeyFromObject(md), md); err != nil {
+			if apierrors.IsNotFound(err) {
+				return "", nil
+			}
+			return "", fmt.Errorf("failed to get MachineDeployment %s: %w", md.Name, err)
+		}
+		dataSecretName = md.Spec.Template.Spec.Bootstrap.DataSecretName
+	}
+	return ptr.Deref(dataSecretName, ""), nil
+}
+
+// advanceRetiredGenerationOnComplete frees the previous payload's store token once a rollout has
+// drained, by advancing the IgnitionPayload CR's spec.retiredGeneration to status.previous.generation.
+// It is a no-op on the gate-OFF path (no CR) and is level-triggered + monotonic, so calling it on
+// every completed reconcile — including at adoption, where previous.generation has not advanced — is
+// safe (it advances nothing then). Errors are logged, not returned: retirement is best-effort and
+// retried on the next reconcile.
+func (c *CAPI) advanceRetiredGenerationOnComplete(ctx context.Context, log logr.Logger) {
+	if !c.ignitionPayloadConsumerActive || c.ignitionPayloadCR == nil {
+		return
+	}
+	if err := advanceRetiredGeneration(ctx, c.Client, c.ignitionPayloadCR, c.ignitionPayloadCR.Status.Previous.Generation); err != nil {
+		log.Error(err, "failed to advance IgnitionPayload retiredGeneration")
+	}
 }
 
 func (c *CAPI) Reconcile(ctx context.Context) error {
@@ -696,6 +750,9 @@ func (c *CAPI) reconcileMachineDeploymentStatus(ctx context.Context, log logr.Lo
 				"previous", nodePool.Annotations[nodePoolAnnotationPlatformMachineTemplate], "new", machineTemplateCR.GetName())
 			nodePool.Annotations[nodePoolAnnotationPlatformMachineTemplate] = machineTemplateCR.GetName()
 		}
+
+		// The rollout has drained; free the previous payload's store token (gate-ON only).
+		c.advanceRetiredGenerationOnComplete(ctx, log)
 	}
 
 	nodePool.Status.Replicas = ptr.Deref(machineDeployment.Status.AvailableReplicas, 0)
@@ -1070,12 +1127,18 @@ func (c *CAPI) reconcileMachineSet(ctx context.Context,
 		machineSet.Spec.Template.Spec.Version = targetVersion
 		machineSet.Spec.Template.Spec.Bootstrap.DataSecretName = ptr.To(userDataSecret.Name)
 
-		// Signal in-place upgrade request.
-		machineSet.Annotations[nodePoolAnnotationTargetConfigVersion] = targetConfigVersionHash
+		// Signal in-place upgrade request. On the gate-ON IgnitionPayload path the upgrade target is
+		// the payload-identity configHash (what HCCO converges on and what keys the token-{ms}-{hash}
+		// compat Secret), not the legacy Token.Hash().
+		inPlaceConfigVersion := targetConfigVersionHash
+		if c.ignitionPayloadConsumerActive {
+			inPlaceConfigVersion = c.ignitionPayloadConfigHash
+		}
+		machineSet.Annotations[nodePoolAnnotationTargetConfigVersion] = inPlaceConfigVersion
 
 		// If the machineSet is brand new, set current version to target so in-place upgrade no-op.
 		if _, ok := machineSet.Annotations[nodePoolAnnotationCurrentConfigVersion]; !ok {
-			machineSet.Annotations[nodePoolAnnotationCurrentConfigVersion] = targetConfigVersionHash
+			machineSet.Annotations[nodePoolAnnotationCurrentConfigVersion] = inPlaceConfigVersion
 		}
 		isUpdating = true
 	}
@@ -1120,6 +1183,9 @@ func (c *CAPI) reconcileMachineSet(ctx context.Context,
 				"previous", nodePool.Annotations[nodePoolAnnotationPlatformMachineTemplate], "new", machineTemplateCR.GetName())
 			nodePool.Annotations[nodePoolAnnotationPlatformMachineTemplate] = machineTemplateCR.GetName()
 		}
+
+		// The in-place rollout has drained; free the previous payload's store token (gate-ON only).
+		c.advanceRetiredGenerationOnComplete(ctx, log)
 	}
 
 	// Bubble up AvailableReplicas and Ready condition from MachineSet.

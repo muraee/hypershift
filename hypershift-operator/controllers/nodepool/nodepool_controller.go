@@ -78,6 +78,12 @@ const (
 	nodePoolAnnotationUpgradeInProgressTrue  = "hypershift.openshift.io/nodePoolUpgradeInProgressTrue"
 	nodePoolAnnotationUpgradeInProgressFalse = "hypershift.openshift.io/nodePoolUpgradeInProgressFalse"
 	nodePoolAnnotationMaxUnavailable         = "hypershift.openshift.io/nodePoolMaxUnavailable"
+	// nodePoolAnnotationIgnitionAdoptedRolloutHash records the IgnitionPayload rollout hash this
+	// NodePool has been adopted onto. On the first gate-ON reconcile of an already-provisioned
+	// NodePool it is absent, so the consumer keeps the existing userdata Secret name (no roll) and
+	// stamps the current rollout hash here. A later reconcile where status.current.rolloutHash differs
+	// from this marker is a genuine config change and rolls normally.
+	nodePoolAnnotationIgnitionAdoptedRolloutHash = "hypershift.openshift.io/ignition-adopted-rollout-hash"
 
 	// ec2InstanceMetadataHTTPTokensAnnotation can be set to change the instance metadata options of the nodepool underlying EC2 instances
 	// possible values are 'required' (i.e. IMDSv2) or 'optional' which is the default.
@@ -485,7 +491,14 @@ func (r *NodePoolReconciler) reconcile(ctx context.Context, hcluster *hyperv1.Ho
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to gather ignition payload consumer inputs: %w", err)
 		}
-		userDataName, _, err := reconcileIgnitionPayloadConsumer(ctx, r.Client, store, nodePool, hcluster, cutoverActive, in)
+		// Adoption keys off the live userdata name so an already-provisioned NodePool keeps its exact
+		// name across the gate flip (no roll).
+		existingUserData, err := capi.currentUserDataSecretName(ctx)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to read current userdata Secret name: %w", err)
+		}
+		in.existingUserDataSecretName = existingUserData
+		userDataName, cr, err := reconcileIgnitionPayloadConsumer(ctx, r.Client, store, nodePool, hcluster, cutoverActive, in)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to reconcile ignition payload consumer: %w", err)
 		}
@@ -494,6 +507,8 @@ func (r *NodePoolReconciler) reconcile(ctx context.Context, hcluster *hyperv1.Ho
 		// existing DataSecretName untouched (skipUserDataRepoint) and we requeue until it is ready.
 		token.ignitionPayloadConsumerActive = true
 		token.userDataSecretNameOverride = userDataName
+		capi.ignitionPayloadCR = cr
+		capi.ignitionPayloadConfigHash = cr.Status.Current.ConfigHash
 		requeueForIgnitionPayload = userDataName == ""
 	} else {
 		if err := token.Reconcile(ctx); err != nil {

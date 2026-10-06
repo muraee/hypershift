@@ -82,6 +82,14 @@ type ignitionConsumerInputs struct {
 	endpoint        string
 	proxy           *configv1.Proxy
 	machineSetName  string
+	// existingUserDataSecretName is the userdata Secret name the NodePool's Machines currently boot
+	// from (the live Bootstrap.DataSecretName of the MachineDeployment/MachineSet), or "" for a
+	// never-provisioned NodePool. Adoption keys off this LIVE name — not a derived hash — so that an
+	// already-provisioned NodePool keeps its exact name across the gate flip (no roll), and a genuine
+	// change rolls to the new rollout-hash name without flip-flopping mid-rollout. The legacy
+	// ConfigGenerator.Hash() and the PayloadController rollout hash are computed by different formulas,
+	// so the live name cannot be reconstructed from the NodePool annotation alone.
+	existingUserDataSecretName string
 }
 
 // ignitionConsumerInputsFor gathers the resolved inputs the IgnitionPayload consumer needs for one
@@ -190,8 +198,10 @@ func reconcileIgnitionPayloadConsumer(ctx context.Context, c client.Client, stor
 		return "", cr, nil
 	}
 
+	userDataName := adoptUserDataSecretName(nodePool, cr.Status.Current, in.existingUserDataSecretName)
+
 	desired := userDataSecretForToken(nodePool, hcpNamespace, in.endpoint, in.caCert, in.proxy, cr.Status.Current)
-	userDataSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: desired.Namespace, Name: desired.Name}}
+	userDataSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: hcpNamespace, Name: userDataName}}
 	if _, err := controllerutil.CreateOrUpdate(ctx, c, userDataSecret, func() error {
 		if err := controllerutil.SetControllerReference(cr, userDataSecret, api.Scheme); err != nil {
 			return err
@@ -199,7 +209,7 @@ func reconcileIgnitionPayloadConsumer(ctx context.Context, c client.Client, stor
 		userDataSecret.Data = desired.Data
 		return nil
 	}); err != nil {
-		return "", cr, fmt.Errorf("failed to reconcile userdata Secret %s/%s: %w", desired.Namespace, desired.Name, err)
+		return "", cr, fmt.Errorf("failed to reconcile userdata Secret %s/%s: %w", hcpNamespace, userDataName, err)
 	}
 
 	if err := reconcileLegacyInPlaceSecret(ctx, c, store, hcpNamespace, in.machineSetName,
@@ -207,7 +217,45 @@ func reconcileIgnitionPayloadConsumer(ctx context.Context, c client.Client, stor
 		return "", cr, err
 	}
 
-	return desired.Name, cr, nil
+	return userDataName, cr, nil
+}
+
+// adoptUserDataSecretName decides the userdata Secret name the consumer writes content under (and
+// returns for the CAPI re-point), and records the adopted rollout-hash baseline on the NodePool. It
+// is the crux of the no-fleet-roll-on-gate-flip guarantee:
+//
+//   - Already-provisioned NodePool whose adoption marker is absent (first gate-ON reconcile) or equals
+//     the current rollout hash (steady state): keep the EXISTING live userdata name so CAPI sees no
+//     DataSecretName change and does not roll; the content is overwritten in place with the new
+//     token/CA/endpoint, which scale-up Machines pick up.
+//   - Brand-new NodePool (no live userdata): name keys on the current rollout hash.
+//   - Genuine config change after adoption (current rollout hash differs from the marker): name keys
+//     on the new rollout hash, so CAPI rolls normally.
+//
+// In all three it records current.RolloutHash as the adopted baseline so the next reconcile can tell
+// steady state from a genuine change.
+func adoptUserDataSecretName(nodePool *hyperv1.NodePool, current hyperv1.PayloadReference, existing string) string {
+	marker := nodePool.GetAnnotations()[nodePoolAnnotationIgnitionAdoptedRolloutHash]
+	rolloutHashName := fmt.Sprintf("%s-%s-%s", UserDataSecrePrefix, nodePool.GetName(), current.RolloutHash)
+
+	var name string
+	switch {
+	case existing == "":
+		// Brand-new NodePool: nothing to adopt, key on the rollout hash.
+		name = rolloutHashName
+	case marker == "" || marker == current.RolloutHash:
+		// Already provisioned and not yet adopted, or steady state: keep the existing name (no roll).
+		name = existing
+	default:
+		// Genuine change after adoption: new rollout hash -> new name -> CAPI rolls.
+		name = rolloutHashName
+	}
+
+	if nodePool.Annotations == nil {
+		nodePool.Annotations = map[string]string{}
+	}
+	nodePool.Annotations[nodePoolAnnotationIgnitionAdoptedRolloutHash] = current.RolloutHash
+	return name
 }
 
 // finalizeIgnitionPayloadConsumer removes the consumer finalizer from the NodePool's
