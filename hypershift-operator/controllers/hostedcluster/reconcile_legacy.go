@@ -758,19 +758,23 @@ func (r *HostedClusterReconciler) reconcileLegacy(ctx context.Context, req ctrl.
 			log.Error(fmt.Errorf("ignition server service strategy not specified"), "")
 			return ctrl.Result{}, nil
 		}
+		// Select the ignition (Route, proxy Service, server Service) to read based on the
+		// IgnitionPayloadSystem feature gate: gate ON -> the new ignition-payload-* stack,
+		// gate OFF -> the legacy ignition-server stack. The same host serves either proxy, so
+		// the user-supplied Route.Hostname passthrough below is unaffected.
+		ignitionRoute, ignitionProxyService, ignitionBackendService := ignitionEndpointResources(hcluster, controlPlaneNamespace.GetName())
 		switch serviceStrategy.Type {
 		case hyperv1.Route:
 			if serviceStrategy.Route != nil && serviceStrategy.Route.Hostname != "" {
 				hcluster.Status.IgnitionEndpoint = serviceStrategy.Route.Hostname
 			} else {
-				ignitionServerRoute := ignitionserver.Route(controlPlaneNamespace.GetName())
-				if err := r.Client.Get(ctx, client.ObjectKeyFromObject(ignitionServerRoute), ignitionServerRoute); err != nil {
+				if err := r.Client.Get(ctx, client.ObjectKeyFromObject(ignitionRoute), ignitionRoute); err != nil {
 					if !apierrors.IsNotFound(err) {
 						return ctrl.Result{}, fmt.Errorf("failed to get ignitionServerRoute: %w", err)
 					}
 				}
-				if ignitionServerRoute.Spec.Host != "" {
-					hcluster.Status.IgnitionEndpoint = ignitionServerRoute.Spec.Host
+				if ignitionRoute.Spec.Host != "" {
+					hcluster.Status.IgnitionEndpoint = ignitionRoute.Spec.Host
 				}
 			}
 		case hyperv1.NodePort:
@@ -780,13 +784,13 @@ func (r *HostedClusterReconciler) reconcileLegacy(ctx context.Context, req ctrl.
 				log.Error(fmt.Errorf("nodeport metadata not specified for ignition service"), "")
 				return ctrl.Result{}, nil
 			}
-			ignitionService := ignitionserver.ProxyService(controlPlaneNamespace.GetName())
+			ignitionService := ignitionProxyService
 			if err = r.Client.Get(ctx, client.ObjectKeyFromObject(ignitionService), ignitionService); err != nil {
 				if !apierrors.IsNotFound(err) {
 					return ctrl.Result{}, fmt.Errorf("failed to get ignition proxy service: %w", err)
 				} else {
-					// ignition-server-proxy service not found, possible IBM platform or older CPO that doesn't create the service
-					ignitionService = ignitionserver.Service(controlPlaneNamespace.GetName())
+					// ignition proxy service not found, possible IBM platform or older CPO that doesn't create the service
+					ignitionService = ignitionBackendService
 					if err = r.Client.Get(ctx, client.ObjectKeyFromObject(ignitionService), ignitionService); err != nil {
 						if !apierrors.IsNotFound(err) {
 							return ctrl.Result{}, fmt.Errorf("failed to get ignition service: %w", err)
