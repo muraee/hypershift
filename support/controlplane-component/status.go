@@ -45,6 +45,9 @@ var (
 		"router",
 		"ignition-server",
 		"ignition-server-proxy",
+		"ignition-payload-controller",
+		"ignition-payload-server",
+		"ignition-payload-server-proxy",
 	)
 )
 

@@ -1,0 +1,57 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ignition-payload-controller
+rules:
+  - apiGroups:
+      - "coordination.k8s.io"
+    resources:
+      - "leases"
+    verbs:
+      - "get"
+      - "watch"
+      - "create"
+  - apiGroups:
+      - "coordination.k8s.io"
+    resources:
+      - "leases"
+    verbs:
+      - "patch"
+      - "update"
+    resourceNames:
+      - "ignition-payload-controller-leader-elect"
+  - apiGroups:
+      - ""
+    resources:
+      - "secrets"
+    verbs:
+      - "*"
+  - apiGroups:
+      - ""
+    resources:
+      - "configmaps"
+    verbs:
+      - "get"
+      - "list"
+      - "watch"
+  - apiGroups:
+      - ""
+    resources:
+      - "events"
+    verbs:
+      - "*"
+  - apiGroups:
+      - "hypershift.openshift.io"
+    resources:
+      - "ignitionpayloads"
+      - "ignitionpayloads/status"
+    verbs:
+      - "*"
+  - apiGroups:
+      - "hypershift.openshift.io"
+    resources:
+      - "hostedcontrolplanes"
+    verbs:
+      - "get"
+      - "list"
+      - "watch"
