@@ -50,6 +50,20 @@ func TestHashes(t *testing.T) {
 	g.Expect(payloadIdentityHash(t1)).ToNot(Equal(id0))
 	g.Expect(rolloutHash(t1)).To(Equal(ro0))
 
+	// (RF#4) full-config (MCS gate) change: identity CHANGES (payload refreshes), rollout UNCHANGED
+	// (old rollout trigger used only the proxy/image/TLS subset, not the full config hash).
+	hc := base
+	hc.hcConfigHash = "cfg-hash-v2"
+	g.Expect(payloadIdentityHash(hc)).ToNot(Equal(id0), "full-config change must change identity")
+	g.Expect(rolloutHash(hc)).To(Equal(ro0), "full-config change must NOT change rollout hash")
+
+	// (RF#3) cloud-config change: identity CHANGES (payload refreshes), rollout UNCHANGED
+	// (old Hash() excluded cloud config from the rollout trigger).
+	cc := base
+	cc.cloudConfigHash = "cloud-hash-v2"
+	g.Expect(payloadIdentityHash(cc)).ToNot(Equal(id0), "cloud-config change must change identity")
+	g.Expect(rolloutHash(cc)).To(Equal(ro0), "cloud-config change must NOT change rollout hash")
+
 	// rolloutGlobalConfig / osStream / releaseVersion changes: rollout CHANGES.
 	gc := base
 	gc.rolloutGlobalConfig = []byte("gc2")

@@ -121,7 +121,7 @@ func run(ctx context.Context, opts Options) error {
 	}
 
 	store := payloadstore.NewSecretBackedStore(mgr.GetClient(), namespace)
-	r := ignitionpayload.NewReconciler(mgr.GetClient(), store, provider, namespace)
+	r := ignitionpayload.NewReconciler(mgr.GetClient(), store, provider, provider.ReleaseProvider, namespace)
 	if err := r.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("unable to set up ignition payload controller: %w", err)
 	}
