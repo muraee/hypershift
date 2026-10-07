@@ -29,6 +29,22 @@ import (
 	"strings"
 	"time"
 
+	"github.com/blang/semver"
+	"github.com/go-logr/logr"
+	"github.com/google/uuid"
+	orcv1alpha1 "github.com/k-orc/openstack-resource-controller/v2/api/v1alpha1"
+	prometheusoperatorv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+	"gopkg.in/ini.v1"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+
+	configv1 "github.com/openshift/api/config/v1"
+	routev1 "github.com/openshift/api/route/v1"
+
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	hyperkarpenterv1 "github.com/openshift/hypershift/api/karpenter/v1"
 	"github.com/openshift/hypershift/api/util/configrefs"
@@ -44,11 +60,13 @@ import (
 	"github.com/openshift/hypershift/hypershift-operator/controllers/hostedcluster/internal/proxy"
 	hcmetrics "github.com/openshift/hypershift/hypershift-operator/controllers/hostedcluster/metrics"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/hostedcluster/validations"
+	"github.com/openshift/hypershift/hypershift-operator/controllers/ignitionpayloadcutover"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/manifests"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/manifests/clusterapi"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/manifests/controlplaneoperator"
 	controlplanepkioperatormanifests "github.com/openshift/hypershift/hypershift-operator/controllers/manifests/controlplanepkioperator"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/manifests/ignitionserver"
+	"github.com/openshift/hypershift/hypershift-operator/featuregate"
 	kvinfra "github.com/openshift/hypershift/kubevirtexternalinfra"
 	cpconst "github.com/openshift/hypershift/pkg/controlplane"
 	pkgmanifests "github.com/openshift/hypershift/pkg/manifests"
@@ -79,13 +97,6 @@ import (
 	"github.com/openshift/hypershift/support/upsert"
 	hyperutil "github.com/openshift/hypershift/support/util"
 	supportvalidations "github.com/openshift/hypershift/support/validations"
-
-	configv1 "github.com/openshift/api/config/v1"
-	routev1 "github.com/openshift/api/route/v1"
-
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -118,15 +129,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-
-	"github.com/blang/semver"
-	"github.com/go-logr/logr"
-	"github.com/google/uuid"
-	orcv1alpha1 "github.com/k-orc/openstack-resource-controller/v2/api/v1alpha1"
-	prometheusoperatorv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
-	"go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/trace"
-	"gopkg.in/ini.v1"
 )
 
 const (
@@ -1138,19 +1140,28 @@ func (r *HostedClusterReconciler) reconcile(ctx context.Context, req ctrl.Reques
 			log.Error(fmt.Errorf("ignition server service strategy not specified"), "")
 			return ctrl.Result{}, nil
 		}
+		// Select the ignition (Route, proxy Service, server Service) to read based on whether the
+		// cutover to the re-architected ignition stack is active (gate ON && new ignition-payload-server
+		// Available): active -> the new ignition-payload-* stack, otherwise -> the legacy ignition-server
+		// stack. The same host serves either proxy, so the user-supplied Route.Hostname passthrough below
+		// is unaffected. Gate OFF short-circuits with no extra API call, so this path is unchanged.
+		ignitionPayloadActive, cutoverErr := ignitionpayloadcutover.Active(ctx, r.Client, controlPlaneNamespace.GetName())
+		if cutoverErr != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to determine ignition payload cutover state: %w", cutoverErr)
+		}
+		ignitionRoute, ignitionProxyService, ignitionBackendService := ignitionEndpointResources(ignitionPayloadActive, controlPlaneNamespace.GetName())
 		switch serviceStrategy.Type {
 		case hyperv1.Route:
 			if serviceStrategy.Route != nil && serviceStrategy.Route.Hostname != "" {
 				hcluster.Status.IgnitionEndpoint = serviceStrategy.Route.Hostname
 			} else {
-				ignitionServerRoute := ignitionserver.Route(controlPlaneNamespace.GetName())
-				if err := r.Client.Get(ctx, client.ObjectKeyFromObject(ignitionServerRoute), ignitionServerRoute); err != nil {
+				if err := r.Client.Get(ctx, client.ObjectKeyFromObject(ignitionRoute), ignitionRoute); err != nil {
 					if !apierrors.IsNotFound(err) {
 						return ctrl.Result{}, fmt.Errorf("failed to get ignitionServerRoute: %w", err)
 					}
 				}
-				if ignitionServerRoute.Spec.Host != "" {
-					hcluster.Status.IgnitionEndpoint = ignitionServerRoute.Spec.Host
+				if ignitionRoute.Spec.Host != "" {
+					hcluster.Status.IgnitionEndpoint = ignitionRoute.Spec.Host
 				}
 			}
 		case hyperv1.NodePort:
@@ -1160,13 +1171,13 @@ func (r *HostedClusterReconciler) reconcile(ctx context.Context, req ctrl.Reques
 				log.Error(fmt.Errorf("nodeport metadata not specified for ignition service"), "")
 				return ctrl.Result{}, nil
 			}
-			ignitionService := ignitionserver.ProxyService(controlPlaneNamespace.GetName())
+			ignitionService := ignitionProxyService
 			if err = r.Client.Get(ctx, client.ObjectKeyFromObject(ignitionService), ignitionService); err != nil {
 				if !apierrors.IsNotFound(err) {
 					return ctrl.Result{}, fmt.Errorf("failed to get ignition proxy service: %w", err)
 				} else {
-					// ignition-server-proxy service not found, possible IBM platform or older CPO that doesn't create the service
-					ignitionService = ignitionserver.Service(controlPlaneNamespace.GetName())
+					// ignition proxy service not found, possible IBM platform or older CPO that doesn't create the service
+					ignitionService = ignitionBackendService
 					if err = r.Client.Get(ctx, client.ObjectKeyFromObject(ignitionService), ignitionService); err != nil {
 						if !apierrors.IsNotFound(err) {
 							return ctrl.Result{}, fmt.Errorf("failed to get ignition service: %w", err)
@@ -1732,9 +1743,14 @@ func (r *HostedClusterReconciler) reconcileCoreHCPChain(
 		return hcp, fmt.Errorf("failed to determine if AWS node termination handler is needed: %w", err)
 	}
 
+	cutoverActive, err := ignitionpayloadcutover.Active(ctx, r.Client, controlPlaneNamespace)
+	if err != nil {
+		return hcp, fmt.Errorf("failed to determine ignition payload cutover state: %w", err)
+	}
+
 	hcp = controlplaneoperator.HostedControlPlane(controlPlaneNamespace, hcluster.Name)
 	_, err = createOrUpdate(ctx, r.Client, hcp, func() error {
-		return reconcileHostedControlPlane(hcp, hcluster, isAutoscalingNeeded, isAWSNodeTerminationHandlerNeeded,
+		return reconcileHostedControlPlane(hcp, hcluster, isAutoscalingNeeded, isAWSNodeTerminationHandlerNeeded, cutoverActive,
 			annotationsForCertRenewal(log,
 				hcp,
 				shouldCheckForStaleCerts(hcluster, defaultToControlPlaneV2),
@@ -1844,6 +1860,23 @@ func (r *HostedClusterReconciler) reconcileOperatorDeployments(ctx context.Conte
 	if err := r.reconcileKarpenterOperator(cpContext, hcluster,
 		r.HypershiftOperatorImage, controlPlaneOperatorImage); err != nil {
 		errs = append(errs, fmt.Errorf("failed to reconcile karpenter operator: %w", err))
+	}
+
+	// Reconcile the re-architected ignition payload components (gated on IgnitionPayloadSystem).
+	// Always invoked so a gate-off flip tears them down via their predicate-false delete path; a
+	// no-op (state unchanged) when the gate is off and the components were never created. The
+	// ingress domain is only resolved when the gate is on so the gate-off path adds no new behavior.
+	var ignitionPayloadIngressDomain string
+	if featuregate.Gate().Enabled(featuregate.IgnitionPayloadSystem) {
+		domain, domainErr := r.defaultIngressDomain(ctx)
+		if domainErr != nil {
+			errs = append(errs, fmt.Errorf("failed to determine default ingress domain for ignition payload components: %w", domainErr))
+		}
+		ignitionPayloadIngressDomain = domain
+	}
+	if err := r.reconcileIgnitionPayloadComponents(cpContext, hcluster,
+		r.HypershiftOperatorImage, releaseProvider, ignitionPayloadIngressDomain); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile ignition payload components: %w", err))
 	}
 	return utilerrors.NewAggregate(errs)
 }
@@ -2825,7 +2858,7 @@ func shouldCheckForStaleCerts(hc *hyperv1.HostedCluster, defaultingToControlPlan
 	}
 }
 
-func reconcileHostedControlPlaneAnnotations(hcp *hyperv1.HostedControlPlane, hcluster *hyperv1.HostedCluster, isAutoscalingNeeded bool, isAWSNodeTerminationHandlerNeeded bool, certRenewalAnnotations func() (map[string]string, error)) error {
+func reconcileHostedControlPlaneAnnotations(hcp *hyperv1.HostedControlPlane, hcluster *hyperv1.HostedCluster, isAutoscalingNeeded bool, isAWSNodeTerminationHandlerNeeded bool, ignitionPayloadCutoverActive bool, certRenewalAnnotations func() (map[string]string, error)) error {
 	if hcp.Annotations == nil {
 		hcp.Annotations = map[string]string{}
 	}
@@ -2893,6 +2926,17 @@ func reconcileHostedControlPlaneAnnotations(hcp *hyperv1.HostedControlPlane, hcl
 		}
 	}
 
+	// Cut the data plane over to the re-architected ignition stack by standing the legacy
+	// ignition-server down. This reuses the existing DisableIgnitionServerAnnotation — which the
+	// in-cluster CPO already honors across an N->N+1 upgrade — rather than a brand-new annotation an
+	// older CPO would silently ignore. It MUST run after the mirroredAnnotations loop above, which
+	// includes DisableIgnitionServerAnnotation and would otherwise clobber this write. Forward-only:
+	// we only set it when cutover is active; when inactive (gate off, or new server not yet
+	// Available) the mirror loop above already restores operator intent, so we never delete it here.
+	if ignitionPayloadCutoverActive {
+		hcp.Annotations[hyperv1.DisableIgnitionServerAnnotation] = "true"
+	}
+
 	prefixesToSync := []string{
 		hyperv1.IdentityProviderOverridesAnnotationPrefix,
 		hyperv1.ResourceRequestOverrideAnnotationPrefix,
@@ -2951,8 +2995,8 @@ func reconcileHostedControlPlaneAnnotations(hcp *hyperv1.HostedControlPlane, hcl
 
 // reconcileHostedControlPlane reconciles the given HostedControlPlane, which
 // will be mutated.
-func reconcileHostedControlPlane(hcp *hyperv1.HostedControlPlane, hcluster *hyperv1.HostedCluster, isAutoscalingNeeded bool, isAWSNodeTerminationHandlerNeeded bool, certRenewalAnnotations func() (map[string]string, error)) error {
-	if err := reconcileHostedControlPlaneAnnotations(hcp, hcluster, isAutoscalingNeeded, isAWSNodeTerminationHandlerNeeded, certRenewalAnnotations); err != nil {
+func reconcileHostedControlPlane(hcp *hyperv1.HostedControlPlane, hcluster *hyperv1.HostedCluster, isAutoscalingNeeded bool, isAWSNodeTerminationHandlerNeeded bool, ignitionPayloadCutoverActive bool, certRenewalAnnotations func() (map[string]string, error)) error {
+	if err := reconcileHostedControlPlaneAnnotations(hcp, hcluster, isAutoscalingNeeded, isAWSNodeTerminationHandlerNeeded, ignitionPayloadCutoverActive, certRenewalAnnotations); err != nil {
 		return err
 	}
 

@@ -512,7 +512,7 @@ func TestReconcileHostedControlPlaneAdditionalTrustBundle(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			updated := test.controlPlane.DeepCopy()
-			err := reconcileHostedControlPlane(updated, &test.cluster, true, true, func() (map[string]string, error) { return nil, nil })
+			err := reconcileHostedControlPlane(updated, &test.cluster, true, true, false, func() (map[string]string, error) { return nil, nil })
 			if err != nil {
 				t.Error(err)
 			}
@@ -566,7 +566,7 @@ func TestReconcileHostedControlPlaneLabelSync(t *testing.T) {
 			hcp := &hyperv1.HostedControlPlane{
 				ObjectMeta: metav1.ObjectMeta{Labels: test.hcpLabels},
 			}
-			err := reconcileHostedControlPlane(hcp, hc, false, false, func() (map[string]string, error) { return nil, nil })
+			err := reconcileHostedControlPlane(hcp, hc, false, false, false, func() (map[string]string, error) { return nil, nil })
 			g.Expect(err).ToNot(HaveOccurred())
 
 			for key, val := range test.expectedLabels {
@@ -673,7 +673,7 @@ func TestReconcileHostedControlPlaneUpgrades(t *testing.T) {
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
 			updated := test.ControlPlane.DeepCopy()
-			err := reconcileHostedControlPlane(updated, &test.Cluster, true, true, func() (map[string]string, error) { return nil, nil })
+			err := reconcileHostedControlPlane(updated, &test.Cluster, true, true, false, func() (map[string]string, error) { return nil, nil })
 			if err != nil {
 				t.Error(err)
 			}
@@ -813,7 +813,7 @@ func TestReconcileHostedControlPlaneAPINetwork(t *testing.T) {
 			hostedCluster := &hyperv1.HostedCluster{}
 			hostedCluster.Spec.Networking.APIServer = test.networking
 			hostedControlPlane := &hyperv1.HostedControlPlane{}
-			err := reconcileHostedControlPlane(hostedControlPlane, hostedCluster, true, true, func() (map[string]string, error) { return nil, nil })
+			err := reconcileHostedControlPlane(hostedControlPlane, hostedCluster, true, true, false, func() (map[string]string, error) { return nil, nil })
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -872,7 +872,7 @@ func TestReconcileHostedControlPlaneConfiguration(t *testing.T) {
 			hostedControlPlane := &hyperv1.HostedControlPlane{}
 			g := NewGomegaWithT(t)
 
-			err := reconcileHostedControlPlane(hostedControlPlane, hostedCluster, true, true, func() (map[string]string, error) { return nil, nil })
+			err := reconcileHostedControlPlane(hostedControlPlane, hostedCluster, true, true, false, func() (map[string]string, error) { return nil, nil })
 			g.Expect(err).ToNot(HaveOccurred())
 
 			// DeepEqual to check that all ClusterConfiguration fields are deep copied to HostedControlPlane
@@ -978,7 +978,7 @@ func TestReconcileHostedControlPlaneMonitoring(t *testing.T) {
 			hostedCluster.Spec.Monitoring = test.monitoring
 			hostedControlPlane := &hyperv1.HostedControlPlane{}
 
-			err := reconcileHostedControlPlane(hostedControlPlane, hostedCluster, true, true, func() (map[string]string, error) { return nil, nil })
+			err := reconcileHostedControlPlane(hostedControlPlane, hostedCluster, true, true, false, func() (map[string]string, error) { return nil, nil })
 			g.Expect(err).ToNot(HaveOccurred())
 			g.Expect(hostedControlPlane.Spec.Monitoring).To(Equal(test.expectedMonitoring))
 			if test.expectAnnotationOnHCP {
@@ -998,6 +998,7 @@ func TestReconcileHostedControlPlaneAnnotations(t *testing.T) {
 		hcAnnotations                     map[string]string
 		isAutoscalingNeeded               bool
 		isAWSNodeTerminationHandlerNeeded bool
+		ignitionPayloadCutoverActive      bool
 		certRenewalAnnotations            map[string]string
 		expectedAnnotations               map[string]string
 	}
@@ -1233,6 +1234,45 @@ func TestReconcileHostedControlPlaneAnnotations(t *testing.T) {
 				hyperv1.DisableClusterAutoscalerAnnotation: "true",
 			},
 		},
+		{
+			name:                         "When ignition payload cutover is active, it should set DisableIgnitionServerAnnotation",
+			ignitionPayloadCutoverActive: true,
+			hcAnnotations:                map[string]string{},
+			hcpAnnotations:               map[string]string{},
+			expectedAnnotations: map[string]string{
+				k8sutil.HostedClusterAnnotation:                    hcKey,
+				hyperv1.DisableClusterAutoscalerAnnotation:         "true",
+				hyperv1.DisableAWSNodeTerminationHandlerAnnotation: "true",
+				hyperv1.DisableIgnitionServerAnnotation:            "true",
+			},
+		},
+		{
+			name:                         "When ignition payload cutover is active, it should override the mirrored DisableIgnitionServerAnnotation",
+			ignitionPayloadCutoverActive: true,
+			// Operator did not set it on the HostedCluster, so the mirror loop would delete it; the
+			// cutover step must re-add it after the mirror loop.
+			hcAnnotations: map[string]string{},
+			hcpAnnotations: map[string]string{
+				hyperv1.DisableIgnitionServerAnnotation: "true",
+			},
+			expectedAnnotations: map[string]string{
+				k8sutil.HostedClusterAnnotation:                    hcKey,
+				hyperv1.DisableClusterAutoscalerAnnotation:         "true",
+				hyperv1.DisableAWSNodeTerminationHandlerAnnotation: "true",
+				hyperv1.DisableIgnitionServerAnnotation:            "true",
+			},
+		},
+		{
+			name: "When ignition payload cutover is inactive, it should not set DisableIgnitionServerAnnotation",
+			// Cutover inactive and operator did not set it on the HostedCluster -> stays unset.
+			hcAnnotations:  map[string]string{},
+			hcpAnnotations: map[string]string{},
+			expectedAnnotations: map[string]string{
+				k8sutil.HostedClusterAnnotation:                    hcKey,
+				hyperv1.DisableClusterAutoscalerAnnotation:         "true",
+				hyperv1.DisableAWSNodeTerminationHandlerAnnotation: "true",
+			},
+		},
 	}
 
 	for _, tc := range tests {
@@ -1244,7 +1284,7 @@ func TestReconcileHostedControlPlaneAnnotations(t *testing.T) {
 			hcp := &hyperv1.HostedControlPlane{}
 			hcp.Annotations = tc.hcpAnnotations
 			hc.Annotations = tc.hcAnnotations
-			err := reconcileHostedControlPlaneAnnotations(hcp, hc, tc.isAutoscalingNeeded, tc.isAWSNodeTerminationHandlerNeeded, func() (map[string]string, error) { return tc.certRenewalAnnotations, nil })
+			err := reconcileHostedControlPlaneAnnotations(hcp, hc, tc.isAutoscalingNeeded, tc.isAWSNodeTerminationHandlerNeeded, tc.ignitionPayloadCutoverActive, func() (map[string]string, error) { return tc.certRenewalAnnotations, nil })
 			g.Expect(err).ToNot(HaveOccurred())
 			g.Expect(hcp.Annotations).To(Equal(tc.expectedAnnotations))
 		})

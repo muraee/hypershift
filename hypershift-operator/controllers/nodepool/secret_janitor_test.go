@@ -10,6 +10,7 @@ import (
 
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/manifests/ignitionserver"
+	"github.com/openshift/hypershift/hypershift-operator/featuregate"
 	"github.com/openshift/hypershift/support/api"
 	"github.com/openshift/hypershift/support/releaseinfo"
 	fakereleaseprovider "github.com/openshift/hypershift/support/releaseinfo/fake"
@@ -17,6 +18,7 @@ import (
 	"github.com/openshift/hypershift/support/thirdparty/library-go/pkg/image/dockerv1client"
 	"github.com/openshift/hypershift/support/util/fakeimagemetadataprovider"
 
+	configv1 "github.com/openshift/api/config/v1"
 	"github.com/openshift/api/image/docker10"
 
 	corev1 "k8s.io/api/core/v1"
@@ -39,6 +41,39 @@ import (
 	"go.uber.org/zap/zaptest"
 	"go.uber.org/zap/zaptest/observer"
 )
+
+// TestSecretJanitor_SkipsIgnitionPayloadOwned pins that the legacy janitor never touches a
+// userdata/token Secret owned by an IgnitionPayload CR (the re-architected path manages + GCs it),
+// even when its name is not in the janitor's expected (legacy Hash()) set — the gate-ON live userdata
+// Secret is named on the payload rollout hash.
+func TestSecretJanitor_SkipsIgnitionPayloadOwned(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	const hcpNS = "clusters-hc"
+
+	owned := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   hcpNS,
+			Name:        "user-data-np-1-rollouthash", // not the legacy Hash()-based name
+			Annotations: map[string]string{nodePoolAnnotation: "clusters/np-1"},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: hyperv1.GroupVersion.String(),
+				Kind:       "IgnitionPayload",
+				Name:       "np-1",
+				Controller: func() *bool { b := true; return &b }(),
+			}},
+		},
+	}
+	c := fake.NewClientBuilder().WithScheme(api.Scheme).WithObjects(owned).Build()
+	r := &secretJanitor{NodePoolReconciler: &NodePoolReconciler{Client: c}, now: time.Now}
+
+	_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(owned)})
+	g.Expect(err).ToNot(HaveOccurred())
+
+	// The IgnitionPayload-owned Secret must still exist (not deleted/expired by the janitor).
+	got := &corev1.Secret{}
+	g.Expect(c.Get(ctx, client.ObjectKeyFromObject(owned), got)).To(Succeed())
+}
 
 func TestSecretJanitor_Reconcile(t *testing.T) {
 	ctx := ctrl.LoggerInto(t.Context(), zapr.NewLogger(zaptest.NewLogger(t)))
@@ -520,6 +555,39 @@ spec:
 		if !apierrors.IsNotFound(err) {
 			t.Errorf("expected userdata secret to be deleted, got error: %v", err)
 		}
+	})
+
+	// Under the IgnitionPayloadSystem gate (and when the operator has not disabled ignition on the
+	// HostedCluster), the NodePool IgnitionPayload consumer owns the userdata/token Secret lifecycle —
+	// including the pre-cutover window where the live legacy-named Secret has not yet been adopted
+	// (re-owned) by the CR. The legacy janitor must not delete such a stale-named userdata Secret, or a
+	// gate-enablement bump that also changes a legacy Hash() input would delete the in-use Secret and
+	// break scale-up before the new server is Available. A live NodePool + HostedCluster (handled above)
+	// still gate this skip, so NodePool/HostedCluster deletion continues to clean up.
+	t.Run("When the IgnitionPayloadSystem gate is active and ignition is not operator-disabled, it keeps a stale-named userdata secret", func(t *testing.T) {
+		g := NewWithT(t)
+		previous := featuregate.FeatureSet()
+		featuregate.ConfigureFeatureSet(string(configv1.TechPreviewNoUpgrade))
+		t.Cleanup(func() { featuregate.ConfigureFeatureSet(string(previous)) })
+
+		staleUserData := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "user-data-nodepool-name-gatedstale",
+				Namespace: "myns",
+				Annotations: map[string]string{
+					nodePoolAnnotation: client.ObjectKeyFromObject(nodePool).String(),
+				},
+			},
+		}
+		g.Expect(c.Create(ctx, staleUserData)).To(Succeed())
+
+		key := client.ObjectKeyFromObject(staleUserData)
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		g.Expect(err).ToNot(HaveOccurred())
+
+		// The stale-named Secret (not in the legacy Hash() expected set, not IgnitionPayload-owned yet)
+		// must survive because the consumer, not the janitor, owns it under the gate.
+		g.Expect(c.Get(ctx, key, &corev1.Secret{})).To(Succeed())
 	})
 }
 

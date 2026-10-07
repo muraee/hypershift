@@ -37,6 +37,15 @@ func rolloutGlobalConfigMapName(crName string) string {
 	return netutil.ShortenName("rollout-global-config", crName, validation.DNS1123SubdomainMaxLength)
 }
 
+// platformConfigCopyName is the deterministic, per-CR name of a materialized platform-generated
+// MachineConfig in the HCP namespace. Platform configs (e.g. the KubeVirt network-override
+// MachineConfig) are generated in memory rather than read from the cluster, so they have no source
+// name; they are keyed by their generation index, which is stable because getPlatformConfigs produces
+// them deterministically.
+func platformConfigCopyName(crName string, index int) string {
+	return netutil.ShortenName(fmt.Sprintf("platform-config-%d", index), crName, validation.DNS1123SubdomainMaxLength)
+}
+
 // classifyConfigs computes the rollout/mgmt reference lists and the rolloutGlobalConfig
 // ConfigMap name deterministically from the source ConfigMaps, WITHOUT touching the
 // cluster. Because the projected names are stable functions of the CR name and the source
@@ -46,11 +55,13 @@ func rolloutGlobalConfigMapName(crName string) string {
 //
 //   - user configs are copied, so they are classified rollout under their copy name;
 //   - core and NTO configs are referenced in place (by their own name), classified rollout;
+//   - platform-generated configs (e.g. KubeVirt network overrides) are materialized under a
+//     generated name, classified rollout (they change the rendered node config);
 //   - the HAProxy config is classified mgmt, so a management-side bump does not churn the
 //     rollout hash;
 //   - the rolloutGlobalConfig name is returned separately (it is referenced by the
 //     dedicated spec.rolloutGlobalConfig field, not by rolloutConfigMaps).
-func classifyConfigs(crName string, userConfigs, coreConfigs, ntoConfigs []corev1.ConfigMap,
+func classifyConfigs(crName string, userConfigs, coreConfigs, ntoConfigs, platformConfigs []corev1.ConfigMap,
 ) (rolloutRefs, mgmtRefs []hyperv1.ConfigMapReference, rolloutGlobalConfigName string) {
 	for i := range userConfigs {
 		rolloutRefs = append(rolloutRefs, hyperv1.ConfigMapReference{Name: userConfigCopyName(crName, userConfigs[i].GetName())})
@@ -61,6 +72,9 @@ func classifyConfigs(crName string, userConfigs, coreConfigs, ntoConfigs []corev
 	for i := range ntoConfigs {
 		rolloutRefs = append(rolloutRefs, hyperv1.ConfigMapReference{Name: ntoConfigs[i].GetName()})
 	}
+	for i := range platformConfigs {
+		rolloutRefs = append(rolloutRefs, hyperv1.ConfigMapReference{Name: platformConfigCopyName(crName, i)})
+	}
 	mgmtRefs = append(mgmtRefs, hyperv1.ConfigMapReference{Name: haproxyConfigMapName(crName)})
 
 	// Deterministic ordering so the authored spec is stable across reconciles.
@@ -70,18 +84,23 @@ func classifyConfigs(crName string, userConfigs, coreConfigs, ntoConfigs []corev
 }
 
 // materializeConfigs creates or updates the CR-owned projected ConfigMaps in hcpNamespace:
-// copied user configs, the materialized HAProxy config, and the authored
-// rolloutGlobalConfig. Core and NTO configs are referenced in place (already in the HCP
-// namespace, owned elsewhere) and are not materialized here. owner is the IgnitionPayload
+// copied user configs, materialized platform-generated configs, the materialized HAProxy config,
+// and the authored rolloutGlobalConfig. Core and NTO configs are referenced in place (already in the
+// HCP namespace, owned elsewhere) and are not materialized here. owner is the IgnitionPayload
 // CR used as the controller owner of every ConfigMap so they cascade-delete with the CR.
 // Names match classifyConfigs exactly.
 func materializeConfigs(ctx context.Context, c client.Client, hcpNamespace string, owner *hyperv1.IgnitionPayload,
-	userConfigs []corev1.ConfigMap, haproxyRaw string, rolloutGlobalConfig []byte) error {
+	userConfigs, platformConfigs []corev1.ConfigMap, haproxyRaw string, rolloutGlobalConfig []byte) error {
 	crName := owner.GetName()
 
 	for i := range userConfigs {
 		src := &userConfigs[i]
 		if err := upsertOwnedConfigMap(ctx, c, hcpNamespace, userConfigCopyName(crName, src.GetName()), owner, src.Data); err != nil {
+			return err
+		}
+	}
+	for i := range platformConfigs {
+		if err := upsertOwnedConfigMap(ctx, c, hcpNamespace, platformConfigCopyName(crName, i), owner, platformConfigs[i].Data); err != nil {
 			return err
 		}
 	}

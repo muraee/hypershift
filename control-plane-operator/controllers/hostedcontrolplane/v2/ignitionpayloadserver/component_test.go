@@ -33,6 +33,36 @@ func TestOptionsWorkloadIdentity(t *testing.T) {
 	g.Expect(o.NeedsManagementKASAccess()).To(BeTrue())
 }
 
+func TestPredicate(t *testing.T) {
+	testCases := []struct {
+		name     string
+		enabled  bool
+		expected bool
+	}{
+		{name: "gate OFF -> false", enabled: false, expected: false},
+		{name: "gate ON -> true", enabled: true, expected: true},
+		{
+			// The predicate reads only Enabled, never the HCP DisableIgnitionServerAnnotation (which
+			// also carries the HO's cutover signal). Operator-disable is folded into Enabled upstream.
+			name:     "gate ON, HCP DisableIgnitionServerAnnotation set -> still true (predicate ignores it)",
+			enabled:  true,
+			expected: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			hcp := &hyperv1.HostedControlPlane{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-hcp", Namespace: "test-ns", Annotations: map[string]string{hyperv1.DisableIgnitionServerAnnotation: "true"}},
+			}
+			result, err := (&Options{Enabled: tc.enabled}).predicate(component.WorkloadContext{HCP: hcp})
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(result).To(Equal(tc.expected))
+		})
+	}
+}
+
 func ignitionRouteHCP(ns string) *hyperv1.HostedControlPlane {
 	return &hyperv1.HostedControlPlane{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: ns},

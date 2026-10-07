@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	prometheusoperatorv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	"go.uber.org/mock/gomock"
 )
 
@@ -30,6 +31,36 @@ func TestOptionsWorkloadIdentity(t *testing.T) {
 	g.Expect(o.IsRequestServing()).To(BeFalse())
 	g.Expect(o.MultiZoneSpread()).To(BeTrue())
 	g.Expect(o.NeedsManagementKASAccess()).To(BeTrue())
+}
+
+func TestPredicate(t *testing.T) {
+	testCases := []struct {
+		name     string
+		enabled  bool
+		expected bool
+	}{
+		{name: "gate OFF -> false", enabled: false, expected: false},
+		{name: "gate ON -> true", enabled: true, expected: true},
+		{
+			// The predicate reads only Enabled, never the HCP DisableIgnitionServerAnnotation (which
+			// also carries the HO's cutover signal). Operator-disable is folded into Enabled upstream.
+			name:     "gate ON, HCP DisableIgnitionServerAnnotation set -> still true (predicate ignores it)",
+			enabled:  true,
+			expected: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			hcp := &hyperv1.HostedControlPlane{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-hcp", Namespace: "test-ns", Annotations: map[string]string{hyperv1.DisableIgnitionServerAnnotation: "true"}},
+			}
+			result, err := (&Options{Enabled: tc.enabled}).predicate(component.WorkloadContext{HCP: hcp})
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(result).To(Equal(tc.expected))
+		})
+	}
 }
 
 func TestReconcileRendersController(t *testing.T) {
@@ -77,9 +108,19 @@ func TestReconcileRendersController(t *testing.T) {
 	g.Expect(c.Args).To(ContainElement("--platform"))
 	g.Expect(volumeNames(dep)).To(ContainElements("payloads", "shared"))
 	g.Expect(initContainerNames(dep)).To(ContainElement("fetch-feature-gate"))
-	// No serving-cert / ports on the generator.
+	// No serving-cert on the generator (it renders payloads; it does not serve ignition).
 	g.Expect(volumeNames(dep)).ToNot(ContainElement("serving-cert"))
-	g.Expect(c.Ports).To(BeEmpty())
+
+	// Metrics: the generator's controller-runtime manager serves /metrics on :8080; the container
+	// exposes that port and a PodMonitor scrapes it.
+	metricsPort := containerPortByName(c, "metrics")
+	g.Expect(metricsPort).ToNot(BeNil())
+	g.Expect(metricsPort.ContainerPort).To(Equal(int32(8080)))
+
+	pm := &prometheusoperatorv1.PodMonitor{}
+	g.Expect(cpContext.Client.Get(t.Context(), client.ObjectKey{Namespace: ns, Name: ComponentName}, pm)).To(Succeed())
+	g.Expect(pm.Spec.NamespaceSelector.MatchNames).To(ConsistOf(ns))
+	g.Expect(pm.Spec.PodMetricsEndpoints).ToNot(BeEmpty())
 
 	// Role: leader-election lease + ignitionpayloads + secrets.
 	role := &rbacv1.Role{}
@@ -93,6 +134,15 @@ func containerByName(cs []corev1.Container, name string) *corev1.Container {
 	for i := range cs {
 		if cs[i].Name == name {
 			return &cs[i]
+		}
+	}
+	return nil
+}
+
+func containerPortByName(c *corev1.Container, name string) *corev1.ContainerPort {
+	for i := range c.Ports {
+		if c.Ports[i].Name == name {
+			return &c.Ports[i]
 		}
 	}
 	return nil

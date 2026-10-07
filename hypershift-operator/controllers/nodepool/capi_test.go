@@ -7,7 +7,9 @@ import (
 	"testing"
 	"time"
 
-	. "github.com/onsi/gomega"
+	"github.com/go-logr/logr"
+
+	imageapi "github.com/openshift/api/image/v1"
 
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	"github.com/openshift/hypershift/pkg/manifests"
@@ -15,8 +17,6 @@ import (
 	"github.com/openshift/hypershift/support/releaseinfo"
 	"github.com/openshift/hypershift/support/testutil"
 	"github.com/openshift/hypershift/support/upsert"
-
-	imageapi "github.com/openshift/api/image/v1"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -35,7 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
-	"github.com/go-logr/logr"
+	. "github.com/onsi/gomega"
 )
 
 func TestHasStatusCapacity(t *testing.T) {
@@ -4279,4 +4279,132 @@ func TestMHCRemediationAllowedChangedPredicate(t *testing.T) {
 			g.Expect(pred.Update(e)).To(Equal(tt.expected))
 		})
 	}
+}
+
+// TestReconcileMachineSetIgnitionAdoption pins the InPlace adoption behavior (Task 5, RF#2/#3/#4):
+//   - adoption (the consumer returned the live userdata name): no re-point, and the MachineSet
+//     TargetConfigVersion is NOT re-stamped (so HCCO does not reboot nodes);
+//   - a genuine change (the consumer returned a new rollout-hash name): the re-point stamps
+//     TargetConfigVersion = status.current.configHash (not the legacy Token.Hash()), so HCCO finds the
+//     token-{ms}-{configHash} compat Secret.
+func TestReconcileMachineSetIgnitionAdoption(t *testing.T) {
+	t.Parallel()
+	const cpns = "test-namespace-test-cluster"
+	const legacyTarget = "legacy-target"
+	const configHash = "cfg1"
+
+	tests := []struct {
+		name                    string
+		override                string
+		wantDataSecret          string
+		wantTargetConfigVersion string
+	}{
+		{
+			name:                    "adoption keeps the live name and does not re-stamp TargetConfigVersion",
+			override:                "user-data-np-1-X",
+			wantDataSecret:          "user-data-np-1-X",
+			wantTargetConfigVersion: legacyTarget,
+		},
+		{
+			name:                    "genuine change re-points and stamps the payload configHash",
+			override:                "user-data-np-1-roll1",
+			wantDataSecret:          "user-data-np-1-roll1",
+			wantTargetConfigVersion: configHash,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+			ctx := t.Context()
+
+			nodePool := &hyperv1.NodePool{
+				ObjectMeta: metav1.ObjectMeta{Name: "np-1", Namespace: "test-namespace"},
+				Spec: hyperv1.NodePoolSpec{
+					ClusterName: "test-cluster",
+					Management: hyperv1.NodePoolManagement{
+						UpgradeType: hyperv1.UpgradeTypeInPlace,
+						InPlace:     &hyperv1.InPlaceUpgrade{},
+					},
+					Replicas: ptr.To[int32](3),
+					Platform: hyperv1.NodePoolPlatform{Type: hyperv1.AWSPlatform, AWS: &hyperv1.AWSNodePoolPlatform{AMI: "an-ami"}},
+				},
+			}
+			hostedCluster := &hyperv1.HostedCluster{ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "test-namespace"}}
+			template := &capiaws.AWSMachineTemplate{ObjectMeta: metav1.ObjectMeta{Name: "tmpl", Namespace: cpns}}
+			ms := &capiv1.MachineSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "np-1",
+					Namespace: cpns,
+					Annotations: map[string]string{
+						nodePoolAnnotationTargetConfigVersion:  legacyTarget,
+						nodePoolAnnotationCurrentConfigVersion: legacyTarget,
+					},
+				},
+				Spec: capiv1.MachineSetSpec{
+					Template: capiv1.MachineTemplateSpec{
+						Spec: capiv1.MachineSpec{
+							Bootstrap:         capiv1.Bootstrap{DataSecretName: ptr.To("user-data-np-1-X")},
+							InfrastructureRef: capiv1.ContractVersionedObjectReference{Kind: "AWSMachineTemplate", APIGroup: "infrastructure.cluster.x-k8s.io", Name: "tmpl"},
+						},
+					},
+				},
+			}
+
+			c := fake.NewClientBuilder().WithScheme(api.Scheme).WithObjects(nodePool).Build()
+			capi := &CAPI{
+				Token: &Token{
+					ConfigGenerator: &ConfigGenerator{
+						Client:                c,
+						hostedCluster:         hostedCluster,
+						nodePool:              nodePool,
+						controlplaneNamespace: cpns,
+						rolloutConfig: &rolloutConfig{
+							releaseImage: &releaseinfo.ReleaseImage{ImageStream: &imageapi.ImageStream{ObjectMeta: metav1.ObjectMeta{Name: "v"}}},
+						},
+					},
+					CreateOrUpdateProvider:        upsert.New(false),
+					ignitionPayloadConsumerActive: true,
+					userDataSecretNameOverride:    tc.override,
+				},
+				capiClusterName:           "infra",
+				ApplyProvider:             upsert.NewApplyProvider(false),
+				ignitionPayloadConfigHash: configHash,
+			}
+
+			g.Expect(capi.reconcileMachineSet(ctx, ms, template)).To(Succeed())
+			g.Expect(ptr.Deref(ms.Spec.Template.Spec.Bootstrap.DataSecretName, "")).To(Equal(tc.wantDataSecret))
+			g.Expect(ms.Annotations[nodePoolAnnotationTargetConfigVersion]).To(Equal(tc.wantTargetConfigVersion))
+		})
+	}
+}
+
+// TestAdvanceRetiredGenerationOnComplete proves the retirement hook advances the IgnitionPayload CR's
+// retiredGeneration to status.previous.generation when a rollout completes on the gate-ON path, and is
+// a safe no-op on the gate-OFF path (no CR) or when the consumer is inactive.
+func TestAdvanceRetiredGenerationOnComplete(t *testing.T) {
+	g := NewWithT(t)
+	ctx := t.Context()
+	log := logr.Discard()
+
+	cr := &hyperv1.IgnitionPayload{
+		ObjectMeta: metav1.ObjectMeta{Name: "np-1", Namespace: "hcp"},
+		Spec:       hyperv1.IgnitionPayloadSpec{ReleaseImage: "img", PullSecretName: "ps", RetiredGeneration: 2},
+	}
+	c := fake.NewClientBuilder().WithScheme(api.Scheme).WithStatusSubresource(&hyperv1.IgnitionPayload{}).WithObjects(cr).Build()
+	cr.Status.Previous = hyperv1.PayloadReference{Token: "old", ConfigHash: "c0", RolloutHash: "r0", Generation: 5}
+	g.Expect(c.Status().Update(ctx, cr)).To(Succeed())
+
+	// Gate-OFF (no CR) and inactive: no-op, no panic.
+	(&CAPI{Token: &Token{}}).advanceRetiredGenerationOnComplete(ctx, log)
+	(&CAPI{Token: &Token{CreateOrUpdateProvider: upsert.New(false)}, ignitionPayloadCR: cr}).advanceRetiredGenerationOnComplete(ctx, log)
+
+	// Gate-ON: advances retiredGeneration to previous.generation.
+	capi := &CAPI{Token: &Token{ConfigGenerator: &ConfigGenerator{Client: c}, ignitionPayloadConsumerActive: true}, ignitionPayloadCR: cr}
+	capi.advanceRetiredGenerationOnComplete(ctx, log)
+
+	fetched := &hyperv1.IgnitionPayload{}
+	g.Expect(c.Get(ctx, client.ObjectKeyFromObject(cr), fetched)).To(Succeed())
+	g.Expect(fetched.Spec.RetiredGeneration).To(Equal(int64(5)))
 }

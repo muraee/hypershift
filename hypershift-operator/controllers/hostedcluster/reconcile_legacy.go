@@ -8,12 +8,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/blang/semver"
+	"github.com/go-logr/logr"
+
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	"github.com/openshift/hypershift/api/util/configrefs"
 	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/imageprovider"
 	cpomanifests "github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/manifests"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/hostedcluster/internal/platform"
 	hcmetrics "github.com/openshift/hypershift/hypershift-operator/controllers/hostedcluster/metrics"
+	"github.com/openshift/hypershift/hypershift-operator/controllers/ignitionpayloadcutover"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/manifests"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/manifests/controlplaneoperator"
 	controlplanepkioperatormanifests "github.com/openshift/hypershift/hypershift-operator/controllers/manifests/controlplanepkioperator"
@@ -44,9 +48,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-
-	"github.com/blang/semver"
-	"github.com/go-logr/logr"
 )
 
 // reconcileLegacy is the original reconcile implementation preserved for
@@ -334,10 +335,15 @@ func (r *HostedClusterReconciler) reconcileLegacy(ctx context.Context, req ctrl.
 			log.Error(nthErr, "failed to determine if AWS node termination handler is needed during pull secret recovery, defaulting to true")
 			isAWSNodeTerminationHandlerNeeded = true
 		}
+		cutoverActive, cutoverErr := ignitionpayloadcutover.Active(ctx, r.Client, controlPlaneNamespace.Name)
+		if cutoverErr != nil {
+			log.Error(cutoverErr, "failed to determine ignition payload cutover state during pull secret recovery, defaulting to false")
+			cutoverActive = false
+		}
 		_, hcpErr := createOrUpdate(ctx, r.Client, hcp, func() error {
 			// Skip cert annotation resolution during pull secret recovery — it requires
 			// the pull secret to resolve the CPO image, which is unavailable here.
-			return reconcileHostedControlPlane(hcp, hcluster, isAutoscalingNeeded, isAWSNodeTerminationHandlerNeeded,
+			return reconcileHostedControlPlane(hcp, hcluster, isAutoscalingNeeded, isAWSNodeTerminationHandlerNeeded, cutoverActive,
 				func() (map[string]string, error) { return nil, nil })
 		})
 		if hcpErr != nil {
@@ -758,19 +764,28 @@ func (r *HostedClusterReconciler) reconcileLegacy(ctx context.Context, req ctrl.
 			log.Error(fmt.Errorf("ignition server service strategy not specified"), "")
 			return ctrl.Result{}, nil
 		}
+		// Select the ignition (Route, proxy Service, server Service) to read based on whether the
+		// cutover to the re-architected ignition stack is active (gate ON && new ignition-payload-server
+		// Available): active -> the new ignition-payload-* stack, otherwise -> the legacy ignition-server
+		// stack. The same host serves either proxy, so the user-supplied Route.Hostname passthrough below
+		// is unaffected. Gate OFF short-circuits with no extra API call, so this path is unchanged.
+		ignitionPayloadActive, cutoverErr := ignitionpayloadcutover.Active(ctx, r.Client, controlPlaneNamespace.GetName())
+		if cutoverErr != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to determine ignition payload cutover state: %w", cutoverErr)
+		}
+		ignitionRoute, ignitionProxyService, ignitionBackendService := ignitionEndpointResources(ignitionPayloadActive, controlPlaneNamespace.GetName())
 		switch serviceStrategy.Type {
 		case hyperv1.Route:
 			if serviceStrategy.Route != nil && serviceStrategy.Route.Hostname != "" {
 				hcluster.Status.IgnitionEndpoint = serviceStrategy.Route.Hostname
 			} else {
-				ignitionServerRoute := ignitionserver.Route(controlPlaneNamespace.GetName())
-				if err := r.Client.Get(ctx, client.ObjectKeyFromObject(ignitionServerRoute), ignitionServerRoute); err != nil {
+				if err := r.Client.Get(ctx, client.ObjectKeyFromObject(ignitionRoute), ignitionRoute); err != nil {
 					if !apierrors.IsNotFound(err) {
 						return ctrl.Result{}, fmt.Errorf("failed to get ignitionServerRoute: %w", err)
 					}
 				}
-				if ignitionServerRoute.Spec.Host != "" {
-					hcluster.Status.IgnitionEndpoint = ignitionServerRoute.Spec.Host
+				if ignitionRoute.Spec.Host != "" {
+					hcluster.Status.IgnitionEndpoint = ignitionRoute.Spec.Host
 				}
 			}
 		case hyperv1.NodePort:
@@ -780,13 +795,13 @@ func (r *HostedClusterReconciler) reconcileLegacy(ctx context.Context, req ctrl.
 				log.Error(fmt.Errorf("nodeport metadata not specified for ignition service"), "")
 				return ctrl.Result{}, nil
 			}
-			ignitionService := ignitionserver.ProxyService(controlPlaneNamespace.GetName())
+			ignitionService := ignitionProxyService
 			if err = r.Client.Get(ctx, client.ObjectKeyFromObject(ignitionService), ignitionService); err != nil {
 				if !apierrors.IsNotFound(err) {
 					return ctrl.Result{}, fmt.Errorf("failed to get ignition proxy service: %w", err)
 				} else {
-					// ignition-server-proxy service not found, possible IBM platform or older CPO that doesn't create the service
-					ignitionService = ignitionserver.Service(controlPlaneNamespace.GetName())
+					// ignition proxy service not found, possible IBM platform or older CPO that doesn't create the service
+					ignitionService = ignitionBackendService
 					if err = r.Client.Get(ctx, client.ObjectKeyFromObject(ignitionService), ignitionService); err != nil {
 						if !apierrors.IsNotFound(err) {
 							return ctrl.Result{}, fmt.Errorf("failed to get ignition service: %w", err)
@@ -1500,9 +1515,13 @@ func (r *HostedClusterReconciler) reconcileLegacy(ctx context.Context, req ctrl.
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to determine if AWS node termination handler is needed: %w", err)
 	}
+	cutoverActive, err := ignitionpayloadcutover.Active(ctx, r.Client, controlPlaneNamespace.Name)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to determine ignition payload cutover state: %w", err)
+	}
 	hcp = controlplaneoperator.HostedControlPlane(controlPlaneNamespace.Name, hcluster.Name)
 	_, err = createOrUpdate(ctx, r.Client, hcp, func() error {
-		return reconcileHostedControlPlane(hcp, hcluster, isAutoscalingNeeded, isAWSNodeTerminationHandlerNeeded,
+		return reconcileHostedControlPlane(hcp, hcluster, isAutoscalingNeeded, isAWSNodeTerminationHandlerNeeded, cutoverActive,
 			annotationsForCertRenewal(log,
 				hcp,
 				shouldCheckForStaleCerts(hcluster, defaultToControlPlaneV2),

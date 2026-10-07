@@ -10,7 +10,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/blang/semver"
+	"github.com/pkg/errors"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
+	configv1 "github.com/openshift/api/config/v1"
+	agentv1 "github.com/openshift/cluster-api-provider-agent/api/v1beta1"
+
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
+	"github.com/openshift/hypershift/hypershift-operator/controllers/ignitionpayloadcutover"
 	haproxy "github.com/openshift/hypershift/hypershift-operator/controllers/nodepool/apiserver-haproxy"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/nodepool/instancetype"
 	azureinstancetype "github.com/openshift/hypershift/hypershift-operator/controllers/nodepool/instancetype/azure"
@@ -21,6 +30,7 @@ import (
 	npconstants "github.com/openshift/hypershift/pkg/nodepool"
 	"github.com/openshift/hypershift/support/awsapi"
 	"github.com/openshift/hypershift/support/capabilities"
+	payloadstore "github.com/openshift/hypershift/support/ignitionpayload"
 	"github.com/openshift/hypershift/support/imageregistry"
 	"github.com/openshift/hypershift/support/images"
 	"github.com/openshift/hypershift/support/k8sutil"
@@ -31,9 +41,6 @@ import (
 	"github.com/openshift/hypershift/support/tracing"
 	"github.com/openshift/hypershift/support/upsert"
 	supportutil "github.com/openshift/hypershift/support/util"
-
-	configv1 "github.com/openshift/api/config/v1"
-	agentv1 "github.com/openshift/cluster-api-provider-agent/api/v1beta1"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -58,11 +65,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-
-	"github.com/blang/semver"
-	"github.com/pkg/errors"
-	"go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -76,6 +78,12 @@ const (
 	nodePoolAnnotationUpgradeInProgressTrue  = "hypershift.openshift.io/nodePoolUpgradeInProgressTrue"
 	nodePoolAnnotationUpgradeInProgressFalse = "hypershift.openshift.io/nodePoolUpgradeInProgressFalse"
 	nodePoolAnnotationMaxUnavailable         = "hypershift.openshift.io/nodePoolMaxUnavailable"
+	// nodePoolAnnotationIgnitionAdoptedRolloutHash records the IgnitionPayload rollout hash this
+	// NodePool has been adopted onto. On the first gate-ON reconcile of an already-provisioned
+	// NodePool it is absent, so the consumer keeps the existing userdata Secret name (no roll) and
+	// stamps the current rollout hash here. A later reconcile where status.current.rolloutHash differs
+	// from this marker is a genuine config change and rolls normally.
+	nodePoolAnnotationIgnitionAdoptedRolloutHash = "hypershift.openshift.io/ignition-adopted-rollout-hash"
 
 	// ec2InstanceMetadataHTTPTokensAnnotation can be set to change the instance metadata options of the nodepool underlying EC2 instances
 	// possible values are 'required' (i.e. IMDSv2) or 'optional' which is the default.
@@ -152,6 +160,11 @@ func (r *NodePoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.enqueueNodePoolsForCloudConfig), builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
 			return obj.GetName() == "azure-cloud-config" || obj.GetName() == "openstack-cloud-config"
 		}))).
+		// We want to reconcile when the NodePool's IgnitionPayload CR changes (e.g. the PayloadController
+		// publishes status.current), so Machines are re-pointed at the newly generated userdata. This is
+		// a cross-namespace Watch (the CR lives in the HCP namespace), mapped back via the back-reference
+		// annotation, not Owns.
+		Watches(&hyperv1.IgnitionPayload{}, handler.EnqueueRequestsFromMapFunc(r.enqueueNodePoolForIgnitionPayload)).
 		WithOptions(controller.Options{
 			RateLimiter:             workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](1*time.Second, 10*time.Second),
 			MaxConcurrentReconciles: 10,
@@ -461,8 +474,46 @@ func (r *NodePoolReconciler) reconcile(ctx context.Context, hcluster *hyperv1.Ho
 	}
 
 	// 2. - Reconcile towards expected state of the world.
-	if err := token.Reconcile(ctx); err != nil {
-		return ctrl.Result{}, err
+	// Under the IgnitionPayloadSystem gate (and when the operator has not disabled ignition entirely
+	// on the HostedCluster) the NodePool controller drives the re-architected IgnitionPayload consumer
+	// instead of the legacy Token path: it reconciles the per-NodePool IgnitionPayload CR + projected
+	// configs so the PayloadController generates a payload the new server can serve, and — once the
+	// data plane has cut over — publishes node userdata that CAPI re-points Machines at.
+	useNewIgnition := featuregate.Gate().Enabled(featuregate.IgnitionPayloadSystem) && !ignitionpayloadcutover.HasDisableIgnitionServerAnnotation(hcluster)
+	var requeueForIgnitionPayload bool
+	if useNewIgnition {
+		cutoverActive, err := ignitionpayloadcutover.Active(ctx, r.Client, controlPlaneNamespace)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to determine ignition payload cutover state: %w", err)
+		}
+		store := payloadstore.NewSecretBackedStore(r.Client, controlPlaneNamespace)
+		in, err := r.ignitionConsumerInputsFor(ctx, hcluster, nodePool, configGenerator, token, releaseImage, resolvedRHELStream, haproxyRawConfig, controlPlaneNamespace)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to gather ignition payload consumer inputs: %w", err)
+		}
+		// Adoption keys off the live userdata name so an already-provisioned NodePool keeps its exact
+		// name across the gate flip (no roll).
+		existingUserData, err := capi.currentUserDataSecretName(ctx)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to read current userdata Secret name: %w", err)
+		}
+		in.existingUserDataSecretName = existingUserData
+		userDataName, cr, err := reconcileIgnitionPayloadConsumer(ctx, r.Client, store, nodePool, hcluster, cutoverActive, in)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to reconcile ignition payload consumer: %w", err)
+		}
+		// The consumer, not the Token, owns userdata generation on this path. An empty name means no
+		// userdata has been published yet (not cut over, or no payload generated): CAPI must leave the
+		// existing DataSecretName untouched (skipUserDataRepoint) and we requeue until it is ready.
+		token.ignitionPayloadConsumerActive = true
+		token.userDataSecretNameOverride = userDataName
+		capi.ignitionPayloadCR = cr
+		capi.ignitionPayloadConfigHash = cr.Status.Current.ConfigHash
+		requeueForIgnitionPayload = userDataName == ""
+	} else {
+		if err := token.Reconcile(ctx); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	// non automated infrastructure should not have any machine level cluster-api components
@@ -506,6 +557,14 @@ func (r *NodePoolReconciler) reconcile(ctx context.Context, hcluster *hyperv1.Ho
 			log.Error(err, "Failed to set scale-from-zero annotations, will retry")
 			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 		}
+	}
+
+	// Under the IgnitionPayload path, requeue while waiting for the data plane to cut over and the
+	// PayloadController to publish a token, so Machines are re-pointed at the new userdata as soon as
+	// it exists. The IgnitionPayload CR and HostedCluster (endpoint) watches cover this too; the
+	// requeue is a backstop.
+	if requeueForIgnitionPayload {
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
 	return ctrl.Result{}, nil
@@ -650,6 +709,15 @@ func (r *NodePoolReconciler) delete(ctx context.Context, nodePool *hyperv1.NodeP
 	}
 
 	r.KubevirtInfraClients.Delete(string(nodePool.GetUID()))
+
+	// Under the IgnitionPayload gate every NodePool (including non-automated infra) owns an
+	// IgnitionPayload CR; release the consumer finalizer so the CR and its owned ConfigMaps/userdata
+	// Secret can be reclaimed. A no-op when the gate is off or the CR was never created.
+	if featuregate.Gate().Enabled(featuregate.IgnitionPayloadSystem) {
+		if err := finalizeIgnitionPayloadConsumer(ctx, r.Client, controlPlaneNamespace, nodePool.GetName()); err != nil {
+			return fmt.Errorf("failed to finalize ignition payload consumer: %w", err)
+		}
+	}
 
 	return nil
 }

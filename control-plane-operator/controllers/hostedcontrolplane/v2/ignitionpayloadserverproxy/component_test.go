@@ -33,18 +33,23 @@ func TestOptionsWorkloadIdentity(t *testing.T) {
 func TestPredicate(t *testing.T) {
 	testCases := []struct {
 		name        string
+		enabled     bool
 		platform    hyperv1.PlatformType
 		annotations map[string]string
 		expected    bool
 	}{
-		{name: "AWS, ignition enabled -> true", platform: hyperv1.AWSPlatform, expected: true},
-		{name: "Azure, ignition enabled -> true", platform: hyperv1.AzurePlatform, expected: true},
-		{name: "IBMCloud -> false (server exposed directly)", platform: hyperv1.IBMCloudPlatform, expected: false},
+		{name: "gate OFF -> false", enabled: false, platform: hyperv1.AWSPlatform, expected: false},
+		{name: "gate ON, AWS -> true", enabled: true, platform: hyperv1.AWSPlatform, expected: true},
+		{name: "gate ON, Azure -> true", enabled: true, platform: hyperv1.AzurePlatform, expected: true},
+		{name: "gate ON, IBMCloud -> false (server exposed directly)", enabled: true, platform: hyperv1.IBMCloudPlatform, expected: false},
 		{
-			name:        "DisableIgnitionServerAnnotation -> false",
+			// The predicate reads only Enabled (and platform), never the HCP DisableIgnitionServerAnnotation
+			// (which also carries the HO's cutover signal). Operator-disable is folded into Enabled upstream.
+			name:        "gate ON, AWS, HCP DisableIgnitionServerAnnotation set -> still true (predicate ignores it)",
+			enabled:     true,
 			platform:    hyperv1.AWSPlatform,
 			annotations: map[string]string{hyperv1.DisableIgnitionServerAnnotation: "true"},
-			expected:    false,
+			expected:    true,
 		},
 	}
 
@@ -55,7 +60,7 @@ func TestPredicate(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Name: "test-hcp", Namespace: "test-ns", Annotations: tc.annotations},
 				Spec:       hyperv1.HostedControlPlaneSpec{Platform: hyperv1.PlatformSpec{Type: tc.platform}},
 			}
-			result, err := predicate(component.WorkloadContext{HCP: hcp})
+			result, err := (&Options{Enabled: tc.enabled}).predicate(component.WorkloadContext{HCP: hcp})
 			g.Expect(err).ToNot(HaveOccurred())
 			g.Expect(result).To(Equal(tc.expected))
 		})
@@ -114,7 +119,7 @@ func TestReconcileWaitsForServerDependency(t *testing.T) {
 		OmitOwnerReference:     true,
 	}
 
-	g.Expect(NewComponent().Reconcile(cpContext)).To(Succeed())
+	g.Expect(NewComponent(&Options{}).Reconcile(cpContext)).To(Succeed())
 
 	// The workload must NOT be rendered while the dependency is unavailable.
 	dep := &appsv1.Deployment{}
@@ -159,7 +164,7 @@ func TestReconcileRendersProxy(t *testing.T) {
 		OmitOwnerReference:     true,
 	}
 
-	g.Expect(NewComponent().Reconcile(cpContext)).To(Succeed())
+	g.Expect(NewComponent(&Options{}).Reconcile(cpContext)).To(Succeed())
 
 	// Deployment: haproxy container, distinct name, node-facing cert + self-contained CA volumes.
 	dep := &appsv1.Deployment{}

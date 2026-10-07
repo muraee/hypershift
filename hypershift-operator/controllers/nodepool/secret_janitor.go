@@ -7,6 +7,7 @@ import (
 	"time"
 
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
+	"github.com/openshift/hypershift/hypershift-operator/controllers/ignitionpayloadcutover"
 	"github.com/openshift/hypershift/hypershift-operator/featuregate"
 	"github.com/openshift/hypershift/pkg/manifests"
 	karpenterutil "github.com/openshift/hypershift/support/karpenter"
@@ -63,6 +64,15 @@ func (r *secretJanitor) Reconcile(ctx context.Context, req reconcile.Request) (r
 		return ctrl.Result{}, nil
 	}
 
+	// Secrets owned by an IgnitionPayload CR belong to the re-architected ignition path: they are
+	// reconciled by the NodePool IgnitionPayload consumer and garbage-collected with the CR. The
+	// legacy janitor must not expire or delete them — under the IgnitionPayloadSystem gate the live
+	// userdata Secret is named on the payload rollout hash, which is not in this janitor's expected
+	// (legacy Hash()) name set, so without this guard the janitor would delete the in-use Secret.
+	if isOwnedByIgnitionPayload(secret) {
+		return ctrl.Result{}, nil
+	}
+
 	nodePool := &hyperv1.NodePool{}
 	if err := r.Client.Get(ctx, supportutil.ParseNamespacedName(nodePoolName), nodePool); err != nil && !apierrors.IsNotFound(err) {
 		log.Error(err, "error getting nodepool")
@@ -91,6 +101,18 @@ func (r *secretJanitor) Reconcile(ctx context.Context, req reconcile.Request) (r
 	if !hcluster.DeletionTimestamp.IsZero() {
 		log.Info("removing secret as hosted cluster is being deleted")
 		return ctrl.Result{}, r.cleanupSecretForDeletion(ctx, secret)
+	}
+
+	// Under the IgnitionPayloadSystem gate (new ignition path active for this HostedCluster and not
+	// disabled by the operator), the NodePool IgnitionPayload consumer owns the userdata/token Secret
+	// lifecycle — including the pre-cutover window where the live legacy-named Secret has not yet been
+	// adopted (re-owned) by the CR. The legacy janitor must not expire or delete it against the legacy
+	// Hash() name set: a gate-enablement bump that also changes a Hash() input would otherwise delete
+	// the in-use Secret and break scale-up before the new server is Available. NodePool- and
+	// HostedCluster-deletion cleanup is handled above, so those paths still reclaim the Secret.
+	if featuregate.Gate().Enabled(featuregate.IgnitionPayloadSystem) && !ignitionpayloadcutover.HasDisableIgnitionServerAnnotation(hcluster) {
+		log.V(3).Info("Skipping secretJanitor reconciliation; IgnitionPayload consumer owns the userdata lifecycle under the gate")
+		return ctrl.Result{}, nil
 	}
 
 	shouldKeepOldUserData, err := r.shouldKeepOldUserData(ctx, hcluster)
@@ -176,6 +198,18 @@ func (r *secretJanitor) Reconcile(ctx context.Context, req reconcile.Request) (r
 
 	log.WithValues("options", names, "valid", valid).Info("removing secret as it does not match the expected set of names")
 	return ctrl.Result{}, cleanup(ctx, r.Client, secret)
+}
+
+// isOwnedByIgnitionPayload reports whether obj carries a controller/owner reference to an
+// IgnitionPayload CR (the re-architected ignition path's owner). Such objects are managed and
+// garbage-collected by that path, not the legacy secret janitor.
+func isOwnedByIgnitionPayload(obj client.Object) bool {
+	for _, ref := range obj.GetOwnerReferences() {
+		if ref.Kind == "IgnitionPayload" && ref.APIVersion == hyperv1.GroupVersion.String() {
+			return true
+		}
+	}
+	return false
 }
 
 // shouldKeepOldUserData determines if the old user data should be kept.

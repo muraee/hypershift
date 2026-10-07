@@ -35,6 +35,12 @@ var _ component.ComponentOptions = &Options{}
 type Options struct {
 	HyperShiftOperatorImage string
 	DefaultIngressDomain    string
+
+	// Enabled gates the whole component on the HO-side IgnitionPayloadSystem feature gate.
+	// It is computed by the HostedCluster reconciler (which owns the gate) and threaded in here:
+	// this package lives under control-plane-operator and must NOT import
+	// hypershift-operator/featuregate (that would create an import cycle).
+	Enabled bool
 }
 
 // IsRequestServing implements controlplanecomponent.ComponentOptions.
@@ -52,6 +58,7 @@ func (o *Options) NeedsManagementKASAccess() bool { return true }
 func NewComponent(opts *Options) component.ControlPlaneComponent {
 	return component.NewDeploymentComponent(ComponentName, opts).
 		WithAdaptFunction(opts.adaptDeployment).
+		WithPredicate(opts.predicate).
 		WithManifestAdapter(
 			"service.yaml",
 			component.WithAdaptFunction(adaptService),
@@ -80,4 +87,16 @@ func NewComponent(opts *Options) component.ControlPlaneComponent {
 			component.ReconcileExisting(),
 		).
 		Build()
+}
+
+// predicate enables the component solely on Options.Enabled, which the HyperShift Operator computes as
+// "IgnitionPayloadSystem gate on AND the operator did not set DisableIgnitionServerAnnotation on the
+// HostedCluster". When it returns false the CPOv2 framework tears the component down.
+//
+// It deliberately does NOT read DisableIgnitionServerAnnotation from the HCP: that annotation also
+// carries the HO's legacy-standdown cutover signal, which must not disable the new components. Operator
+// intent ("no ignition at all") is already folded into Enabled, so a per-HostedCluster operator-disable
+// tears these down too.
+func (o *Options) predicate(_ component.WorkloadContext) (bool, error) {
+	return o.Enabled, nil
 }
