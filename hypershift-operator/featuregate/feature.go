@@ -54,6 +54,21 @@ const (
 	// alpha: v0.1.49
 	// default: OCP 5.0
 	OSStreams featuregate.Feature = "OSStreams"
+
+	// DeterministicLBIP enables deterministic LoadBalancer IP management for HostedClusters.
+	// When enabled, users can specify loadBalancerClass and serviceAnnotations on
+	// spec.services entries to control the IP assigned to KAS and other LB-type services.
+	// owner: @jparrill
+	// alpha: v0.1.49
+	// beta: x.y.z
+	DeterministicLBIP featuregate.Feature = "DeterministicLBIP"
+	// IgnitionPayloadSystem gates the re-architected ignition system: the HO deploys the
+	// split ignition-payload-controller + ignition-payload-server (+ proxy) from the HO image
+	// and the NodePool controller uses the IgnitionPayload path instead of the legacy
+	// ignition-server. Fleet-wide selector (no per-HostedCluster opt-in).
+	// owner: @muraee
+	// alpha: v0.1.x
+	IgnitionPayloadSystem featuregate.Feature = "IgnitionPayloadSystem"
 )
 
 // Initialize new features here
@@ -67,6 +82,8 @@ var (
 	karpenterOperatorFeature       = featuregates.NewFeature(KarpenterOperator, featuregates.WithEnableForFeatureSets(configv1.TechPreviewNoUpgrade))
 	etcdShardingFeature            = featuregates.NewFeature(EtcdSharding, featuregates.WithEnableForFeatureSets(configv1.TechPreviewNoUpgrade))
 	osStreamsFeature               = featuregates.NewFeature(OSStreams, featuregates.WithEnableForFeatureSets(configv1.TechPreviewNoUpgrade, configv1.Default))
+	deterministicLBIPFeature       = featuregates.NewFeature(DeterministicLBIP, featuregates.WithEnableForFeatureSets(configv1.TechPreviewNoUpgrade))
+	ignitionPayloadSystemFeature   = featuregates.NewFeature(IgnitionPayloadSystem, featuregates.WithEnableForFeatureSets(configv1.TechPreviewNoUpgrade))
 )
 
 func init() {
@@ -78,6 +95,8 @@ func init() {
 	allFeatures.AddFeature(karpenterOperatorFeature)
 	allFeatures.AddFeature(etcdShardingFeature)
 	allFeatures.AddFeature(osStreamsFeature)
+	allFeatures.AddFeature(deterministicLBIPFeature)
+	allFeatures.AddFeature(ignitionPayloadSystemFeature)
 
 	// Default to configuring the Default featureset
 	ConfigureFeatureSet(string(configv1.Default))

@@ -47,6 +47,27 @@ func TestHCPEtcdBackupFeatureGate(t *testing.T) {
 	}
 }
 
+func TestIgnitionPayloadSystemFeatureGate(t *testing.T) {
+	testcases := []struct {
+		name       string
+		featureSet configv1.FeatureSet
+		expected   bool
+	}{
+		{name: "When the feature set is Default, it should disable IgnitionPayloadSystem", featureSet: configv1.Default, expected: false},
+		{name: "When the feature set is TechPreviewNoUpgrade, it should enable IgnitionPayloadSystem", featureSet: configv1.TechPreviewNoUpgrade, expected: true},
+		{name: "When the feature set is DevPreviewNoUpgrade, it should disable IgnitionPayloadSystem", featureSet: configv1.DevPreviewNoUpgrade, expected: false},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			featuregate.ConfigureFeatureSet(string(tc.featureSet))
+			actual := featuregate.Gate().Enabled(featuregate.IgnitionPayloadSystem)
+			assert.Equal(t, tc.expected, actual,
+				"IgnitionPayloadSystem feature gate enabled state should match expected value for feature set %s", tc.featureSet)
+		})
+	}
+}
+
 func TestGCPPlatformFeatureGate(t *testing.T) {
 	testcases := []struct {
 		name                string
@@ -103,6 +124,7 @@ func TestAllHypershiftOperatorFeatureGates(t *testing.T) {
 				"HCPEtcdBackup":           false,
 				"KarpenterOperator":       false,
 				"OSStreams":               true,
+				"DeterministicLBIP":       false,
 			},
 		},
 		{
@@ -115,6 +137,7 @@ func TestAllHypershiftOperatorFeatureGates(t *testing.T) {
 				"HCPEtcdBackup":           true,
 				"KarpenterOperator":       true,
 				"OSStreams":               true,
+				"DeterministicLBIP":       true,
 			},
 		},
 		{
@@ -127,6 +150,7 @@ func TestAllHypershiftOperatorFeatureGates(t *testing.T) {
 				"HCPEtcdBackup":           false,
 				"KarpenterOperator":       false,
 				"OSStreams":               false,
+				"DeterministicLBIP":       false,
 			},
 		},
 	}
@@ -171,6 +195,12 @@ func TestAllHypershiftOperatorFeatureGates(t *testing.T) {
 			assert.Equal(t, tc.expected["OSStreams"], actualOSStreams,
 				"OSStreams should be %v for feature set %s",
 				tc.expected["OSStreams"], tc.featureSet)
+
+			// Test DeterministicLBIP
+			actualDeterministicLBIP := featuregate.Gate().Enabled(featuregate.DeterministicLBIP)
+			assert.Equal(t, tc.expected["DeterministicLBIP"], actualDeterministicLBIP,
+				"DeterministicLBIP should be %v for feature set %s",
+				tc.expected["DeterministicLBIP"], tc.featureSet)
 		})
 	}
 }
@@ -183,4 +213,5 @@ func TestFeatureGateConstants(t *testing.T) {
 	assert.Equal(t, "HCPEtcdBackup", string(featuregate.HCPEtcdBackup))
 	assert.Equal(t, "KarpenterOperator", string(featuregate.KarpenterOperator))
 	assert.Equal(t, "OSStreams", string(featuregate.OSStreams))
+	assert.Equal(t, "DeterministicLBIP", string(featuregate.DeterministicLBIP))
 }

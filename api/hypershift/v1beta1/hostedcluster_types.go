@@ -407,6 +407,18 @@ const (
 	// without triggering an unexpected update of KubeVirt VMs.
 	NodePoolSupportsKubevirtTopologySpreadConstraintsAnnotation = "hypershift.openshift.io/nodepool-supports-kubevirt-topology-spread-constraints"
 
+	// NodePoolSupportsKubevirtArchitectureAnnotation indicates that it is safe to set the VMI
+	// Architecture field and inject the kubernetes.io/arch NodeSelector on KubeVirt VMs in
+	// this NodePool without triggering an unexpected fleet-wide rolling update.
+	//
+	// Because nodePool.Spec.Arch has +kubebuilder:default:=amd64, every existing NodePool
+	// already carries Arch="amd64". Setting Architecture="amd64" on the VMI spec changes the
+	// JSON-serialised KubevirtMachineTemplateSpec, which changes the hash-derived template name
+	// and causes CAPI to replace all VMs — identical in impact to the TopologySpreadConstraints
+	// migration. The annotation is only set for new NodePools or NodePools already undergoing a
+	// version update, so idle existing NodePools are never unexpectedly disrupted.
+	NodePoolSupportsKubevirtArchitectureAnnotation = "hypershift.openshift.io/nodepool-supports-kubevirt-architecture"
+
 	// IsKubeVirtRHCOSVolumeLabelName labels rhcos DataVolumes and PVCs, to be able to filter them, e.g. for backup
 	IsKubeVirtRHCOSVolumeLabelName = "hypershift.openshift.io/is-kubevirt-rhcos"
 
@@ -1103,8 +1115,9 @@ type NodePortPublishingStrategy struct {
 	// +required
 	Address string `json:"address"`
 
-	// port is the port of the NodePort service. If <=0, the port is dynamically
-	// assigned when the service is created.
+	// port is the port of the NodePort service.
+	// If omitted, the port is dynamically assigned when the service is created.
+	// +kubebuilder:validation:Minimum=1
 	// +optional
 	Port int32 `json:"port,omitempty"`
 }
@@ -2170,21 +2183,21 @@ type PersistentVolumeEtcdStorageSpec struct {
 }
 
 // UnmanagedEtcdSpec specifies configuration which enables the control plane to
-// integrate with an eternally managed etcd cluster.
+// integrate with an externally managed etcd cluster.
 // +openshift:validation:FeatureGateAwareXValidation:featureGate=EtcdSharding,rule="has(oldSelf.shards) == has(self.shards)",message="shards cannot be added or removed after creation"
 type UnmanagedEtcdSpec struct {
-	// endpoint is the full etcd cluster client endpoint URL. For example:
+	// endpoint is the full etcd cluster client endpoint HTTPS URL. For example:
 	//
 	//     https://etcd-client:2379
 	//
-	// If the URL uses an HTTPS scheme, the TLS field is required.
+	// The tls field is required to authenticate to and verify the etcd endpoint.
 	//
 	// +kubebuilder:validation:Pattern=`^https://`
 	// +kubebuilder:validation:MaxLength=255
 	// +required
 	Endpoint string `json:"endpoint"`
 
-	// tls specifies TLS configuration for HTTPS etcd client endpoints.
+	// tls specifies the required TLS configuration for the HTTPS etcd client endpoint.
 	// +required
 	TLS EtcdTLSConfig `json:"tls"`
 
@@ -2210,12 +2223,12 @@ type UnmanagedEtcdSpec struct {
 
 // EtcdTLSConfig specifies TLS configuration for HTTPS etcd client endpoints.
 type EtcdTLSConfig struct {
-	// clientSecret refers to a secret for client mTLS authentication with the etcd cluster. It
-	// may have the following key/value pairs:
+	// clientSecret refers to a secret for client mTLS authentication with the etcd cluster.
+	// The secret must contain all three of the following key/value pairs:
 	//
-	//     etcd-client-ca.crt: Certificate Authority value
-	//     etcd-client.crt: Client certificate value
-	//     etcd-client.key: Client certificate key value
+	//     etcd-client-ca.crt: CA bundle used to verify the etcd server certificate
+	//     etcd-client.crt: Client certificate used to authenticate to etcd
+	//     etcd-client.key: Private key for the client certificate
 	// +required
 	ClientSecret corev1.LocalObjectReference `json:"clientSecret"`
 }

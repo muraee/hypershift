@@ -7007,7 +7007,35 @@ oc patch nodepool -n <HOSTED_CLUSTER_NAMESPACE> <NODEPOOL_NAME> --type merge -p 
     `autoScaling` and `replicas` are mutually exclusive. When enabling autoscaling, `replicas` must be set to `null`.
 
 !!! note
-    Scale-from-zero (`min: 0`) is only supported on the AWS platform. All other platforms require `min` >= 1.
+    Scale-from-zero (`min: 0`) is supported on AWS and Azure when native capacity or the corresponding instance-type discovery provider is available. Other platforms require `min` >= 1.
+
+### Labels and Taints When Scaling from Zero
+
+Without a live worker, the autoscaler needs scheduling labels and taints in addition to resource capacity. For AWS and Azure autoscaling NodePools, HyperShift reconciles `spec.nodeLabels` and `spec.taints` into the `capacity.cluster-autoscaler.kubernetes.io/labels` and `capacity.cluster-autoscaler.kubernetes.io/taints` annotations on the MachineDeployment (Replace) or MachineSet (InPlace). Native provider capacity replaces CPU/memory/GPU workaround annotations, not labels or taints; their reconciliation does not require the optional capacity-discovery provider.
+
+**Topology labels are user-configured, not discovered automatically.** If workloads use zone/region affinity, selectors, or volume topology requirements, supply the corresponding labels on the NodePool before relying on scale-from-zero. For example, for an AWS pool in `eu-central-1b`:
+
+```yaml
+spec:
+  nodeLabels:
+    topology.kubernetes.io/region: eu-central-1
+    topology.kubernetes.io/zone: eu-central-1b
+    topology.ebs.csi.aws.com/zone: eu-central-1b
+    topology.k8s.aws/zone-id: euc1-az3
+    failure-domain.beta.kubernetes.io/region: eu-central-1
+    failure-domain.beta.kubernetes.io/zone: eu-central-1b
+```
+
+Use the actual region, zone name, and zone ID for the pool's subnet in the tenant AWS account; these example values are not a universal zone-name/zone-ID mapping. Include the label keys required by your workloads, along with any custom labels. Label propagation does not validate placement against AWS. Incorrect values can misrepresent the pool to the autoscaler's simulation and result in unsuitable scale-up decisions or workloads remaining pending.
+
+Verify the generated annotation before testing scale-up:
+
+```bash
+oc -n <CONTROL_PLANE_NAMESPACE> get machinedeployment <NODEPOOL_NAME> \
+  -o go-template='{{index .metadata.annotations "capacity.cluster-autoscaler.kubernetes.io/labels"}}{{"\n"}}'
+```
+
+For InPlace pools, use `machineset` instead. Configuring only these labels or taints does not change the NodePool rollout hash or replace workers. Validate actual node labels and workload scheduling on a disposable test pool; this configuration is not a guarantee of successful scheduling.
 
 ### Verify Autoscaling is Enabled
 
@@ -26705,6 +26733,7 @@ GCP hosted clusters use a **two-project model** that mirrors the production arch
 - Create GCP Infrastructure — Create network infrastructure (VPC, subnet)
 - Create GCP IAM Resources — Create WIF pool, OIDC provider, and service accounts
 - Create a GCP Hosted Cluster — Deploy your first hosted cluster
+- GCP Workload Identity Webhook — Understand pod mutation for WIF credentials
 - Configure Image Registry — Verify, configure, or troubleshoot the GCS-backed image registry
 - E2E GKE CI Job — CI job for validating GCP platform changes
 
@@ -27016,6 +27045,293 @@ oc get pods -n hypershift
 
 - Create GCP Infrastructure — Create VPC and subnet for hosted clusters
 - Create GCP IAM Resources — Create WIF pool and service accounts
+
+
+---
+
+## Source: docs/content/how-to/gcp/workload-identity-webhook.md
+
+# GCP Workload Identity Webhook
+
+The GCP workload identity webhook mutates hosted cluster pods at admission time so containers can authenticate to Google Cloud through Workload Identity Federation (WIF). It uses annotations on a pod's Kubernetes `ServiceAccount` to decide whether and how to inject GCP credential configuration.
+
+In HyperShift, the webhook runs as a sidecar in the hosted cluster's `kube-apiserver` pod. The hosted cluster `MutatingWebhookConfiguration` points to `https://127.0.0.1:9443/mutate-v1-pod`, so admission calls are handled locally by the webhook sidecar in the same pod as the API server.
+
+## Webhook Configuration
+
+For GCP hosted clusters, HyperShift starts the webhook with these key arguments:
+
+```text
+--annotation-prefix=cloud.google.com
+--gcp-default-region=<hosted-control-plane GCP region>
+--kubeconfig=/var/run/app/kubeconfig/kubeconfig
+--token-audience=openshift
+```
+
+This means:
+
+- WIF annotations use the `cloud.google.com` prefix.
+- The default projected token audience is `openshift`.
+- The default Cloud SDK region is the hosted control plane's GCP region.
+- The webhook talks to the hosted cluster API through a local kubeconfig.
+
+HCCO creates the hosted cluster `MutatingWebhookConfiguration` with one webhook:
+
+```yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: gcp-workload-identity-federation-webhook
+webhooks:
+- name: pod-identity-webhook.gcp.mutate.io
+  admissionReviewVersions:
+  - v1
+  clientConfig:
+    url: https://127.0.0.1:9443/mutate-v1-pod
+    caBundle: <root CA bundle>
+  failurePolicy: Ignore
+  rules:
+  - operations:
+    - CREATE
+    apiGroups:
+    - ""
+    apiVersions:
+    - v1
+    resources:
+    - pods
+  sideEffects: None
+```
+
+The webhook applies to pod `CREATE` admission requests. If the webhook is unavailable, `failurePolicy: Ignore` lets pod creation continue without mutation.
+
+## Admission Flow
+
+For each pod `CREATE` request, the webhook does the following:
+
+1. Decodes the pod admission request.
+2. Allows the pod without mutation if `spec.serviceAccountName` is empty.
+3. Fetches the referenced `ServiceAccount` from the pod namespace.
+4. Allows the pod without mutation if the `ServiceAccount` does not exist.
+5. Reads GCP WIF annotations from the `ServiceAccount`.
+6. Allows the pod without mutation if neither required WIF annotation is present.
+7. Rejects the admission request if only one required annotation is present or if an annotation is invalid.
+8. Mutates the pod and returns a JSON patch when the WIF configuration is valid.
+
+Because the webhook configuration uses `failurePolicy: Ignore`, webhook transport failures are ignored by kube-apiserver. Validation errors returned by the webhook are still webhook responses, so callers should treat invalid annotations as pod admission failures.
+
+## Required ServiceAccount Annotations
+
+To enable mutation, annotate the pod's Kubernetes `ServiceAccount` with both required annotations:
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: app
+  namespace: example
+  annotations:
+    cloud.google.com/workload-identity-provider: projects/<project-number>/locations/<location>/workloadIdentityPools/<pool-id>/providers/<provider-id>
+    cloud.google.com/service-account-email: <gcp-service-account>@<project>.iam.gserviceaccount.com
+```
+
+The `cloud.google.com/workload-identity-provider` value must use this form:
+
+```text
+projects/{ProjectNumber}/locations/{Location}/workloadIdentityPools/{PoolId}/providers/{ProviderId}
+```
+
+If both required annotations are absent, the webhook does nothing. If only one is present, the webhook returns an error.
+
+## Optional ServiceAccount Annotations
+
+The webhook also supports these optional `ServiceAccount` annotations:
+
+```yaml
+metadata:
+  annotations:
+    cloud.google.com/audience: <audience>
+    cloud.google.com/token-expiration: "<seconds>"
+    cloud.google.com/gcloud-run-as-user: "<uid>"
+    cloud.google.com/injection-mode: direct|gcloud
+```
+
+Defaults in HyperShift:
+
+- `cloud.google.com/audience` defaults to `openshift`.
+- `cloud.google.com/token-expiration` defaults to 24 hours.
+- Token expiration has a minimum of 1 hour.
+- `cloud.google.com/injection-mode` defaults to `gcloud`.
+- `cloud.google.com/gcloud-run-as-user` is unset by default.
+
+## Optional Pod Annotations
+
+Pods can override or refine mutation with these annotations:
+
+```yaml
+metadata:
+  annotations:
+    cloud.google.com/token-expiration: "<seconds>"
+    cloud.google.com/skip-containers: "container-a,init-container-b"
+```
+
+The pod-level `cloud.google.com/token-expiration` annotation overrides the `ServiceAccount` token expiration. The `cloud.google.com/skip-containers` annotation prevents the webhook from adding environment variables and volume mounts to the named init containers or containers.
+
+## Common Mutations
+
+For valid WIF configuration, the webhook adds or replaces a projected Kubernetes service account token volume:
+
+```yaml
+volumes:
+- name: gcp-iam-token
+  projected:
+    defaultMode: 0440
+    sources:
+    - serviceAccountToken:
+        audience: openshift
+        expirationSeconds: <resolved-expiration>
+        path: token
+```
+
+The token is mounted at:
+
+```text
+/var/run/secrets/sts.googleapis.com/serviceaccount/token
+```
+
+For every non-skipped init container and container, the webhook adds the token volume mount and injects these environment variables if they are not already present:
+
+```yaml
+env:
+- name: CLOUDSDK_COMPUTE_REGION
+  value: <hosted-control-plane GCP region>
+- name: CLOUDSDK_CORE_PROJECT
+  value: <project parsed from service-account-email>
+```
+
+The `CLOUDSDK_CORE_PROJECT` value is parsed from the GCP service account email. For example, `app@my-project.iam.gserviceaccount.com` yields `my-project`.
+
+## GCloud Injection Mode
+
+`gcloud` mode is the default when `cloud.google.com/injection-mode` is absent or set to `gcloud`.
+
+In this mode, the webhook adds an emptyDir volume for Cloud SDK configuration:
+
+```yaml
+volumes:
+- name: gcloud-config
+  emptyDir: {}
+```
+
+It prepends or replaces an init container named `gcloud-setup`:
+
+```yaml
+initContainers:
+- name: gcloud-setup
+  image: gcr.io/google.com/cloudsdktool/google-cloud-cli:stable
+  command:
+  - sh
+  - -c
+  - |
+    gcloud iam workload-identity-pools create-cred-config \
+      $(GCP_WORKLOAD_IDENTITY_PROVIDER) \
+      --service-account=$(GCP_SERVICE_ACCOUNT) \
+      --output-file=$(CLOUDSDK_CONFIG)/federation.json \
+      --credential-source-file=/var/run/secrets/sts.googleapis.com/serviceaccount/token
+    gcloud auth login --cred-file=$(CLOUDSDK_CONFIG)/federation.json
+```
+
+It injects these fields into workload containers:
+
+```yaml
+env:
+- name: GOOGLE_APPLICATION_CREDENTIALS
+  value: /var/run/secrets/gcloud/config/federation.json
+- name: CLOUDSDK_CONFIG
+  value: /var/run/secrets/gcloud/config
+volumeMounts:
+- name: gcp-iam-token
+  mountPath: /var/run/secrets/sts.googleapis.com/serviceaccount
+  readOnly: true
+- name: gcloud-config
+  mountPath: /var/run/secrets/gcloud/config
+```
+
+Use this mode when the pod should rely on the Cloud SDK init container to generate the external account credentials file before workload containers start.
+
+## Direct Injection Mode
+
+Direct mode is enabled with this `ServiceAccount` annotation:
+
+```yaml
+metadata:
+  annotations:
+    cloud.google.com/injection-mode: direct
+```
+
+In direct mode, the webhook does not inject a `gcloud-setup` init container. Instead, it builds the external account credentials JSON itself and stores it in a pod annotation:
+
+```yaml
+metadata:
+  annotations:
+    cloud.google.com/external-credentials-json: |-
+      {
+        "type": "external_account",
+        "audience": "//iam.googleapis.com/projects/<project-number>/locations/<location>/workloadIdentityPools/<pool-id>/providers/<provider-id>",
+        "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+        "token_url": "https://sts.googleapis.com/v1/token",
+        "service_account_impersonation_url": "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/<gcp-service-account>@<project>.iam.gserviceaccount.com:generateAccessToken",
+        "credential_source": {
+          "file": "/var/run/secrets/sts.googleapis.com/serviceaccount/token",
+          "format": {
+            "type": "text"
+          }
+        }
+      }
+```
+
+It mounts that annotation through a DownwardAPI volume:
+
+```yaml
+volumes:
+- name: external-credential-config
+  downwardAPI:
+    defaultMode: 0440
+    items:
+    - path: federation.json
+      fieldRef:
+        apiVersion: v1
+        fieldPath: metadata.annotations['cloud.google.com/external-credentials-json']
+```
+
+It injects these fields into workload containers:
+
+```yaml
+env:
+- name: GOOGLE_APPLICATION_CREDENTIALS
+  value: /var/run/secrets/workload-identity/federation.json
+volumeMounts:
+- name: gcp-iam-token
+  mountPath: /var/run/secrets/sts.googleapis.com/serviceaccount
+  readOnly: true
+- name: external-credential-config
+  mountPath: /var/run/secrets/workload-identity
+  readOnly: true
+```
+
+Direct mode avoids the Cloud SDK setup init container and is the mode used by HyperShift's GCP WIF webhook e2e test.
+
+## Result
+
+After mutation, an annotated workload gets:
+
+- A projected Kubernetes service account token with the configured audience.
+- A Google external account credentials file.
+- `GOOGLE_APPLICATION_CREDENTIALS` pointing to that credentials file.
+- Optional Cloud SDK region and project environment variables.
+- In `gcloud` mode, an init container that creates and logs in with the credentials file.
+- In `direct` mode, no init container; the credentials JSON is generated by the webhook and mounted through DownwardAPI.
+
+The application can then use standard Google authentication libraries that read `GOOGLE_APPLICATION_CREDENTIALS` to exchange the Kubernetes token through GCP Security Token Service and impersonate the configured Google service account.
 
 
 ---
@@ -28208,6 +28524,36 @@ hcp create cluster kubevirt \
 
 In the example above, the KubeVirt VMs will only be scheduled to nodes that
  contain the labels labelKey1=labelVal1 and labelKey2=labelVal2.
+
+## Creating NodePools for a Specific Architecture
+
+On a multi-architecture KubeVirt infra cluster (one that has both amd64 and
+s390x nodes, for example), you can create additional NodePools that target a
+specific architecture using the `--arch` flag. The default NodePool created
+with the cluster uses the infra cluster's primary architecture; use this
+command to add a NodePool for a secondary architecture.
+
+```shell linenums="1"
+export CLUSTER_NAME=example
+export PULL_SECRET="$HOME/pull-secret"
+export MEM="6Gi"
+export CPU="2"
+export WORKER_COUNT="2"
+
+hcp create nodepool kubevirt \
+  --cluster-name $CLUSTER_NAME \
+  --name $CLUSTER_NAME-s390x \
+  --replicas $WORKER_COUNT \
+  --pull-secret $PULL_SECRET \
+  --memory $MEM \
+  --cores $CPU \
+  --arch s390x
+```
+
+When `--arch` is set, the operator:
+
+- Sets the KubeVirt VM template `spec.architecture` field so the VM is provisioned with the correct architecture.
+- Injects a `kubernetes.io/arch` NodeSelector into the VM template so virt-launcher pods are scheduled only on infra nodes of the matching architecture.
 
 ## Scaling an existing NodePool
 
@@ -32043,6 +32389,18 @@ This document describes how internal control plane certificates are managed in H
 ## Overview
 
 The control-plane-operator (CPO) manages all internal PKI for the hosted control plane. These certificates secure communication between control plane components and are separate from break-glass credentials, which are managed by the control-plane-pki-operator.
+
+## Unmanaged etcd
+
+For unmanaged etcd, the external provider manages etcd certificates and their renewal. The CPO does not generate etcd signers, client, server, peer, or metrics certificates.
+
+The HTTPS endpoint and `spec.etcd.unmanaged.tls.clientSecret` are required, including when `hypershift.openshift.io/disable-pki-reconciliation` is set. The referenced Secret must contain all three keys:
+
+- `etcd-client.crt`: the client certificate used to authenticate to etcd.
+- `etcd-client.key`: the private key for the client certificate.
+- `etcd-client-ca.crt`: the CA bundle used to verify etcd's server certificate.
+
+The CPO copies these credentials into `etcd-client-tls`. The kube-apiserver, OpenShift API server, and OAuth API server use that Secret for both client authentication and CA trust, rather than the `etcd-ca` ConfigMap. Ensure the supplied CA bundle includes any certificates needed during a CA rotation.
 
 ## CA Hierarchy
 
@@ -45505,10 +45863,11 @@ exist in the same network, HostedCluster.Spec.Platform.Azure.VnetID, and must ex
 HostedCluster.Spec.Platform.Azure.SubscriptionID.
 subnetID is immutable once set.
 The subnetID should be in the format <code>/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.Network/virtualNetworks/{vnetName}/subnets/{subnetName}</code>.
-The subscriptionId in the encryptionSetID must be a valid UUID. It should be 5 groups of hyphen separated hexadecimal characters in the form 8-4-4-4-12.
+The subscriptionId in the subnetID must be a valid UUID. It should be 5 groups of hyphen separated hexadecimal characters in the form 8-4-4-4-12.
 The resourceGroupName should be between 1 and 90 characters, consisting only of alphanumeric characters, hyphens, underscores, periods and parenthesis and must not end with a period (.) character.
 The vnetName should be between 2 and 64 characters, consisting only of alphanumeric characters, hyphens, underscores and periods and must not end with either a period (.) or hyphen (-) character.
 The subnetName should be between 1 and 80 characters, consisting only of alphanumeric characters, hyphens and underscores and must start with an alphanumeric character and must not end with a period (.) or hyphen (-) character.</p>
+<p>MaxLength is 85 fixed path characters + 38 for a fully braced UUID + 90 (resource group) + 64 (VNet) + 80 (subnet).</p>
 </td>
 </tr>
 <tr>
@@ -45610,16 +45969,15 @@ string
 </em>
 </td>
 <td>
-<p>subnetID is the subnet ID of an existing subnet where the nodes in the nodepool will be created. This can be a
-different subnet than the one listed in the HostedCluster, HostedCluster.Spec.Platform.Azure.SubnetID, but must
-exist in the same network, HostedCluster.Spec.Platform.Azure.VnetID, and must exist under the same subscription ID,
-HostedCluster.Spec.Platform.Azure.SubscriptionID.
+<p>subnetID is the ID of an existing subnet where the HostedCluster&rsquo;s nodes will be created. It must exist in the same
+network as VnetID and under the same subscription as SubscriptionID.
 subnetID is immutable once set.
 The subnetID should be in the format <code>/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.Network/virtualNetworks/{vnetName}/subnets/{subnetName}</code>.
-The subscriptionId in the encryptionSetID must be a valid UUID. It should be 5 groups of hyphen separated hexadecimal characters in the form 8-4-4-4-12.
+The subscriptionId in the subnetID must be a valid UUID. It should be 5 groups of hyphen separated hexadecimal characters in the form 8-4-4-4-12.
 The resourceGroupName should be between 1 and 90 characters, consisting only of alphanumeric characters, hyphens, underscores, periods and parenthesis and must not end with a period (.) character.
 The vnetName should be between 2 and 64 characters, consisting only of alphanumeric characters, hyphens, underscores and periods and must not end with either a period (.) or hyphen (-) character.
 The subnetName should be between 1 and 80 characters, consisting only of alphanumeric characters, hyphens and underscores and must start with an alphanumeric character and must not end with a period (.) or hyphen (-) character.</p>
+<p>MaxLength is 85 fixed path characters + 38 for a fully braced UUID + 90 (resource group) + 64 (VNet) + 80 (subnet).</p>
 </td>
 </tr>
 <tr>
@@ -46079,7 +46437,7 @@ This subnet must have privateLinkServiceNetworkPolicies disabled.
 If not provided, the controller will auto-create a NAT subnet in the HC&rsquo;s VNet.
 The expected format is:
 /subscriptions/{subscriptionID}/resourceGroups/{resourceGroup}/providers/Microsoft.Network/virtualNetworks/{vnetName}/subnets/{subnetName}
-The maximum length is 355 characters.</p>
+The maximum length is 357 characters: 85 fixed path characters + 38 for a fully braced UUID + 90 (resource group) + 64 (VNet) + 80 (subnet).</p>
 </td>
 </tr>
 <tr>
@@ -46258,6 +46616,7 @@ Azure&rsquo;s API.</p>
 The expected format is:</p>
 <pre><code>/subscriptions/{subscriptionID}/resourceGroups/{resourceGroup}/providers/Microsoft.Network/virtualNetworks/{vnetName}/subnets/{subnetName}
 </code></pre>
+<p>MaxLength is 85 fixed path characters + 38 for a fully braced UUID + 90 (resource group) + 64 (VNet) + 80 (subnet).</p>
 </p>
 ###AzureSubscriptionID { #hypershift.openshift.io/v1beta1.AzureSubscriptionID }
 <p>
@@ -48019,6 +48378,38 @@ and reports missing images if any.</p>
 </td>
 </tr></tbody>
 </table>
+###ConfigMapReference { #hypershift.openshift.io/v1beta1.ConfigMapReference }
+<p>
+(<em>Appears on:</em>
+<a href="#hypershift.openshift.io/v1beta1.IgnitionPayloadSpec">IgnitionPayloadSpec</a>)
+</p>
+<p>
+<p>ConfigMapReference references a ConfigMap by name in the IgnitionPayload&rsquo;s namespace.</p>
+</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>
+<code>name</code></br>
+<em>
+string
+</em>
+</td>
+<td>
+<p>name is the name of a ConfigMap in the same namespace as this resource. It must
+be a valid DNS-1123 subdomain: at most 253 characters, consisting of lowercase
+alphanumeric characters, hyphens, and periods. Each period-separated segment must
+start and end with an alphanumeric character.</p>
+</td>
+</tr>
+</tbody>
+</table>
 ###ConfigurationStatus { #hypershift.openshift.io/v1beta1.ConfigurationStatus }
 <p>
 (<em>Appears on:</em>
@@ -49159,11 +49550,11 @@ Kubernetes core/v1.LocalObjectReference
 </em>
 </td>
 <td>
-<p>clientSecret refers to a secret for client mTLS authentication with the etcd cluster. It
-may have the following key/value pairs:</p>
-<pre><code>etcd-client-ca.crt: Certificate Authority value
-etcd-client.crt: Client certificate value
-etcd-client.key: Client certificate key value
+<p>clientSecret refers to a secret for client mTLS authentication with the etcd cluster.
+The secret must contain all three of the following key/value pairs:</p>
+<pre><code>etcd-client-ca.crt: CA bundle used to verify the etcd server certificate
+etcd-client.crt: Client certificate used to authenticate to etcd
+etcd-client.key: Private key for the client certificate
 </code></pre>
 </td>
 </tr>
@@ -53024,6 +53415,310 @@ github.com/openshift/api/config/v1.IBMCloudProviderType
 </tr>
 </tbody>
 </table>
+###IgnitionPayload { #hypershift.openshift.io/v1beta1.IgnitionPayload }
+<p>
+<p>IgnitionPayload is one consumer&rsquo;s ignition payload request: the consumer&rsquo;s
+inputs in spec, the generator&rsquo;s results in status. One resource exists per
+consumer request (one per NodePool for the NodePool controller; Karpenter
+creates its own on demand). The type is consumer-agnostic — it carries no
+back-reference to a NodePool so non-NodePool consumers can use it.</p>
+</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>
+<code>metadata</code></br>
+<em>
+<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.22/#objectmeta-v1-meta">
+Kubernetes meta/v1.ObjectMeta
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>metadata is the standard object metadata.</p>
+Refer to the Kubernetes API documentation for the fields of the
+<code>metadata</code> field.
+</td>
+</tr>
+<tr>
+<td>
+<code>spec,omitzero</code></br>
+<em>
+<a href="#hypershift.openshift.io/v1beta1.IgnitionPayloadSpec">
+IgnitionPayloadSpec
+</a>
+</em>
+</td>
+<td>
+<p>spec is written by the consumer and describes the desired payload inputs.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>status,omitzero</code></br>
+<em>
+<a href="#hypershift.openshift.io/v1beta1.IgnitionPayloadStatus">
+IgnitionPayloadStatus
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>status is written by the PayloadController and reports generation and
+rollout progress.</p>
+</td>
+</tr>
+</tbody>
+</table>
+###IgnitionPayloadSpec { #hypershift.openshift.io/v1beta1.IgnitionPayloadSpec }
+<p>
+(<em>Appears on:</em>
+<a href="#hypershift.openshift.io/v1beta1.IgnitionPayload">IgnitionPayload</a>)
+</p>
+<p>
+<p>IgnitionPayloadSpec is written entirely by the consumer; the PayloadController
+treats it as read-only input.</p>
+</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>
+<code>releaseImage</code></br>
+<em>
+string
+</em>
+</td>
+<td>
+<p>releaseImage is the pullspec of the OCP release whose machine-config-server
+binaries render the payload. It is resolved to an immutable digest before the
+payload is generated. This field is required.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>pullSecret,omitzero</code></br>
+<em>
+<a href="#hypershift.openshift.io/v1beta1.SecretReference">
+SecretReference
+</a>
+</em>
+</td>
+<td>
+<p>pullSecret references a Secret in the IgnitionPayload&rsquo;s namespace holding the registry pull
+secret used to fetch the release image and embedded in the generated payload.
+This field is required and immutable: change the pull secret in place (via the
+global pull secret mechanism) rather than updating this reference, so it never
+triggers a node rollout.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>additionalTrustBundle,omitzero</code></br>
+<em>
+<a href="#hypershift.openshift.io/v1beta1.ConfigMapReference">
+ConfigMapReference
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>additionalTrustBundle optionally references a ConfigMap in the IgnitionPayload&rsquo;s namespace
+holding additional CA certificates for booting nodes to trust. The CA bundle is
+read from the &ldquo;ca-bundle.crt&rdquo; key, PEM-encoded. When omitted, no additional
+trust bundle is embedded in the payload.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>osStream,omitzero</code></br>
+<em>
+<a href="#hypershift.openshift.io/v1beta1.OSImageStreamReference">
+OSImageStreamReference
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>osStream selects the RHEL OS stream the payload targets. Valid values are
+&ldquo;rhel-9&rdquo; (RHEL 9 boot images) and &ldquo;rhel-10&rdquo; (RHEL 10 boot images). When omitted,
+the stream defaults to the one implied by the release version (RHEL 10 for newer
+releases, RHEL 9 for older ones). rhel-9 is the legacy stream and is expected to
+be retired as supported releases move to RHEL 10; consumers that do not recognize
+the selected stream should treat the payload as unservable rather than guessing.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>rolloutGlobalConfig,omitzero</code></br>
+<em>
+<a href="#hypershift.openshift.io/v1beta1.ConfigMapReference">
+ConfigMapReference
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>rolloutGlobalConfig references an IgnitionPayload-owned ConfigMap in the
+IgnitionPayload&rsquo;s namespace holding the rollout-relevant subset of the hosted
+cluster&rsquo;s global configuration, canonicalized and authored by the consumer. The
+content is an opaque, canonicalized representation that feeds the rollout hash.
+When omitted, no global configuration contributes to the payload.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>rolloutConfigMaps</code></br>
+<em>
+<a href="#hypershift.openshift.io/v1beta1.ConfigMapReference">
+[]ConfigMapReference
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>rolloutConfigMaps lists ConfigMaps in the IgnitionPayload&rsquo;s namespace whose
+contents are rollout-relevant (user, core, and NTO machine configs). Names must be
+unique (enforced as a map keyed by name) and must not also appear in
+managementConfigMaps. A change to any listed ConfigMap feeds the rollout hash and
+can therefore trigger a node rollout. When omitted, no rollout-relevant ConfigMaps
+contribute to the payload. At least 1 and at most 100 entries.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>managementConfigMaps</code></br>
+<em>
+<a href="#hypershift.openshift.io/v1beta1.ConfigMapReference">
+[]ConfigMapReference
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>managementConfigMaps lists ConfigMaps in the IgnitionPayload&rsquo;s namespace whose
+contents are management-side only (e.g. the apiserver-HAProxy config). Names must
+be unique (enforced as a map keyed by name) and must not also appear in
+rolloutConfigMaps. A change to any listed ConfigMap refreshes the generated payload
+bytes WITHOUT advancing rolloutGeneration, so it does not trigger a node rollout.
+When omitted, no management-only ConfigMaps contribute to the payload. At least 1
+and at most 100 entries.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>retiredRolloutGeneration</code></br>
+<em>
+int64
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>retiredRolloutGeneration lets the consumer release storage for payloads it no
+longer needs: set it to the highest rolloutGeneration whose nodes have all been
+replaced, and the payloads for that generation and below are freed (the current
+payload is always kept). It only ever increases; when omitted, no payloads are
+freed. Minimum 1.</p>
+</td>
+</tr>
+</tbody>
+</table>
+###IgnitionPayloadStatus { #hypershift.openshift.io/v1beta1.IgnitionPayloadStatus }
+<p>
+(<em>Appears on:</em>
+<a href="#hypershift.openshift.io/v1beta1.IgnitionPayload">IgnitionPayload</a>)
+</p>
+<p>
+<p>IgnitionPayloadStatus has two writers with disjoint field ownership. The
+PayloadController owns current, previous, and PayloadGenerated; the serving
+tier owns only IgnitionReached (field-scoped patch).</p>
+</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>
+<code>conditions</code></br>
+<em>
+<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.22/#condition-v1-meta">
+[]Kubernetes meta/v1.Condition
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>conditions reports generation and rollout progress. Known condition types are
+&ldquo;PayloadGenerated&rdquo; (owned by the PayloadController; its observedGeneration tracks
+the spec generation last processed, so consumers can tell whether current reflects
+the latest spec) and &ldquo;IgnitionReached&rdquo; (owned by the serving tier; True once a node
+has successfully fetched the current payload, i.e. begun booting from it). At least
+1 and at most 100 entries.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>current,omitzero</code></br>
+<em>
+<a href="#hypershift.openshift.io/v1beta1.PayloadReference">
+PayloadReference
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>current describes the payload for the latest validated, generated config. It is
+absent until the first payload has been generated.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>previous,omitzero</code></br>
+<em>
+<a href="#hypershift.openshift.io/v1beta1.PayloadReference">
+PayloadReference
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>previous describes the immediately prior payload, retained during a rollout so
+in-flight boots on the old token are served until they drain. It is absent when
+there is no prior payload (e.g. the first generation) or once the prior payload
+has fully drained.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>rolloutHashVersion</code></br>
+<em>
+int64
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>rolloutHashVersion identifies the formula version used to compute
+current.rolloutHash. Minimum 1.</p>
+</td>
+</tr>
+</tbody>
+</table>
 ###ImageContentSource { #hypershift.openshift.io/v1beta1.ImageContentSource }
 <p>
 (<em>Appears on:</em>
@@ -56619,8 +57314,8 @@ int32
 </td>
 <td>
 <em>(Optional)</em>
-<p>port is the port of the NodePort service. If &lt;=0, the port is dynamically
-assigned when the service is created.</p>
+<p>port is the port of the NodePort service.
+If omitted, the port is dynamically assigned when the service is created.</p>
 </td>
 </tr>
 </tbody>
@@ -56754,6 +57449,7 @@ the management cluster.</p>
 ###OSImageStreamReference { #hypershift.openshift.io/v1beta1.OSImageStreamReference }
 <p>
 (<em>Appears on:</em>
+<a href="#hypershift.openshift.io/v1beta1.IgnitionPayloadSpec">IgnitionPayloadSpec</a>,
 <a href="#hypershift.openshift.io/v1beta1.NodePoolSpec">NodePoolSpec</a>,
 <a href="#hypershift.openshift.io/v1beta1.NodePoolStatus">NodePoolStatus</a>)
 </p>
@@ -57706,6 +58402,76 @@ The current default log level is Normal.</p>
 </tr><tr><td><p>&#34;S390X&#34;</p></td>
 <td></td>
 </tr></tbody>
+</table>
+###PayloadReference { #hypershift.openshift.io/v1beta1.PayloadReference }
+<p>
+(<em>Appears on:</em>
+<a href="#hypershift.openshift.io/v1beta1.IgnitionPayloadStatus">IgnitionPayloadStatus</a>)
+</p>
+<p>
+<p>PayloadReference identifies one generated payload version and its store key.</p>
+</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>
+<code>configHash</code></br>
+<em>
+string
+</em>
+</td>
+<td>
+<p>configHash is the payload-identity hash over the whole validated config. It is an
+opaque, fixed-form hash string: consumers compare it for equality and must not
+parse it. Required, at most 64 characters.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>rolloutHash</code></br>
+<em>
+string
+</em>
+</td>
+<td>
+<p>rolloutHash is the hash over the rollout-relevant inputs. It is an opaque,
+fixed-form hash string: consumers compare it for equality and must not parse it.
+Required, at most 64 characters.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>token</code></br>
+<em>
+string
+</em>
+</td>
+<td>
+<p>token is the credential a booting node presents to fetch its generated payload.
+Because the payload embeds registry and bootstrap credentials, treat token as a
+bearer secret. It is an opaque, non-derivable, canonical lowercase UUID.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>rolloutGeneration</code></br>
+<em>
+int64
+</em>
+</td>
+<td>
+<p>rolloutGeneration is a monotonically increasing counter the consumer watches to
+execute a rollout. It advances only when rolloutHash changes (so a management-only
+payload refresh does not advance it). Minimum 1.</p>
+</td>
+</tr>
+</tbody>
 </table>
 ###PersistentVolumeAccessMode { #hypershift.openshift.io/v1beta1.PersistentVolumeAccessMode }
 <p>
@@ -59598,7 +60364,8 @@ history[0] is not Completed or Interrupted.</p>
 (<em>Appears on:</em>
 <a href="#hypershift.openshift.io/v1beta1.AESCBCKeyStatus">AESCBCKeyStatus</a>,
 <a href="#hypershift.openshift.io/v1beta1.HCPEtcdBackupAzureBlob">HCPEtcdBackupAzureBlob</a>,
-<a href="#hypershift.openshift.io/v1beta1.HCPEtcdBackupS3">HCPEtcdBackupS3</a>)
+<a href="#hypershift.openshift.io/v1beta1.HCPEtcdBackupS3">HCPEtcdBackupS3</a>,
+<a href="#hypershift.openshift.io/v1beta1.IgnitionPayloadSpec">IgnitionPayloadSpec</a>)
 </p>
 <p>
 <p>SecretReference contains a reference to a Secret by name.
@@ -60183,7 +60950,7 @@ connections; &ndash;etcd-servers-overrides only overrides server URLs.</p>
 </p>
 <p>
 <p>UnmanagedEtcdSpec specifies configuration which enables the control plane to
-integrate with an eternally managed etcd cluster.</p>
+integrate with an externally managed etcd cluster.</p>
 </p>
 <table>
 <thead>
@@ -60201,10 +60968,10 @@ string
 </em>
 </td>
 <td>
-<p>endpoint is the full etcd cluster client endpoint URL. For example:</p>
+<p>endpoint is the full etcd cluster client endpoint HTTPS URL. For example:</p>
 <pre><code>https://etcd-client:2379
 </code></pre>
-<p>If the URL uses an HTTPS scheme, the TLS field is required.</p>
+<p>The tls field is required to authenticate to and verify the etcd endpoint.</p>
 </td>
 </tr>
 <tr>
@@ -60217,7 +60984,7 @@ EtcdTLSConfig
 </em>
 </td>
 <td>
-<p>tls specifies TLS configuration for HTTPS etcd client endpoints.</p>
+<p>tls specifies the required TLS configuration for the HTTPS etcd client endpoint.</p>
 </td>
 </tr>
 <tr>

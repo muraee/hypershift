@@ -13,7 +13,6 @@ import (
 	"github.com/openshift/hypershift/support/config"
 	component "github.com/openshift/hypershift/support/controlplane-component"
 	"github.com/openshift/hypershift/support/netutil"
-	"github.com/openshift/hypershift/support/podspec"
 
 	corev1 "k8s.io/api/core/v1"
 	clientcmd "k8s.io/client-go/tools/clientcmd"
@@ -24,7 +23,7 @@ import (
 )
 
 const (
-	KubeconfigKey = podspec.KubeconfigKey
+	KubeconfigKey = config.KubeconfigKey
 )
 
 func adaptServiceKubeconfigSecret(cpContext component.WorkloadContext, secret *corev1.Secret) error {
@@ -225,6 +224,29 @@ func adaptAzureWorkloadIdentityWebhookKubeconfigSecret(cpContext component.Workl
 		apiServerPort := netutil.KASPodPort(cpContext.HCP)
 		localhostURL := fmt.Sprintf("https://localhost:%d", apiServerPort)
 		return pki.ReconcileServiceAccountKubeconfigWithURL(secret, csrSigner, rootCACM, "openshift-authentication", "azure-workload-identity-webhook", localhostURL)
+	}
+	return nil
+}
+
+func adaptGCPWorkloadIdentityFederationWebhookKubeconfigSecret(cpContext component.WorkloadContext, secret *corev1.Secret) error {
+	csrSigner := manifests.CSRSignerCASecret(cpContext.HCP.Namespace)
+	if err := cpContext.Client.Get(cpContext, client.ObjectKeyFromObject(csrSigner), csrSigner); err != nil {
+		return fmt.Errorf("failed to get cluster-signer-ca secret: %w", err)
+	}
+	rootCA := manifests.RootCASecret(cpContext.HCP.Namespace)
+	if err := cpContext.Client.Get(cpContext, client.ObjectKeyFromObject(rootCA), rootCA); err != nil {
+		return fmt.Errorf("failed to get root ca cert secret: %w", err)
+	}
+	rootCACM := &corev1.ConfigMap{
+		Data: map[string]string{
+			certs.CASignerCertMapKey: string(rootCA.Data[certs.CASignerCertMapKey]),
+		},
+	}
+
+	if !cpContext.SkipCertificateSigning {
+		apiServerPort := netutil.KASPodPort(cpContext.HCP)
+		localhostURL := fmt.Sprintf("https://localhost:%d", apiServerPort)
+		return pki.ReconcileServiceAccountKubeconfigWithURL(secret, csrSigner, rootCACM, "openshift-authentication", "gcp-workload-identity-federation-webhook", localhostURL)
 	}
 	return nil
 }
