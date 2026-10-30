@@ -143,8 +143,10 @@ var (
 type DumpOptions struct {
 	Namespace   string
 	Name        string
+	Kubeconfig  string
 	ArtifactDir string
 	ArchiveDump bool
+	Azure       *AzureDumpOptions
 	// LogCheckers is a list of functions that will
 	// get run over all raw logs if set.
 	LogCheckers []LogChecker
@@ -158,14 +160,55 @@ type DumpOptions struct {
 	ImpersonateAs string
 
 	Log logr.Logger
+
+	Client         client.Client
+	ClientProvider *util.ClientProvider
+
+	// DumpClusterWithRetry reuses these options. Retry diagnostics setup failures,
+	// but do not repeat collection after it has been attempted.
+	azureDiagnosticsAttempted bool
+}
+
+func (opts *DumpOptions) managementClient() (client.Client, error) {
+	if opts.ImpersonateAs == "" && opts.Client != nil {
+		return opts.Client, nil
+	}
+	if opts.ClientProvider == nil {
+		return nil, fmt.Errorf("management-cluster client provider is not configured")
+	}
+	var (
+		c   client.Client
+		err error
+	)
+	if opts.ImpersonateAs != "" {
+		c, err = opts.ClientProvider.ImpersonatedClientFor(opts.Kubeconfig, opts.ImpersonateAs)
+	} else {
+		c, err = opts.ClientProvider.ControllerRuntimeClientFor(opts.Kubeconfig)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if c == nil {
+		return nil, fmt.Errorf("management-cluster client provider returned a nil client")
+	}
+	opts.Client = c
+	return c, nil
+}
+
+func (opts *DumpOptions) managementConfig() (*restclient.Config, error) {
+	if opts == nil || opts.ClientProvider == nil {
+		return nil, fmt.Errorf("REST config provider is not configured")
+	}
+	return opts.ClientProvider.ConfigFor(opts.Kubeconfig)
 }
 
 type DumpCallback func(ctx context.Context, opts *DumpOptions) error
 
-func NewDumpCommand(dumpCallback DumpCallback) *cobra.Command {
+func NewDumpCommand(dumpCallback DumpCallback, clientProviders ...*util.ClientProvider) *cobra.Command {
 	const defaultDumpGuestClusterPolicy = "default-policy" // Not a real policy, placeholder to allow --dump-guest-cluster to be specified without a value
 	var dumpGuestClusterFlag string
 	var dumpGuestClusterThroughKubeService bool
+	var azureCredentialsFile string
 
 	cmd := &cobra.Command{
 		Use:          "cluster",
@@ -182,12 +225,14 @@ func NewDumpCommand(dumpCallback DumpCallback) *cobra.Command {
 		DumpGuestClusterPolicies: map[DumpGuestClusterPolicy]struct{}{},
 		Log:                      log.Log,
 	}
+	opts.ClientProvider = util.ResolveClientProvider(clientProviders...)
 
 	cmd.Flags().StringVar(&opts.Namespace, "namespace", opts.Namespace, "The namespace of the hostedcluster to dump")
 	cmd.Flags().StringVar(&opts.Name, "name", opts.Name, "The name of the hostedcluster to dump")
 	cmd.Flags().StringVar(&opts.ImpersonateAs, "as", opts.ImpersonateAs, "The user or service account to impersonate to and used to execute the cluster dump command")
 	cmd.Flags().StringVar(&opts.ArtifactDir, "artifact-dir", opts.ArtifactDir, "Destination directory for dump files")
 	cmd.Flags().BoolVar(&opts.ArchiveDump, "archive-dump", opts.ArchiveDump, "Create a tar archive of the artifact directory")
+	cmd.Flags().StringVar(&azureCredentialsFile, "azure-creds", "", "Azure credentials file for worker machine diagnostics")
 	cmd.Flags().StringVar(&opts.AgentNamespace, "agent-namespace", opts.AgentNamespace, "For agent platform, the namespace where the agents are located")
 	cmd.Flags().StringVar(&dumpGuestClusterFlag, "dump-guest-cluster", "", "Dump data plane content as well. "+
 		"Optionally takes an argument, a comma separated list of policies, here are the possible values: "+
@@ -203,6 +248,9 @@ func NewDumpCommand(dumpCallback DumpCallback) *cobra.Command {
 	_ = cmd.Flags().MarkDeprecated("dump-guest-cluster-through-kube-service", "use --dump-guest-cluster=direct-kube-api-service-access instead")
 
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		if cmd.Flags().Changed("azure-creds") {
+			opts.Azure = &AzureDumpOptions{CredentialsFile: azureCredentialsFile}
+		}
 		isDumpingGuestCluster, err := strconv.ParseBool(dumpGuestClusterFlag)
 		if err == nil {
 			// Backward compatibility: when --dump-guest-cluster used to be a boolean flag
@@ -259,14 +307,7 @@ func DumpClusterWithRetry(ctx context.Context, opts *DumpOptions) error {
 
 func dumpGuestCluster(ctx context.Context, opts *DumpOptions) error {
 	start := time.Now()
-	var c client.Client
-	var err error
-
-	if len(opts.ImpersonateAs) > 0 {
-		c, err = util.GetImpersonatedClient(opts.ImpersonateAs)
-	} else {
-		c, err = util.GetClient()
-	}
+	c, err := opts.managementClient()
 
 	if err != nil {
 		return err
@@ -289,7 +330,7 @@ func dumpGuestCluster(ctx context.Context, opts *DumpOptions) error {
 			return fmt.Errorf("failed to get running kube-apiserver pod for guest cluster: %w", err)
 		}
 
-		restConfig, err := util.GetConfig()
+		restConfig, err := opts.managementConfig()
 		if err != nil {
 			return fmt.Errorf("failed to get a config for management cluster: %w", err)
 		}
@@ -401,14 +442,21 @@ func createGuestKubeconfig(ctx context.Context, c client.Client, cpNamespace str
 }
 
 func DumpCluster(ctx context.Context, opts *DumpOptions) error {
-	var c client.Client
-	var err error
+	if opts.Azure != nil {
+		if err := opts.dumpAzureMachineDiagnostics(ctx, collectAzureMachineDiagnostics); err != nil {
+			opts.Log.Error(err, "Failed to dump Azure machine diagnostics")
+		}
+	}
 
 	ocCommand, err := exec.LookPath("oc")
 	if err != nil || len(ocCommand) == 0 {
 		return fmt.Errorf("cannot find oc command")
 	}
-	cfg, err := util.GetConfig()
+	c, err := opts.managementClient()
+	if err != nil {
+		return err
+	}
+	cfg, err := opts.managementConfig()
 	if err != nil {
 		return err
 	}
@@ -416,16 +464,6 @@ func DumpCluster(ctx context.Context, opts *DumpOptions) error {
 	if len(opts.ImpersonateAs) > 0 {
 		cfg.Impersonate = restclient.ImpersonationConfig{
 			UserName: opts.ImpersonateAs,
-		}
-
-		c, err = util.GetImpersonatedClient(opts.ImpersonateAs)
-		if err != nil {
-			return err
-		}
-	} else {
-		c, err = util.GetClient()
-		if err != nil {
-			return err
 		}
 	}
 	allNodePools := &hyperv1.NodePoolList{}

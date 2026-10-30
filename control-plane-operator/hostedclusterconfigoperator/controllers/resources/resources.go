@@ -25,7 +25,7 @@ import (
 	azureresources "github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/azure"
 	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/cco"
 	ccm "github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/cloudcontrollermanager/azure"
-	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/crd"
+	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/configuration"
 	gcpresources "github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/gcp"
 	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/ingress"
 	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/kas"
@@ -33,7 +33,6 @@ import (
 	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/kubeadminpassword"
 	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/manifests"
 	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/monitoring"
-	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/namespaces"
 	networkoperator "github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/network"
 	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/oapi"
 	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/oauth"
@@ -83,6 +82,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/util/workqueue"
 	apiregistrationv1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
 	"k8s.io/utils/ptr"
 	"k8s.io/utils/set"
@@ -214,29 +214,31 @@ func Setup(ctx context.Context, opts *operator.HostedClusterConfigOperatorConfig
 		return fmt.Errorf("failed to initialize kubeClient from config: %w", err)
 	}
 
-	c, err := controller.New(ControllerName, opts.Manager, controller.Options{Reconciler: &reconciler{
-		client:                    opts.Manager.GetClient(),
-		uncachedClient:            uncachedClient,
-		clientSet:                 clientset,
-		CreateOrUpdateProvider:    opts.TargetCreateOrUpdateProvider,
-		platformType:              opts.PlatformType,
-		rootCA:                    opts.InitialCA,
-		clusterSignerCA:           opts.ClusterSignerCA,
-		cpClient:                  opts.CPCluster.GetClient(),
-		kubevirtInfraClient:       kubevirtInfraClient,
-		hcpName:                   opts.HCPName,
-		hcpNamespace:              opts.Namespace,
-		releaseProvider:           opts.ReleaseProvider,
-		konnectivityServerAddress: opts.KonnectivityAddress,
-		konnectivityServerPort:    opts.KonnectivityPort,
-		oauthAddress:              opts.OAuthAddress,
-		oauthPort:                 opts.OAuthPort,
-		versions:                  opts.Versions,
-		operateOnReleaseImage:     opts.OperateOnReleaseImage,
-		ImageMetaDataProvider:     opts.ImageMetaDataProvider,
-		cleanupTracker:            reconcilerpolicy.NewCleanupTracker(),
-		GetPodLogs:                getPodLogs,
-	}})
+	c, err := controller.New(ControllerName, opts.Manager, controller.Options{
+		RateLimiter: workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](100*time.Millisecond, 2*time.Minute),
+		Reconciler: &reconciler{
+			client:                    opts.Manager.GetClient(),
+			uncachedClient:            uncachedClient,
+			clientSet:                 clientset,
+			CreateOrUpdateProvider:    opts.TargetCreateOrUpdateProvider,
+			platformType:              opts.PlatformType,
+			rootCA:                    opts.InitialCA,
+			clusterSignerCA:           opts.ClusterSignerCA,
+			cpClient:                  opts.CPCluster.GetClient(),
+			kubevirtInfraClient:       kubevirtInfraClient,
+			hcpName:                   opts.HCPName,
+			hcpNamespace:              opts.Namespace,
+			releaseProvider:           opts.ReleaseProvider,
+			konnectivityServerAddress: opts.KonnectivityAddress,
+			konnectivityServerPort:    opts.KonnectivityPort,
+			oauthAddress:              opts.OAuthAddress,
+			oauthPort:                 opts.OAuthPort,
+			versions:                  opts.Versions,
+			operateOnReleaseImage:     opts.OperateOnReleaseImage,
+			ImageMetaDataProvider:     opts.ImageMetaDataProvider,
+			cleanupTracker:            reconcilerpolicy.NewCleanupTracker(),
+			GetPodLogs:                getPodLogs,
+		}})
 	if err != nil {
 		return fmt.Errorf("failed to construct controller: %w", err)
 	}
@@ -277,6 +279,7 @@ func Setup(ctx context.Context, opts *operator.HostedClusterConfigOperatorConfig
 		&configv1.ClusterVersion{},
 		&apiregistrationv1.APIService{},
 		&operatorv1.Network{},
+		&operatorv1.OpenShiftAPIServer{},
 		&admissionregistrationv1.MutatingWebhookConfiguration{},
 		&admissionregistrationv1.ValidatingWebhookConfiguration{},
 		&prometheusoperatorv1.PrometheusRule{},
@@ -394,9 +397,13 @@ func (r *reconciler) Reconcile(ctx context.Context, _ ctrl.Request) (result ctrl
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to get lookup release image %s: %w", hcp.Spec.ReleaseImage, err)
 	}
+	params := configuration.ReconcileParams{
+		ClusterID: hcp.Spec.ClusterID, UpdateService: hcp.Spec.UpdateService,
+		Channel: hcp.Spec.Channel, Capabilities: hcp.Spec.Capabilities, Versions: r.versions,
+	}
 	var errs []error
 	log.Info("reconciling guest cluster crds")
-	if err := r.reconcileCRDs(ctx); err != nil {
+	if err := configuration.Reconcile(ctx, r.client, r.CreateOrUpdate, params, configuration.CRDs); err != nil {
 		errs = append(errs, fmt.Errorf("failed to reconcile crds: %w", err))
 	}
 
@@ -413,6 +420,18 @@ func (r *reconciler) Reconcile(ctx context.Context, _ ctrl.Request) (result ctrl
 	releaseImageVersion, err := semver.Parse(releaseImage.Version())
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to parse release image version: %w", err)
+	}
+
+	controlPlaneReleaseVersion := releaseImageVersion
+	if hcp.Spec.ControlPlaneReleaseImage != nil {
+		controlPlaneReleaseImage, err := r.releaseProvider.Lookup(ctx, *hcp.Spec.ControlPlaneReleaseImage, pullSecret.Data[corev1.DockerConfigJsonKey])
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to lookup control plane release image %s: %w", *hcp.Spec.ControlPlaneReleaseImage, err)
+		}
+		controlPlaneReleaseVersion, err = semver.Parse(controlPlaneReleaseImage.Version())
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to parse control plane release image version: %w", err)
+		}
 	}
 
 	// The exception for IBMCloudPlatform is due to the fact that the IBM will include new certificates for HCCO from 4.17 version
@@ -435,12 +454,14 @@ func (r *reconciler) Reconcile(ctx context.Context, _ ctrl.Request) (result ctrl
 	}
 
 	log.Info("reconciling clusterversion")
-	if err := r.reconcileClusterVersion(ctx, hcp); err != nil {
+	params.FeatureSet = hcp.Spec.Configuration.GetFeatureGateSelection().FeatureSet
+	params.ControlPlaneReleaseVersion = controlPlaneReleaseVersion
+	if err := configuration.Reconcile(ctx, r.client, r.CreateOrUpdate, params, configuration.ClusterVersion); err != nil {
 		errs = append(errs, fmt.Errorf("failed to reconcile clusterversion: %w", err))
 	}
 
 	log.Info("reconciling clusterOperators")
-	if err := r.reconcileClusterOperators(ctx); err != nil {
+	if err := configuration.Reconcile(ctx, r.client, r.CreateOrUpdate, params, configuration.ClusterOperators); err != nil {
 		errs = append(errs, fmt.Errorf("failed to reconcile clusterOperators: %w", err))
 	}
 
@@ -450,7 +471,7 @@ func (r *reconciler) Reconcile(ctx context.Context, _ ctrl.Request) (result ctrl
 	}
 
 	log.Info("reconciling guest cluster namespaces")
-	if err := r.reconcileNamespaces(ctx, hcp); err != nil {
+	if err := configuration.Reconcile(ctx, r.client, r.CreateOrUpdate, params, configuration.Namespaces); err != nil {
 		errs = append(errs, fmt.Errorf("failed to reconcile namespaces: %w", err))
 	}
 
@@ -471,13 +492,21 @@ func (r *reconciler) Reconcile(ctx context.Context, _ ctrl.Request) (result ctrl
 	errs = append(errs, r.reconcileStorageAndMisc(ctx, log, hcp, releaseImage)...)
 	r.cleanupLegacyResources(ctx, log, hcp, releaseImage, &errs)
 
+	log.Info("reconciling OpenShiftAPIServer encryption condition")
+	if err := oapi.ReconcileEncryptionCondition(ctx, r.client, hcp); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile OpenShiftAPIServer encryption condition: %w", err))
+	}
+
 	errs = append(errs, r.reconcilePlatformSpecificResources(ctx, log, hcp, releaseImage)...)
 
 	if result, err := r.reconcileClusterRecovery(ctx, log, hcp, errs); err != nil || result.RequeueAfter > 0 {
 		return result, utilerrors.NewAggregate(append(errs, err))
 	}
 
-	return ctrl.Result{}, utilerrors.NewAggregate(errs)
+	if aggregatedErr := utilerrors.NewAggregate(errs); aggregatedErr != nil {
+		return ctrl.Result{}, aggregatedErr
+	}
+	return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
 }
 
 func (r *reconciler) reconcileStorageAndMisc(ctx context.Context, log logr.Logger, hcp *hyperv1.HostedControlPlane, releaseImage *releaseinfo.ReleaseImage) []error {
@@ -567,6 +596,10 @@ func (r *reconciler) reconcilePlatformSpecificResources(ctx context.Context, log
 		log.Info("reconciling Azure specific resources")
 		errs = append(errs, r.reconcileAzureCloudNodeManager(ctx, releaseImage.ComponentImages()["azure-cloud-node-manager"])...)
 		errs = append(errs, r.reconcileAzureIdentityWebhook(ctx)...)
+	case hyperv1.GCPPlatform:
+		log.Info("reconciling GCP specific resources")
+		errs = append(errs, r.reconcileGCPIdentityWebhook(ctx)...)
+		errs = append(errs, r.reconcileGCPLoadBalancerServiceAnnotations(ctx, hcp)...)
 	}
 	return errs
 }
@@ -1064,9 +1097,9 @@ func (r *reconciler) reconcileMetricsForwarder(ctx context.Context, hcp *hyperv1
 	}
 	sort.Strings(componentNames)
 
-	haproxyImage, ok := releaseImage.ComponentImages()["haproxy-router"]
+	haproxyImage, ok := releaseImage.ComponentImages()["haproxy-router-haproxy32"]
 	if !ok {
-		return fmt.Errorf("haproxy-router image not found in release payload")
+		return fmt.Errorf("haproxy-router-haproxy32 image not found in release payload")
 	}
 
 	if _, err := r.CreateOrUpdate(ctx, r.client, cm, func() error {
@@ -1096,19 +1129,6 @@ func (r *reconciler) reconcileMetricsForwarder(ctx context.Context, hcp *hyperv1
 	}
 
 	return nil
-}
-
-func (r *reconciler) reconcileCRDs(ctx context.Context) error {
-	var errs []error
-
-	requestCount := manifests.RequestCountCRD()
-	if _, err := r.CreateOrUpdate(ctx, r.client, requestCount, func() error {
-		return crd.ReconcileRequestCountCRD(requestCount)
-	}); err != nil {
-		errs = append(errs, fmt.Errorf("failed to reconcile request count crd: %w", err))
-	}
-
-	return utilerrors.NewAggregate(errs)
 }
 
 func (r *reconciler) reconcileConfig(ctx context.Context, hcp *hyperv1.HostedControlPlane) error {
@@ -1275,43 +1295,6 @@ func (r *reconciler) reconcileProxyTrustedCAConfigMap(ctx context.Context, hcp *
 	}
 
 	return nil
-}
-
-func (r *reconciler) reconcileNamespaces(ctx context.Context, hcp *hyperv1.HostedControlPlane) error {
-	namespaceManifests := []struct {
-		manifest  func() *corev1.Namespace
-		reconcile func(*corev1.Namespace) error
-	}{
-		{manifest: manifests.NamespaceOpenShiftAPIServer},
-		{manifest: manifests.NamespaceOpenShiftInfra, reconcile: namespaces.ReconcileOpenShiftInfraNamespace},
-		{manifest: manifests.NamespaceOpenshiftCloudControllerManager},
-		{manifest: manifests.NamespaceOpenShiftControllerManager},
-		{manifest: manifests.NamespaceKubeAPIServer, reconcile: namespaces.ReconcileKubeAPIServerNamespace},
-		{manifest: manifests.NamespaceKubeControllerManager},
-		{manifest: manifests.NamespaceKubeScheduler},
-		{manifest: manifests.NamespaceEtcd},
-		{manifest: manifests.NamespaceIngress, reconcile: namespaces.ReconcileOpenShiftIngressNamespace},
-		{manifest: manifests.NamespaceAuthentication},
-		{manifest: manifests.NamespaceRouteControllerManager},
-	}
-
-	var errs []error
-	for _, m := range namespaceManifests {
-		ns := m.manifest()
-		if ns.Name == "openshift-ingress" && !capabilities.IsIngressCapabilityEnabled(hcp.Spec.Capabilities) {
-			continue
-		}
-		if _, err := r.CreateOrUpdate(ctx, r.client, ns, func() error {
-			if m.reconcile != nil {
-				return m.reconcile(ns)
-			}
-			return nil
-		}); err != nil {
-			errs = append(errs, fmt.Errorf("failed to reconcile namespace %s: %w", ns.Name, err))
-		}
-	}
-
-	return utilerrors.NewAggregate(errs)
 }
 
 func (r *reconciler) reconcileRBAC(ctx context.Context, hcp *hyperv1.HostedControlPlane) error {
@@ -1575,27 +1558,6 @@ func (r *reconciler) reconcileKonnectivityAgent(ctx context.Context, hcp *hyperv
 	}
 
 	return utilerrors.NewAggregate(errs)
-}
-
-func (r *reconciler) reconcileClusterVersion(ctx context.Context, hcp *hyperv1.HostedControlPlane) error {
-	clusterVersion := &configv1.ClusterVersion{ObjectMeta: metav1.ObjectMeta{Name: "version"}}
-	if _, err := r.CreateOrUpdate(ctx, r.client, clusterVersion, func() error {
-		clusterVersion.Spec.ClusterID = configv1.ClusterID(hcp.Spec.ClusterID)
-		desiredCaps := capabilities.CalculateEnabledCapabilities(hcp.Spec.Capabilities)
-		desiredCaps = capabilities.FilterByKnownCapabilities(desiredCaps, clusterVersion.Status.Capabilities.KnownCapabilities)
-		clusterVersion.Spec.Capabilities = &configv1.ClusterVersionCapabilitiesSpec{
-			BaselineCapabilitySet:         configv1.ClusterVersionCapabilitySetNone,
-			AdditionalEnabledCapabilities: desiredCaps,
-		}
-		clusterVersion.Spec.Upstream = hcp.Spec.UpdateService
-		clusterVersion.Spec.Channel = hcp.Spec.Channel
-		clusterVersion.Spec.DesiredUpdate = nil
-		return nil
-	}); err != nil {
-		return fmt.Errorf("failed to reconcile clusterVersion: %w", err)
-	}
-
-	return nil
 }
 
 func (r *reconciler) reconcileDataPlaneConnectionAvailable(ctx context.Context, hcp *hyperv1.HostedControlPlane, log logr.Logger) error {
@@ -2683,6 +2645,73 @@ func (r *reconciler) reconcileAzureIdentityWebhook(ctx context.Context) []error 
 	return errs
 }
 
+func (r *reconciler) reconcileGCPIdentityWebhook(ctx context.Context) []error {
+	var errs []error
+	clusterRole := manifests.GCPWorkloadIdentityFederationWebhookClusterRole()
+	if _, err := r.CreateOrUpdate(ctx, r.client, clusterRole, func() error {
+		clusterRole.Rules = []rbacv1.PolicyRule{{
+			APIGroups: []string{""},
+			Resources: []string{"serviceaccounts"},
+			Verbs: []string{
+				"get",
+				"list",
+				"watch",
+			},
+		}}
+		return nil
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile %T %s: %w", clusterRole, clusterRole.Name, err))
+	}
+
+	clusterRoleBinding := manifests.GCPWorkloadIdentityFederationWebhookClusterRoleBinding()
+	if _, err := r.CreateOrUpdate(ctx, r.client, clusterRoleBinding, func() error {
+		clusterRoleBinding.RoleRef.APIGroup = "rbac.authorization.k8s.io"
+		clusterRoleBinding.RoleRef.Kind = "ClusterRole"
+		clusterRoleBinding.RoleRef.Name = clusterRole.Name
+		clusterRoleBinding.Subjects = []rbacv1.Subject{{
+			Kind:      "ServiceAccount",
+			Name:      "gcp-workload-identity-federation-webhook",
+			Namespace: "openshift-authentication",
+		}}
+		return nil
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile %T %s: %w", clusterRoleBinding, clusterRoleBinding.Name, err))
+	}
+
+	ignoreFailurePolicy := admissionregistrationv1.Ignore
+	sideEffectsNone := admissionregistrationv1.SideEffectClassNone
+	matchEquivalent := admissionregistrationv1.Equivalent
+	reinvocationIfNeeded := admissionregistrationv1.IfNeededReinvocationPolicy
+	webhook := manifests.GCPWorkloadIdentityFederationWebhook()
+	if _, err := r.CreateOrUpdate(ctx, r.client, webhook, func() error {
+		webhook.Webhooks = []admissionregistrationv1.MutatingWebhook{{
+			AdmissionReviewVersions: []string{"v1"},
+			Name:                    "pod-identity-webhook.gcp.mutate.io",
+			ClientConfig: admissionregistrationv1.WebhookClientConfig{
+				CABundle: []byte(r.rootCA),
+				URL:      ptr.To("https://127.0.0.1:9443/mutate-v1-pod"),
+			},
+			FailurePolicy:      &ignoreFailurePolicy,
+			MatchPolicy:        &matchEquivalent,
+			ReinvocationPolicy: &reinvocationIfNeeded,
+			Rules: []admissionregistrationv1.RuleWithOperations{{
+				Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create},
+				Rule: admissionregistrationv1.Rule{
+					APIGroups:   []string{""},
+					APIVersions: []string{"v1"},
+					Resources:   []string{"pods"},
+				},
+			}},
+			SideEffects: &sideEffectsNone,
+		}}
+		return nil
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile %T %s: %w", webhook, webhook.Name, err))
+	}
+
+	return errs
+}
+
 func (r *reconciler) destroyCloudResources(ctx context.Context, hcp *hyperv1.HostedControlPlane) (ctrl.Result, error) {
 	remaining, skipReason, err := r.ensureCloudResourcesDestroyed(ctx, hcp)
 
@@ -3415,6 +3444,14 @@ func (r *reconciler) reconcileStorage(ctx context.Context, hcp *hyperv1.HostedCo
 		driver := manifests.ClusterCSIDriver(driverName)
 		if _, err := r.CreateOrUpdate(ctx, r.client, driver, func() error {
 			storage.ReconcileClusterCSIDriver(driver)
+			// For AWS EBS, apply the write-once KMS key from initialKMSKeyARN.
+			if driverName == operatorv1.AWSEBSCSIDriver {
+				kmsKeyARN := ""
+				if hcp.Spec.OperatorConfiguration != nil {
+					kmsKeyARN = hcp.Spec.OperatorConfiguration.CSIDriverOperator.AWS.InitialKMSKeyARN
+				}
+				storage.ReconcileAWSEBSCSIDriverKMSKey(ctrl.LoggerFrom(ctx), driver, kmsKeyARN)
+			}
 			return nil
 		}); err != nil {
 			errs = append(errs, fmt.Errorf("failed to reconcile ClusterCSIDriver %s: %w", driver.Name, err))

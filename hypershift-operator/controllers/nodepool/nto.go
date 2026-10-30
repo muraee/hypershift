@@ -316,6 +316,10 @@ func validateTuningConfigManifest(manifest []byte) ([]byte, []byte, error) {
 		return manifest, nil, nil
 
 	case *performanceprofilev2.PerformanceProfile:
+		if obj.Spec.CPU != nil && obj.Spec.CPU.OvsDpdk != nil {
+			return nil, nil, fmt.Errorf("PerformanceProfile spec.cpu.ovsDpdk is not supported in NodePool tuningConfig")
+		}
+
 		validationErrors := obj.ValidateBasicFields()
 		if len(validationErrors) > 0 {
 			return nil, nil, fmt.Errorf("PerformanceProfile validation failed pp:%s : %w", obj.Name, coreerrors.Join(validationErrors.ToAggregate().Errors()...))
@@ -394,12 +398,7 @@ func (r *NodePoolReconciler) SetPerformanceProfileConditions(ctx context.Context
 			Message:            performanceProfileCondition.Message,
 			ObservedGeneration: nodePool.Generation,
 		}
-		oldCondition := FindStatusCondition(nodePool.Status.Conditions, condition.Type)
-
-		// Will set the condition only if it was not set previously, or has changed
-		if oldCondition == nil || oldCondition.ObservedGeneration != condition.ObservedGeneration {
-			SetStatusCondition(&nodePool.Status.Conditions, condition)
-		}
+		SetStatusCondition(&nodePool.Status.Conditions, condition)
 	}
 	return nil
 }

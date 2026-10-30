@@ -87,12 +87,20 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &hypershiftv1beta1.AWSCloudProviderConfigApplyConfiguration{}
 	case v1beta1.SchemeGroupVersion.WithKind("AWSClusterResourceTag"):
 		return &hypershiftv1beta1.AWSClusterResourceTagApplyConfiguration{}
+	case v1beta1.SchemeGroupVersion.WithKind("AWSCSIDriverConfig"):
+		return &hypershiftv1beta1.AWSCSIDriverConfigApplyConfiguration{}
+	case v1beta1.SchemeGroupVersion.WithKind("AWSDNSZoneStatus"):
+		return &hypershiftv1beta1.AWSDNSZoneStatusApplyConfiguration{}
 	case v1beta1.SchemeGroupVersion.WithKind("AWSKMSAuthSpec"):
 		return &hypershiftv1beta1.AWSKMSAuthSpecApplyConfiguration{}
 	case v1beta1.SchemeGroupVersion.WithKind("AWSKMSKeyEntry"):
 		return &hypershiftv1beta1.AWSKMSKeyEntryApplyConfiguration{}
 	case v1beta1.SchemeGroupVersion.WithKind("AWSKMSSpec"):
 		return &hypershiftv1beta1.AWSKMSSpecApplyConfiguration{}
+	case v1beta1.SchemeGroupVersion.WithKind("AWSManagedDNSDelegationSpec"):
+		return &hypershiftv1beta1.AWSManagedDNSDelegationSpecApplyConfiguration{}
+	case v1beta1.SchemeGroupVersion.WithKind("AWSManagedDNSSpec"):
+		return &hypershiftv1beta1.AWSManagedDNSSpecApplyConfiguration{}
 	case v1beta1.SchemeGroupVersion.WithKind("AWSNodePoolPlatform"):
 		return &hypershiftv1beta1.AWSNodePoolPlatformApplyConfiguration{}
 	case v1beta1.SchemeGroupVersion.WithKind("AWSNodePoolResourceTag"):
@@ -169,6 +177,8 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &hypershiftv1beta1.ClusterVersionStatusApplyConfiguration{}
 	case v1beta1.SchemeGroupVersion.WithKind("ComponentLogLevelSpec"):
 		return &hypershiftv1beta1.ComponentLogLevelSpecApplyConfiguration{}
+	case v1beta1.SchemeGroupVersion.WithKind("ConfigMapReference"):
+		return &hypershiftv1beta1.ConfigMapReferenceApplyConfiguration{}
 	case v1beta1.SchemeGroupVersion.WithKind("ConfigurationStatus"):
 		return &hypershiftv1beta1.ConfigurationStatusApplyConfiguration{}
 	case v1beta1.SchemeGroupVersion.WithKind("ControlPlaneManagedIdentities"):
@@ -179,6 +189,8 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &hypershiftv1beta1.ControlPlaneVersionStatusApplyConfiguration{}
 	case v1beta1.SchemeGroupVersion.WithKind("CPUOptions"):
 		return &hypershiftv1beta1.CPUOptionsApplyConfiguration{}
+	case v1beta1.SchemeGroupVersion.WithKind("CSIDriverOperatorSpec"):
+		return &hypershiftv1beta1.CSIDriverOperatorSpecApplyConfiguration{}
 	case v1beta1.SchemeGroupVersion.WithKind("DataPlaneManagedIdentities"):
 		return &hypershiftv1beta1.DataPlaneManagedIdentitiesApplyConfiguration{}
 	case v1beta1.SchemeGroupVersion.WithKind("Diagnostics"):
@@ -227,6 +239,8 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &hypershiftv1beta1.GCPResourceLabelApplyConfiguration{}
 	case v1beta1.SchemeGroupVersion.WithKind("GCPResourceReference"):
 		return &hypershiftv1beta1.GCPResourceReferenceApplyConfiguration{}
+	case v1beta1.SchemeGroupVersion.WithKind("GCPResourceTag"):
+		return &hypershiftv1beta1.GCPResourceTagApplyConfiguration{}
 	case v1beta1.SchemeGroupVersion.WithKind("GCPServiceAccountsEmails"):
 		return &hypershiftv1beta1.GCPServiceAccountsEmailsApplyConfiguration{}
 	case v1beta1.SchemeGroupVersion.WithKind("GCPWorkloadIdentityConfig"):
@@ -279,6 +293,12 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &hypershiftv1beta1.IBMCloudKMSUnmanagedAuthSpecApplyConfiguration{}
 	case v1beta1.SchemeGroupVersion.WithKind("IBMCloudPlatformSpec"):
 		return &hypershiftv1beta1.IBMCloudPlatformSpecApplyConfiguration{}
+	case v1beta1.SchemeGroupVersion.WithKind("IgnitionPayload"):
+		return &hypershiftv1beta1.IgnitionPayloadApplyConfiguration{}
+	case v1beta1.SchemeGroupVersion.WithKind("IgnitionPayloadSpec"):
+		return &hypershiftv1beta1.IgnitionPayloadSpecApplyConfiguration{}
+	case v1beta1.SchemeGroupVersion.WithKind("IgnitionPayloadStatus"):
+		return &hypershiftv1beta1.IgnitionPayloadStatusApplyConfiguration{}
 	case v1beta1.SchemeGroupVersion.WithKind("ImageContentSource"):
 		return &hypershiftv1beta1.ImageContentSourceApplyConfiguration{}
 	case v1beta1.SchemeGroupVersion.WithKind("IngressDefaultCertificateReference"):
@@ -407,6 +427,8 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &hypershiftv1beta1.OVNIPv6ConfigApplyConfiguration{}
 	case v1beta1.SchemeGroupVersion.WithKind("OVNKubernetesConfig"):
 		return &hypershiftv1beta1.OVNKubernetesConfigApplyConfiguration{}
+	case v1beta1.SchemeGroupVersion.WithKind("PayloadReference"):
+		return &hypershiftv1beta1.PayloadReferenceApplyConfiguration{}
 	case v1beta1.SchemeGroupVersion.WithKind("PersistentVolumeEtcdStorageSpec"):
 		return &hypershiftv1beta1.PersistentVolumeEtcdStorageSpecApplyConfiguration{}
 	case v1beta1.SchemeGroupVersion.WithKind("PlacementOptions"):
@@ -487,6 +509,8 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &karpenterv1.CapacityReservationApplyConfiguration{}
 	case v1.SchemeGroupVersion.WithKind("CapacityReservationSelectorTerm"):
 		return &karpenterv1.CapacityReservationSelectorTermApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("CPUOptions"):
+		return &karpenterv1.CPUOptionsApplyConfiguration{}
 	case v1.SchemeGroupVersion.WithKind("KubeletConfiguration"):
 		return &karpenterv1.KubeletConfigurationApplyConfiguration{}
 	case v1.SchemeGroupVersion.WithKind("MetadataOptions"):

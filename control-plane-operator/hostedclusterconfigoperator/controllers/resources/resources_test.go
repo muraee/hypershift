@@ -153,6 +153,14 @@ var cpObjects = []client.Object{
 	fakePackageServerService(),
 }
 
+func cpObjectsWithControlPlaneReleaseImage(image string) []client.Object {
+	objects := append([]client.Object{}, cpObjects...)
+	hcp := fakeHCP()
+	hcp.Spec.ControlPlaneReleaseImage = &image
+	objects[0] = hcp
+	return objects
+}
+
 // TestReconcileErrorHandling verifies that the reconcile loop proceeds when
 // errors occur.  The test uses a fake  client with a specific list of initial
 // objects in order to establish a baseline number of expected client create
@@ -175,6 +183,8 @@ func TestReconcileErrorHandling(t *testing.T) {
 	errorExceptions := []string{
 		"global pull secret syncer signaled to shutdown",
 	}
+	cpReleaseImage := "quay.io/openshift-release-dev/ocp-release:5.1.0-x86_64"
+	cpObjects := cpObjectsWithControlPlaneReleaseImage(cpReleaseImage)
 
 	var totalCreates int
 	{
@@ -193,6 +203,7 @@ func TestReconcileErrorHandling(t *testing.T) {
 			hcpName:                "foo",
 			hcpNamespace:           "bar",
 			releaseProvider: &fakereleaseprovider.FakeReleaseProvider{
+				Version: "5.1.0",
 				Components: map[string]string{
 					"cli": "quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:cli-fake",
 				},
@@ -227,6 +238,7 @@ func TestReconcileErrorHandling(t *testing.T) {
 			hcpName:                "foo",
 			hcpNamespace:           "bar",
 			releaseProvider: &fakereleaseprovider.FakeReleaseProvider{
+				Version: "5.1.0",
 				Components: map[string]string{
 					"cli": "quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:cli-fake",
 				},
@@ -244,6 +256,77 @@ func TestReconcileErrorHandling(t *testing.T) {
 				t.Fatalf("Unexpected number of creates: %d/%d with errors %d", fakeClient.createCount, totalCreates, fakeClient.getErrorCount)
 			}
 		}
+	}
+}
+
+func TestReconcileRequeueBehavior(t *testing.T) {
+	imageMetaDataProvider := fakeimagemetadataprovider.FakeRegistryClientImageMetadataProviderHCCO{}
+	ctx := logr.NewContext(context.Background(), zapr.NewLogger(zaptest.NewLogger(t)))
+
+	newReconciler := func(cpObjs []client.Object, guestObjs []client.Object) *reconciler {
+		return &reconciler{
+			client:                 fake.NewClientBuilder().WithScheme(api.Scheme).WithObjects(guestObjs...).WithStatusSubresource(&configv1.Infrastructure{}).Build(),
+			uncachedClient:         fake.NewClientBuilder().WithScheme(api.Scheme).Build(),
+			CreateOrUpdateProvider: &simpleCreateOrUpdater{},
+			platformType:           hyperv1.NonePlatform,
+			clusterSignerCA:        "foobar",
+			cpClient:               fake.NewClientBuilder().WithScheme(api.Scheme).WithObjects(cpObjs...).WithStatusSubresource(&hyperv1.HostedControlPlane{}).Build(),
+			hcpName:                "foo",
+			hcpNamespace:           "bar",
+			releaseProvider: &fakereleaseprovider.FakeReleaseProvider{
+				Components: map[string]string{
+					"cli": "quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:cli-fake",
+				},
+			},
+			ImageMetaDataProvider: &imageMetaDataProvider,
+		}
+	}
+
+	tests := []struct {
+		name            string
+		cpObjects       []client.Object
+		guestObjects    []client.Object
+		wantRequeueSecs int
+		wantErr         bool
+	}{
+		{
+			name:            "When reconciliation succeeds, it should requeue after 60 seconds",
+			cpObjects:       cpObjects,
+			guestObjects:    initialObjects,
+			wantRequeueSecs: 60,
+			wantErr:         false,
+		},
+		{
+			name:            "When reconciliation fails, it should return error without RequeueAfter",
+			cpObjects:       []client.Object{fakeHCP()},
+			guestObjects:    initialObjects,
+			wantRequeueSecs: 0,
+			wantErr:         true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newReconciler(tc.cpObjects, tc.guestObjects)
+			result, err := r.Reconcile(ctx, controllerruntime.Request{})
+
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected error but got nil")
+				}
+				if result.RequeueAfter != 0 {
+					t.Errorf("expected no RequeueAfter on error, got %v", result.RequeueAfter)
+				}
+			} else {
+				// Allow known non-fatal errors (e.g. global pull secret syncer shutdown)
+				if err != nil && !strings.Contains(err.Error(), "global pull secret syncer signaled to shutdown") {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if result.RequeueAfter != time.Duration(tc.wantRequeueSecs)*time.Second {
+					t.Errorf("expected RequeueAfter %ds, got %v", tc.wantRequeueSecs, result.RequeueAfter)
+				}
+			}
+		})
 	}
 }
 
@@ -1335,314 +1418,6 @@ func TestListAccessor(t *testing.T) {
 	g.Expect(a.len()).To(Equal(2))
 	g.Expect(a.item(0).GetName()).To(Equal("test1"))
 	g.Expect(a.item(1).GetName()).To(Equal("test2"))
-}
-
-func TestReconcileClusterVersion(t *testing.T) {
-	t.Parallel()
-	hcp := &hyperv1.HostedControlPlane{
-		Spec: hyperv1.HostedControlPlaneSpec{
-			ClusterID: "test-cluster-id",
-		},
-	}
-	testOverrides := []configv1.ComponentOverride{
-		{
-			Kind:      "Pod",
-			Group:     "",
-			Name:      "test",
-			Namespace: "default",
-			Unmanaged: true,
-		},
-	}
-	clusterVersion := &configv1.ClusterVersion{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "version",
-		},
-		Spec: configv1.ClusterVersionSpec{
-			ClusterID: "some-other-id",
-			Capabilities: &configv1.ClusterVersionCapabilitiesSpec{
-				AdditionalEnabledCapabilities: []configv1.ClusterVersionCapability{
-					"foo",
-					"bar",
-				},
-			},
-			Channel: "fast",
-			DesiredUpdate: &configv1.Update{
-				Version: "4.12.5",
-				Image:   "example.com/imagens/image:latest",
-				Force:   true,
-			},
-			Upstream:  configv1.URL("https://upstream.example.com"),
-			Overrides: testOverrides,
-		},
-	}
-	fakeClient := fake.NewClientBuilder().WithScheme(api.Scheme).WithObjects(clusterVersion).Build()
-	g := NewWithT(t)
-	r := &reconciler{
-		client:                 fakeClient,
-		CreateOrUpdateProvider: &simpleCreateOrUpdater{},
-	}
-	err := r.reconcileClusterVersion(t.Context(), hcp)
-	g.Expect(err).ToNot(HaveOccurred())
-	err = fakeClient.Get(t.Context(), client.ObjectKeyFromObject(clusterVersion), clusterVersion)
-	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(clusterVersion.Spec.ClusterID).To(Equal(configv1.ClusterID("test-cluster-id")))
-	expectedCapabilities := &configv1.ClusterVersionCapabilitiesSpec{
-		BaselineCapabilitySet: configv1.ClusterVersionCapabilitySetNone,
-		AdditionalEnabledCapabilities: []configv1.ClusterVersionCapability{
-			configv1.ClusterVersionCapabilityBuild,
-			configv1.ClusterVersionCapabilityCSISnapshot,
-			configv1.ClusterVersionCapabilityCloudControllerManager,
-			configv1.ClusterVersionCapabilityCloudCredential,
-			configv1.ClusterVersionCapabilityConsole,
-			configv1.ClusterVersionCapabilityDeploymentConfig,
-			configv1.ClusterVersionCapabilityImageRegistry,
-			configv1.ClusterVersionCapabilityIngress,
-			configv1.ClusterVersionCapabilityInsights,
-			configv1.ClusterVersionCapabilityMachineAPI,
-			configv1.ClusterVersionCapabilityNodeTuning,
-			configv1.ClusterVersionCapabilityOperatorLifecycleManager,
-			configv1.ClusterVersionCapabilityOperatorLifecycleManagerV1,
-			configv1.ClusterVersionCapabilityStorage,
-			configv1.ClusterVersionCapabilityMarketplace,
-			configv1.ClusterVersionCapabilityOpenShiftSamples,
-		},
-	}
-	g.Expect(clusterVersion.Spec.Capabilities).To(Equal(expectedCapabilities))
-	g.Expect(clusterVersion.Spec.DesiredUpdate).To(BeNil())
-	g.Expect(clusterVersion.Spec.Overrides).To(Equal(testOverrides))
-	g.Expect(clusterVersion.Spec.Channel).To(BeEmpty())
-}
-
-func TestReconcileClusterVersionWithDisabledCapabilities(t *testing.T) {
-	t.Parallel()
-	hcp := &hyperv1.HostedControlPlane{
-		Spec: hyperv1.HostedControlPlaneSpec{
-			ClusterID: "test-cluster-id",
-			Capabilities: &hyperv1.Capabilities{
-				Disabled: []hyperv1.OptionalCapability{
-					hyperv1.ImageRegistryCapability, hyperv1.OpenShiftSamplesCapability, hyperv1.InsightsCapability, hyperv1.ConsoleCapability, hyperv1.NodeTuningCapability, hyperv1.IngressCapability,
-				},
-			},
-		},
-	}
-	testOverrides := []configv1.ComponentOverride{
-		{
-			Kind:      "Pod",
-			Group:     "",
-			Name:      "test",
-			Namespace: "default",
-			Unmanaged: true,
-		},
-	}
-	clusterVersion := &configv1.ClusterVersion{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "version",
-		},
-		Spec: configv1.ClusterVersionSpec{
-			ClusterID: "some-other-id",
-			Capabilities: &configv1.ClusterVersionCapabilitiesSpec{
-				AdditionalEnabledCapabilities: []configv1.ClusterVersionCapability{
-					"foo",
-					"bar",
-				},
-			},
-			Channel: "fast",
-			DesiredUpdate: &configv1.Update{
-				Version: "4.12.5",
-				Image:   "example.com/imagens/image:latest",
-				Force:   true,
-			},
-			Upstream:  configv1.URL("https://upstream.example.com"),
-			Overrides: testOverrides,
-		},
-	}
-	fakeClient := fake.NewClientBuilder().WithScheme(api.Scheme).WithObjects(clusterVersion).Build()
-	g := NewWithT(t)
-	r := &reconciler{
-		client:                 fakeClient,
-		CreateOrUpdateProvider: &simpleCreateOrUpdater{},
-	}
-	err := r.reconcileClusterVersion(t.Context(), hcp)
-	g.Expect(err).ToNot(HaveOccurred())
-	err = fakeClient.Get(t.Context(), client.ObjectKeyFromObject(clusterVersion), clusterVersion)
-	g.Expect(err).ToNot(HaveOccurred())
-
-	expectedCapabilities := &configv1.ClusterVersionCapabilitiesSpec{
-		BaselineCapabilitySet: configv1.ClusterVersionCapabilitySetNone,
-		AdditionalEnabledCapabilities: []configv1.ClusterVersionCapability{
-			configv1.ClusterVersionCapabilityBuild,
-			configv1.ClusterVersionCapabilityCSISnapshot,
-			configv1.ClusterVersionCapabilityCloudControllerManager,
-			configv1.ClusterVersionCapabilityCloudCredential,
-			//configv1.ClusterVersionCapabilityConsole,
-			configv1.ClusterVersionCapabilityDeploymentConfig,
-			// configv1.ClusterVersionCapabilityImageRegistry,
-			//configv1.ClusterVersionCapabilityIngress,
-			//configv1.ClusterVersionCapabilityInsights,
-			configv1.ClusterVersionCapabilityMachineAPI,
-			//configv1.ClusterVersionCapabilityNodeTuning,
-			configv1.ClusterVersionCapabilityOperatorLifecycleManager,
-			configv1.ClusterVersionCapabilityOperatorLifecycleManagerV1,
-			configv1.ClusterVersionCapabilityStorage,
-			configv1.ClusterVersionCapabilityMarketplace,
-			// configv1.ClusterVersionCapabilityOpenShiftSamples,
-		},
-	}
-	g.Expect(clusterVersion.Spec.Capabilities).To(Equal(expectedCapabilities))
-}
-
-func TestReconcileClusterVersionWithEnabledCapabilities(t *testing.T) {
-	t.Parallel()
-	hcp := &hyperv1.HostedControlPlane{
-		Spec: hyperv1.HostedControlPlaneSpec{
-			ClusterID: "test-cluster-id",
-			Capabilities: &hyperv1.Capabilities{
-				Enabled: []hyperv1.OptionalCapability{
-					hyperv1.BaremetalCapability,
-				},
-			},
-		},
-	}
-	testOverrides := []configv1.ComponentOverride{
-		{
-			Kind:      "Pod",
-			Group:     "",
-			Name:      "test",
-			Namespace: "default",
-			Unmanaged: true,
-		},
-	}
-	clusterVersion := &configv1.ClusterVersion{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "version",
-		},
-		Spec: configv1.ClusterVersionSpec{
-			ClusterID: "some-other-id",
-			Capabilities: &configv1.ClusterVersionCapabilitiesSpec{
-				AdditionalEnabledCapabilities: []configv1.ClusterVersionCapability{
-					"foo",
-					"bar",
-				},
-			},
-			Channel: "fast",
-			DesiredUpdate: &configv1.Update{
-				Version: "4.12.5",
-				Image:   "example.com/imagens/image:latest",
-				Force:   true,
-			},
-			Upstream:  configv1.URL("https://upstream.example.com"),
-			Overrides: testOverrides,
-		},
-	}
-	fakeClient := fake.NewClientBuilder().WithScheme(api.Scheme).WithObjects(clusterVersion).Build()
-	g := NewWithT(t)
-	r := &reconciler{
-		client:                 fakeClient,
-		CreateOrUpdateProvider: &simpleCreateOrUpdater{},
-	}
-	err := r.reconcileClusterVersion(t.Context(), hcp)
-	g.Expect(err).ToNot(HaveOccurred())
-	err = fakeClient.Get(t.Context(), client.ObjectKeyFromObject(clusterVersion), clusterVersion)
-	g.Expect(err).ToNot(HaveOccurred())
-
-	expectedCapabilities := &configv1.ClusterVersionCapabilitiesSpec{
-		BaselineCapabilitySet: configv1.ClusterVersionCapabilitySetNone,
-		AdditionalEnabledCapabilities: []configv1.ClusterVersionCapability{
-			configv1.ClusterVersionCapabilityBuild,
-			configv1.ClusterVersionCapabilityCSISnapshot,
-			configv1.ClusterVersionCapabilityCloudControllerManager,
-			configv1.ClusterVersionCapabilityCloudCredential,
-			configv1.ClusterVersionCapabilityConsole,
-			configv1.ClusterVersionCapabilityDeploymentConfig,
-			configv1.ClusterVersionCapabilityImageRegistry,
-			configv1.ClusterVersionCapabilityIngress,
-			configv1.ClusterVersionCapabilityInsights,
-			configv1.ClusterVersionCapabilityMachineAPI,
-			configv1.ClusterVersionCapabilityNodeTuning,
-			configv1.ClusterVersionCapabilityOperatorLifecycleManager,
-			configv1.ClusterVersionCapabilityOperatorLifecycleManagerV1,
-			configv1.ClusterVersionCapabilityStorage,
-			configv1.ClusterVersionCapabilityBaremetal,
-			configv1.ClusterVersionCapabilityMarketplace,
-			configv1.ClusterVersionCapabilityOpenShiftSamples,
-		},
-	}
-	g.Expect(clusterVersion.Spec.Capabilities).To(Equal(expectedCapabilities))
-}
-
-func TestReconcileClusterVersionWhenGuestCVOHasOlderCapabilities(t *testing.T) {
-	t.Parallel()
-	hcp := &hyperv1.HostedControlPlane{
-		Spec: hyperv1.HostedControlPlaneSpec{
-			ClusterID: "test-cluster-id",
-		},
-	}
-	// Simulate an older guest CVO that doesn't know about ClusterAPI or CompatibilityRequirements
-	olderCVOKnownCaps := []configv1.ClusterVersionCapability{
-		configv1.ClusterVersionCapabilityBuild,
-		configv1.ClusterVersionCapabilityCSISnapshot,
-		configv1.ClusterVersionCapabilityCloudControllerManager,
-		configv1.ClusterVersionCapabilityCloudCredential,
-		configv1.ClusterVersionCapabilityConsole,
-		configv1.ClusterVersionCapabilityDeploymentConfig,
-		configv1.ClusterVersionCapabilityImageRegistry,
-		configv1.ClusterVersionCapabilityIngress,
-		configv1.ClusterVersionCapabilityInsights,
-		configv1.ClusterVersionCapabilityMachineAPI,
-		configv1.ClusterVersionCapabilityNodeTuning,
-		configv1.ClusterVersionCapabilityOperatorLifecycleManager,
-		configv1.ClusterVersionCapabilityOperatorLifecycleManagerV1,
-		configv1.ClusterVersionCapabilityStorage,
-		configv1.ClusterVersionCapabilityBaremetal,
-		configv1.ClusterVersionCapabilityMarketplace,
-		configv1.ClusterVersionCapabilityOpenShiftSamples,
-	}
-	clusterVersion := &configv1.ClusterVersion{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "version",
-		},
-		Status: configv1.ClusterVersionStatus{
-			Capabilities: configv1.ClusterVersionCapabilitiesStatus{
-				KnownCapabilities: olderCVOKnownCaps,
-			},
-		},
-	}
-	fakeClient := fake.NewClientBuilder().WithScheme(api.Scheme).WithObjects(clusterVersion).Build()
-	g := NewWithT(t)
-	r := &reconciler{
-		client:                 fakeClient,
-		CreateOrUpdateProvider: &simpleCreateOrUpdater{},
-	}
-	err := r.reconcileClusterVersion(t.Context(), hcp)
-	g.Expect(err).ToNot(HaveOccurred())
-	err = fakeClient.Get(t.Context(), client.ObjectKeyFromObject(clusterVersion), clusterVersion)
-	g.Expect(err).ToNot(HaveOccurred())
-
-	// ClusterAPI and CompatibilityRequirements should be filtered out
-	expectedCapabilities := &configv1.ClusterVersionCapabilitiesSpec{
-		BaselineCapabilitySet: configv1.ClusterVersionCapabilitySetNone,
-		AdditionalEnabledCapabilities: []configv1.ClusterVersionCapability{
-			configv1.ClusterVersionCapabilityBuild,
-			configv1.ClusterVersionCapabilityCSISnapshot,
-			configv1.ClusterVersionCapabilityCloudControllerManager,
-			configv1.ClusterVersionCapabilityCloudCredential,
-			// ClusterAPI filtered out - not in knownCapabilities
-			// CompatibilityRequirements filtered out - not in knownCapabilities
-			configv1.ClusterVersionCapabilityConsole,
-			configv1.ClusterVersionCapabilityDeploymentConfig,
-			configv1.ClusterVersionCapabilityImageRegistry,
-			configv1.ClusterVersionCapabilityIngress,
-			configv1.ClusterVersionCapabilityInsights,
-			configv1.ClusterVersionCapabilityMachineAPI,
-			configv1.ClusterVersionCapabilityNodeTuning,
-			configv1.ClusterVersionCapabilityOperatorLifecycleManager,
-			configv1.ClusterVersionCapabilityOperatorLifecycleManagerV1,
-			configv1.ClusterVersionCapabilityStorage,
-			configv1.ClusterVersionCapabilityMarketplace,
-			configv1.ClusterVersionCapabilityOpenShiftSamples,
-		},
-	}
-	g.Expect(clusterVersion.Spec.Capabilities).To(Equal(expectedCapabilities))
 }
 
 func TestReconcileImageContentPolicyType(t *testing.T) {
@@ -3924,6 +3699,24 @@ func TestReconcilePlatformSpecificResources(t *testing.T) {
 				// Verify at least one of the expected resources exists
 				saList := &corev1.ServiceAccountList{}
 				err := c.List(ctx, saList)
+				g.Expect(err).ToNot(HaveOccurred())
+			},
+		},
+		{
+			name:         "When platform is GCP, it should reconcile GCP identity webhook resources",
+			platformType: hyperv1.GCPPlatform,
+			verifyObjects: func(g *WithT, c client.Client) {
+				webhook := manifests.GCPWorkloadIdentityFederationWebhook()
+				err := c.Get(ctx, client.ObjectKeyFromObject(webhook), webhook)
+				g.Expect(err).ToNot(HaveOccurred())
+				g.Expect(webhook.Webhooks).To(HaveLen(1))
+
+				clusterRole := manifests.GCPWorkloadIdentityFederationWebhookClusterRole()
+				err = c.Get(ctx, client.ObjectKeyFromObject(clusterRole), clusterRole)
+				g.Expect(err).ToNot(HaveOccurred())
+
+				clusterRoleBinding := manifests.GCPWorkloadIdentityFederationWebhookClusterRoleBinding()
+				err = c.Get(ctx, client.ObjectKeyFromObject(clusterRoleBinding), clusterRoleBinding)
 				g.Expect(err).ToNot(HaveOccurred())
 			},
 		},

@@ -197,13 +197,20 @@ type NodePoolSpec struct {
 	// +optional
 	NodeVolumeDetachTimeout *metav1.Duration `json:"nodeVolumeDetachTimeout,omitempty"`
 
-	// nodeLabels propagates a list of labels to Nodes, only once on creation.
+	// nodeLabels propagates a list of labels to Nodes.
+	// Labels are re-synced additively whenever the desired state changes;
+	// labels set by other controllers (kubelet, autoscaler) are preserved.
+	// Removing a label from this map does NOT remove it from existing Nodes;
+	// only new values or key additions are propagated.
 	// Valid values are those in https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#syntax-and-character-set
 	// +optional
 	NodeLabels map[string]string `json:"nodeLabels,omitempty"`
 
-	// taints if specified, propagates a list of taints to Nodes, only once on creation.
-	// These taints are additive to the ones applied by other controllers
+	// taints if specified, propagates a list of taints to Nodes.
+	// Taints are re-synced whenever the desired state changes.
+	// These taints are additive to the ones applied by other controllers.
+	// Removing a taint from this list does NOT remove it from existing Nodes;
+	// only new taints are added and existing taint values are updated.
 	// +kubebuilder:validation:MaxItems=50
 	// +optional
 	Taints []Taint `json:"taints,omitempty"`
@@ -277,7 +284,7 @@ const (
 
 // OSImageStreamReference references an OSImageStream by name.
 type OSImageStreamReference struct {
-	// name is a required reference to an OSImageStream to be used for the pool.
+	// name is a required reference to an OSImageStream. Valid values are "rhel-9" and "rhel-10".
 	//
 	// +required
 	// +kubebuilder:validation:Enum=rhel-9;rhel-10

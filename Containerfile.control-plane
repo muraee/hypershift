@@ -1,4 +1,4 @@
-FROM registry.access.redhat.com/ubi9/go-toolset:1.26.5-1786522985 AS builder
+FROM registry.access.redhat.com/ubi9/go-toolset:1.26 AS builder
 ARG COMMIT_HASH
 
 WORKDIR /hypershift
@@ -28,4 +28,5 @@ LABEL io.openshift.hypershift.restricted-psa=true
 LABEL io.openshift.hypershift.control-plane-pki-operator-signs-csrs=true
 LABEL io.openshift.hypershift.hosted-cluster-config-operator-reports-node-count=true
 LABEL io.openshift.hypershift.control-plane-operator-supports-kas-custom-kubeconfig=true
+LABEL io.openshift.hypershift.control-plane-operator-supports-gcp-resource-tags=true
 LABEL io.openshift.hypershift.control-plane-operator.v2-isdefault=true

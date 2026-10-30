@@ -2,15 +2,20 @@ package dump
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
+	. "github.com/onsi/gomega"
+
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
+	"github.com/openshift/hypershift/cmd/util"
 	hyperapi "github.com/openshift/hypershift/support/api"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	fakediscovery "k8s.io/client-go/discovery/fake"
+	"k8s.io/client-go/rest"
 	clientgotesting "k8s.io/client-go/testing"
 
 	capiaws "sigs.k8s.io/cluster-api-provider-aws/v2/api/v1beta2"
@@ -20,6 +25,71 @@ import (
 
 	"github.com/go-logr/logr"
 )
+
+func TestDumpOptionsManagementClient(t *testing.T) {
+	defaultClient := crfake.NewClientBuilder().WithScheme(hyperapi.Scheme).Build()
+	impersonatedClient := crfake.NewClientBuilder().WithScheme(hyperapi.Scheme).Build()
+
+	t.Run("When an injected client is provided without impersonation, it should reuse the client", func(t *testing.T) {
+		opts := &DumpOptions{Client: defaultClient}
+		got, err := opts.managementClient()
+		NewWithT(t).Expect(err).NotTo(HaveOccurred())
+		NewWithT(t).Expect(got).To(BeIdenticalTo(defaultClient))
+	})
+	t.Run("When impersonation is requested, it should use the impersonated client", func(t *testing.T) {
+		opts := &DumpOptions{
+			Client:        defaultClient,
+			ImpersonateAs: "test-user",
+			Kubeconfig:    "/tmp/management-kubeconfig",
+			ClientProvider: &util.ClientProvider{ImpersonatedClient: func(kubeconfig, user string) (client.Client, error) {
+				if kubeconfig != "/tmp/management-kubeconfig" {
+					return nil, errors.New("unexpected kubeconfig path")
+				}
+				if user != "test-user" {
+					return nil, errors.New("unexpected user")
+				}
+				return impersonatedClient, nil
+			}},
+		}
+		got, err := opts.managementClient()
+		NewWithT(t).Expect(err).NotTo(HaveOccurred())
+		NewWithT(t).Expect(got).To(BeIdenticalTo(impersonatedClient))
+	})
+	t.Run("When no client provider is configured, it should return an error", func(t *testing.T) {
+		_, err := (&DumpOptions{}).managementClient()
+		NewWithT(t).Expect(err).To(HaveOccurred())
+	})
+	t.Run("When the provider returns an error, it should propagate the error", func(t *testing.T) {
+		_, err := (&DumpOptions{ClientProvider: &util.ClientProvider{
+			ControllerRuntimeClient: func(string) (client.Client, error) {
+				return nil, errors.New("client unavailable")
+			},
+		}}).managementClient()
+		NewWithT(t).Expect(err).To(MatchError("client unavailable"))
+	})
+}
+
+func TestDumpOptionsManagementConfig(t *testing.T) {
+	expectedConfig := &rest.Config{Host: "https://management.example"}
+	t.Run("When a provider is configured, it should request the configured kubeconfig", func(t *testing.T) {
+		opts := &DumpOptions{
+			Kubeconfig: "/tmp/management-kubeconfig",
+			ClientProvider: &util.ClientProvider{Config: func(path string) (*rest.Config, error) {
+				if path != "/tmp/management-kubeconfig" {
+					return nil, errors.New("unexpected kubeconfig path")
+				}
+				return expectedConfig, nil
+			}},
+		}
+		got, err := opts.managementConfig()
+		NewWithT(t).Expect(err).NotTo(HaveOccurred())
+		NewWithT(t).Expect(got).To(BeIdenticalTo(expectedConfig))
+	})
+	t.Run("When no client provider is configured, it should return an error", func(t *testing.T) {
+		_, err := (&DumpOptions{}).managementConfig()
+		NewWithT(t).Expect(err).To(HaveOccurred())
+	})
+}
 
 func TestDumpClusterWithRetry(t *testing.T) {
 	t.Run("When context is already canceled, it should return an error without retrying", func(t *testing.T) {
@@ -43,6 +113,44 @@ func TestDumpClusterWithRetry(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected an error when context is canceled, got nil")
 		}
+	})
+}
+
+func TestDumpCluster(t *testing.T) {
+	t.Run("When Azure options are absent, it should skip Azure diagnostics setup", func(t *testing.T) {
+		g := NewWithT(t)
+		t.Setenv("PATH", "")
+		clientCalls := 0
+		opts := &DumpOptions{
+			Log: logr.Discard(),
+			ClientProvider: &util.ClientProvider{ControllerRuntimeClient: func(string) (client.Client, error) {
+				clientCalls++
+				return crfake.NewClientBuilder().WithScheme(hyperapi.Scheme).Build(), nil
+			}},
+		}
+
+		g.Expect(DumpCluster(t.Context(), opts)).To(MatchError("cannot find oc command"))
+		g.Expect(clientCalls).To(BeZero(), "Azure diagnostics should not run without Azure options")
+	})
+
+	t.Run("When Azure diagnostics setup fails, it should continue with the general dump", func(t *testing.T) {
+		g := NewWithT(t)
+		t.Setenv("PATH", "")
+		clientCalls := 0
+		opts := &DumpOptions{
+			Namespace:   "clusters",
+			Name:        "hc",
+			ArtifactDir: t.TempDir(),
+			Azure:       &AzureDumpOptions{},
+			Log:         logr.Discard(),
+			ClientProvider: &util.ClientProvider{ControllerRuntimeClient: func(string) (client.Client, error) {
+				clientCalls++
+				return crfake.NewClientBuilder().WithScheme(hyperapi.Scheme).Build(), nil
+			}},
+		}
+
+		g.Expect(DumpCluster(t.Context(), opts)).To(MatchError("cannot find oc command"))
+		g.Expect(clientCalls).To(Equal(1), "Azure diagnostics should run before the general dump")
 	})
 }
 
@@ -344,6 +452,48 @@ func discoveryResourcesFor(t *testing.T, c client.Client, objs []client.Object) 
 }
 
 func TestNewDumpCommand(t *testing.T) {
+	t.Run("When Azure credentials are specified, it should enable Azure machine diagnostics", func(t *testing.T) {
+		g := NewWithT(t)
+		var capturedOpts *DumpOptions
+		cmd := NewDumpCommand(func(_ context.Context, opts *DumpOptions) error {
+			capturedOpts = opts
+			return nil
+		})
+		cmd.SetArgs([]string{"--artifact-dir", t.TempDir(), "--azure-creds=/azure/credentials.json"})
+
+		g.Expect(cmd.Execute()).To(Succeed())
+		g.Expect(capturedOpts).NotTo(BeNil())
+		g.Expect(capturedOpts.Azure).To(Equal(&AzureDumpOptions{CredentialsFile: "/azure/credentials.json"}))
+	})
+
+	t.Run("When Azure credentials are explicitly empty, it should still enable journal collection", func(t *testing.T) {
+		g := NewWithT(t)
+		var capturedOpts *DumpOptions
+		cmd := NewDumpCommand(func(_ context.Context, opts *DumpOptions) error {
+			capturedOpts = opts
+			return nil
+		})
+		cmd.SetArgs([]string{"--artifact-dir", t.TempDir(), "--azure-creds="})
+
+		g.Expect(cmd.Execute()).To(Succeed())
+		g.Expect(capturedOpts).NotTo(BeNil())
+		g.Expect(capturedOpts.Azure).To(Equal(&AzureDumpOptions{}))
+	})
+
+	t.Run("When Azure credentials are omitted, it should leave Azure diagnostics disabled", func(t *testing.T) {
+		g := NewWithT(t)
+		var capturedOpts *DumpOptions
+		cmd := NewDumpCommand(func(_ context.Context, opts *DumpOptions) error {
+			capturedOpts = opts
+			return nil
+		})
+		cmd.SetArgs([]string{"--artifact-dir", t.TempDir()})
+
+		g.Expect(cmd.Execute()).To(Succeed())
+		g.Expect(capturedOpts).NotTo(BeNil())
+		g.Expect(capturedOpts.Azure).To(BeNil())
+	})
+
 	t.Run("When using the --dump-guest-cluster flag", func(t *testing.T) {
 		tests := []struct {
 			name               string
