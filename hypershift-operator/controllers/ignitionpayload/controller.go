@@ -4,13 +4,17 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	ignserver "github.com/openshift/hypershift/ignition-server/controllers"
+	"github.com/openshift/hypershift/support/backwardcompat"
 	payloadstore "github.com/openshift/hypershift/support/ignitionpayload"
+	"github.com/openshift/hypershift/support/manifests"
+	"github.com/openshift/hypershift/support/releaseinfo"
 	"github.com/openshift/hypershift/support/statuspatching"
 	supportutil "github.com/openshift/hypershift/support/util"
 
@@ -50,7 +54,10 @@ type Reconciler struct {
 	Store     payloadstore.PayloadStore
 	Generator *payloadGenerator
 	Minter    TokenMinter
-	Namespace string
+	// ReleaseProvider resolves a release-image pullspec to its OCP version for the rollout/identity
+	// hashes (matching the deployed ConfigGenerator.Hash, which keys on releaseImage.Version()).
+	ReleaseProvider releaseinfo.Provider
+	Namespace       string
 
 	// IgnitionCACert is the node-facing CA (PEM) embedded in authored userData so a booting node
 	// trusts the serving tier. IgnitionServerEndpoint is the host[:port] the node fetches from.
@@ -71,6 +78,7 @@ type ReconcilerConfig struct {
 	Client                 client.Client
 	Store                  payloadstore.PayloadStore
 	Provider               ignserver.IgnitionProvider
+	ReleaseProvider        releaseinfo.Provider
 	Minter                 TokenMinter
 	Namespace              string
 	IgnitionCACert         []byte
@@ -86,6 +94,7 @@ func NewReconciler(cfg ReconcilerConfig) *Reconciler {
 		Store:                  cfg.Store,
 		Generator:              &payloadGenerator{store: cfg.Store, provider: cfg.Provider},
 		Minter:                 cfg.Minter,
+		ReleaseProvider:        cfg.ReleaseProvider,
 		Namespace:              cfg.Namespace,
 		IgnitionCACert:         cfg.IgnitionCACert,
 		IgnitionServerEndpoint: cfg.IgnitionServerEndpoint,
@@ -148,9 +157,34 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, err
 	}
 
+	// Resolve the release pullspec to its OCP version for the hashes, matching the deployed
+	// ConfigGenerator.Hash() which keys on releaseImage.Version() (not the pullspec). A Lookup failure
+	// is transient and requeues; it is not a config-validation failure.
+	releaseImage, err := r.ReleaseProvider.Lookup(ctx, cr.Spec.ReleaseImage, inputs.pullSecret)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to resolve release image %q: %w", cr.Spec.ReleaseImage, err)
+	}
+
+	// The full cluster-configuration gate hash (what CPO writes into the machine-config-server
+	// ConfigMap) and the cloud-provider config hash come from the HostedControlPlane in this
+	// namespace, matching exactly what CPO renders from so GetPayload's freshness gate passes. A
+	// missing HCP is transient.
+	hcp, err := r.getHostedControlPlane(ctx)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	hcConfigHash, err := backwardcompat.GetBackwardCompatibleConfigHash(hcp.Spec.Configuration)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to hash hosted cluster configuration: %w", err)
+	}
+	cloudConfigHash, err := r.cloudConfigHash(ctx, hcp)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	in := hashInputs{
 		resolved:                resolved,
-		releaseVersion:          cr.Spec.ReleaseImage,
+		releaseVersion:          releaseImage.Version(),
 		pullSecretName:          cr.Spec.PullSecret.Name,
 		pullSecretContent:       inputs.pullSecret,
 		trustBundleName:         cr.Spec.AdditionalTrustBundle.Name,
@@ -158,6 +192,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		rolloutGlobalConfig:     inputs.rolloutGlobalConfig,
 		osImageStream:           cr.Spec.OSImageStream.Name,
 		additionalRolloutInputs: cr.Spec.AdditionalRolloutInputs,
+		hcConfigHash:            hcConfigHash,
+		cloudConfigHash:         cloudConfigHash,
 	}
 	identity := payloadIdentityHash(in)
 	ro := rolloutHash(in)
@@ -171,9 +207,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		customConfig:        joinManifests(resolved),
 		pullSecretHash:      supportutil.HashSimple(inputs.pullSecret),
 		trustBundleHash:     supportutil.HashSimple(inputs.trustBundle),
-		hcConfigurationHash: supportutil.HashSimple(inputs.rolloutGlobalConfig),
+		hcConfigurationHash: hcConfigHash,
 		osImageStream:       cr.Spec.OSImageStream.Name,
-		cloudConfigHash:     "", // Phase 2: cloud-config boundary resolved with Phase 4.
+		cloudConfigHash:     cloudConfigHash,
 	}
 
 	// Rebaseline: if the stored formula version is older than the binary's, rewrite the stored
@@ -421,6 +457,43 @@ func (r *Reconciler) readConfigMapKey(ctx context.Context, ns, name, key string)
 		return nil, err
 	}
 	return []byte(cm.Data[key]), nil
+}
+
+// getHostedControlPlane returns the single HostedControlPlane in the controller's namespace. Each
+// PayloadController instance is scoped to one HCP namespace, so exactly one is expected; its absence
+// is transient (requeue). Reading the in-namespace HCP keeps the generator consumer-agnostic — it is
+// a namespace-level fact, not a back-reference to any one consumer's NodePool.
+func (r *Reconciler) getHostedControlPlane(ctx context.Context) (*hyperv1.HostedControlPlane, error) {
+	list := &hyperv1.HostedControlPlaneList{}
+	if err := r.List(ctx, list, client.InNamespace(r.Namespace)); err != nil {
+		return nil, err
+	}
+	if len(list.Items) == 0 {
+		return nil, fmt.Errorf("no HostedControlPlane found in namespace %q", r.Namespace)
+	}
+	return &list.Items[0], nil
+}
+
+// cloudConfigHash returns the hash of the platform cloud-provider config ConfigMap, mirroring
+// ConfigGenerator.GetCloudConfigHash: a value for Azure/OpenStack, "" for platforms without one
+// (e.g. AWS/None) or when the ConfigMap is not yet present.
+func (r *Reconciler) cloudConfigHash(ctx context.Context, hcp *hyperv1.HostedControlPlane) (string, error) {
+	var cm *corev1.ConfigMap
+	switch hcp.Spec.Platform.Type {
+	case hyperv1.AzurePlatform:
+		cm = manifests.AzureProviderConfig(r.Namespace)
+	case hyperv1.OpenStackPlatform:
+		cm = manifests.OpenStackProviderConfig(r.Namespace)
+	default:
+		return "", nil
+	}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(cm), cm); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("failed to get cloud config ConfigMap %s/%s: %w", cm.Namespace, cm.Name, err)
+	}
+	return supportutil.HashConfigMapData(cm.Data), nil
 }
 
 func joinManifests(r ResolvedConfig) string {

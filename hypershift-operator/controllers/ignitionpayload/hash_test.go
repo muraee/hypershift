@@ -46,6 +46,14 @@ func TestPayloadIdentityHash(t *testing.T) {
 	ari := base
 	ari.additionalRolloutInputs = "endpoint=1.2.3.4:443;mode=Public"
 	g.Expect(payloadIdentityHash(ari)).To(Equal(id0), "additionalRolloutInputs must NOT change the identity hash")
+
+	// Full-config and cloud-config changes refresh the payload identity (they feed rendering).
+	hcc := base
+	hcc.hcConfigHash = "hc-v2"
+	g.Expect(payloadIdentityHash(hcc)).ToNot(Equal(id0), "full-config change must change identity")
+	cc := base
+	cc.cloudConfigHash = "cloud-v2"
+	g.Expect(payloadIdentityHash(cc)).ToNot(Equal(id0), "cloud-config change must change identity")
 }
 
 func TestRolloutHash(t *testing.T) {
@@ -90,4 +98,12 @@ func TestRolloutHash(t *testing.T) {
 	ari := base
 	ari.additionalRolloutInputs = "endpoint=1.2.3.4:443;mode=Public"
 	g.Expect(rolloutHash(ari)).ToNot(Equal(ro0), "additionalRolloutInputs must change the rollout hash")
+
+	// Full-config and cloud-config feed the identity hash only, never the rollout hash.
+	hcc := base
+	hcc.hcConfigHash = "hc-v2"
+	g.Expect(rolloutHash(hcc)).To(Equal(ro0), "full-config change must NOT roll")
+	cc := base
+	cc.cloudConfigHash = "cloud-v2"
+	g.Expect(rolloutHash(cc)).To(Equal(ro0), "cloud-config change must NOT roll")
 }

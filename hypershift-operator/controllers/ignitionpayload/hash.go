@@ -25,6 +25,15 @@ type hashInputs struct {
 	// live outside the referenced ConfigMaps (e.g. the API-server endpoint identity carried in the
 	// HAProxy management config). It feeds the rollout hash only, never configHash.
 	additionalRolloutInputs string
+	// hcConfigHash is backwardcompat.GetBackwardCompatibleConfigHash(hcp.Spec.Configuration) — the
+	// full cluster-configuration gate value CPO writes into the machine-config-server ConfigMap. It
+	// feeds payloadIdentityHash only (a full-config change refreshes the payload for new nodes), not
+	// rolloutHash (whose global-config term is the rollout-relevant subset in rolloutGlobalConfig).
+	hcConfigHash string
+	// cloudConfigHash hashes the platform cloud-provider config ("" for AWS/None). It feeds
+	// payloadIdentityHash only, matching the old TokenSecretCloudConfigHashKey (never a rollout
+	// trigger).
+	cloudConfigHash string
 }
 
 // payloadIdentityHash covers EVERYTHING embedded in the rendered payload, including the
@@ -39,7 +48,9 @@ func payloadIdentityHash(in hashInputs) string {
 		string(in.pullSecretContent) +
 		string(in.trustBundleContent) +
 		string(in.rolloutGlobalConfig) +
-		in.osImageStream)
+		in.osImageStream +
+		in.hcConfigHash +
+		in.cloudConfigHash)
 }
 
 // rolloutHash covers only rollout-relevant inputs. It EXCLUDES the management (HAProxy) manifests

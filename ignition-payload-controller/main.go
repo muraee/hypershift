@@ -160,6 +160,7 @@ func run(ctx context.Context, opts Options) error {
 		Client:                 mgr.GetClient(),
 		Store:                  store,
 		Provider:               provider,
+		ReleaseProvider:        provider.ReleaseProvider,
 		Minter:                 minter,
 		Namespace:              namespace,
 		IgnitionCACert:         caCert,

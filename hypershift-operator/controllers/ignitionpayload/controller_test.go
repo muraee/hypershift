@@ -10,7 +10,13 @@ import (
 
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	"github.com/openshift/hypershift/support/api"
+	"github.com/openshift/hypershift/support/backwardcompat"
 	payloadstore "github.com/openshift/hypershift/support/ignitionpayload"
+	"github.com/openshift/hypershift/support/manifests"
+	"github.com/openshift/hypershift/support/releaseinfo"
+
+	configv1 "github.com/openshift/api/config/v1"
+	imageapi "github.com/openshift/api/image/v1"
 
 	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -50,10 +56,58 @@ func testCR() *hyperv1.IgnitionPayload {
 	}
 }
 
+// fakeReleaseProvider resolves a pullspec to an OCP version for the hashes. version is the default;
+// versions overrides per-pullspec; err forces a transient Lookup failure.
+type fakeReleaseProvider struct {
+	version  string
+	versions map[string]string
+	err      error
+}
+
+func (f *fakeReleaseProvider) Lookup(_ context.Context, image string, _ []byte) (*releaseinfo.ReleaseImage, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	v := f.version
+	if override, ok := f.versions[image]; ok {
+		v = override
+	}
+	if v == "" {
+		v = "4.23.0"
+	}
+	return &releaseinfo.ReleaseImage{ImageStream: &imageapi.ImageStream{ObjectMeta: metav1.ObjectMeta{Name: v}}}, nil
+}
+
+// testHCP is the single HostedControlPlane the generator reads for the full-config + cloud-config
+// gate hashes. Default platform AWS → cloud-config hash "".
+func testHCP() *hyperv1.HostedControlPlane {
+	return &hyperv1.HostedControlPlane{
+		ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "hcp"},
+		Spec: hyperv1.HostedControlPlaneSpec{
+			Configuration: &hyperv1.ClusterConfiguration{},
+			Platform:      hyperv1.PlatformSpec{Type: hyperv1.AWSPlatform},
+		},
+	}
+}
+
+func containsHCP(objs []client.Object) bool {
+	for _, o := range objs {
+		if _, ok := o.(*hyperv1.HostedControlPlane); ok {
+			return true
+		}
+	}
+	return false
+}
+
 func newTestReconciler(t *testing.T, objs ...client.Object) (*Reconciler, client.Client, *fakeProvider) {
 	t.Helper()
 	store := payloadstore.NewMemStore()
 	fp := &fakeProvider{payload: []byte("PAYLOAD")}
+	// The generator reads the single in-namespace HCP; seed a default one unless the test supplies
+	// its own (e.g. to exercise a cloud platform).
+	if !containsHCP(objs) {
+		objs = append([]client.Object{testHCP()}, objs...)
+	}
 	c := fake.NewClientBuilder().
 		WithScheme(api.Scheme).
 		WithObjects(objs...).
@@ -64,6 +118,7 @@ func newTestReconciler(t *testing.T, objs ...client.Object) (*Reconciler, client
 		Store:                  store,
 		Generator:              &payloadGenerator{store: store, provider: fp},
 		Minter:                 &fakeMinter{},
+		ReleaseProvider:        &fakeReleaseProvider{version: "4.23.0"},
 		Namespace:              testNS,
 		IgnitionCACert:         []byte("ca"),
 		IgnitionServerEndpoint: "ign.example.com",
@@ -110,6 +165,8 @@ func TestReconciler_Reconcile(t *testing.T) {
 	t.Run("PullSecretHashContract", scenarioPullSecretHashContract)
 	t.Run("TrustBundleRotationMovesIdentity", scenarioTrustBundleRotationMovesIdentity)
 	t.Run("MissingConfigMapRequeues", scenarioMissingConfigMapRequeues)
+	t.Run("ReleaseVersionNotPullspec", scenarioReleaseVersionNotPullspec)
+	t.Run("FullConfigAndCloudConfigHashes", scenarioFullConfigAndCloudConfigHashes)
 }
 
 func scenarioRolloutThenRefresh(t *testing.T) {
@@ -222,4 +279,109 @@ func scenarioInvalidConfigNoRollout(t *testing.T) {
 	g.Expect(cr.Status.Current.UserDataSecretName).To(BeEmpty(), "no userData authored for invalid config")
 	g.Expect(cr.Status.Current.RolloutGeneration).To(Equal(int64(0)), "no rollout for invalid config")
 	g.Expect(fp.calls).To(Equal(0), "no render for invalid config")
+}
+
+// scenarioReleaseVersionNotPullspec: the hashes key on the resolved release Version(), not the
+// pullspec, so a re-tag to the same version does not roll, a new version does, and a Lookup failure
+// is transient (not a validation failure).
+func scenarioReleaseVersionNotPullspec(t *testing.T) {
+	g := NewWithT(t)
+	r, c, _ := newTestReconciler(t,
+		testCR(), pullSecret("ps"),
+		cfgMap(testNS, "user-a", mc("00-user-a")),
+		cfgMap(testNS, "core-fips", mc("00-core-fips")),
+		cfgMap(testNS, "haproxy", mc("00-haproxy")),
+	)
+	frp := r.ReleaseProvider.(*fakeReleaseProvider)
+	frp.versions = map[string]string{}
+
+	reconcileCR(t, r)
+	cr := getCR(t, c)
+	g.Expect(cr.Status.Current.RolloutGeneration).To(Equal(int64(1)))
+	roll1 := cr.Status.Current.RolloutHash
+
+	// A different pullspec resolving to the SAME version must not roll.
+	frp.versions["quay.io/ocp@sha256:same"] = "4.23.0"
+	cr.Spec.ReleaseImage = "quay.io/ocp@sha256:same"
+	g.Expect(c.Update(context.Background(), cr)).To(Succeed())
+	reconcileCR(t, r)
+	cr = getCR(t, c)
+	g.Expect(cr.Status.Current.RolloutGeneration).To(Equal(int64(1)), "same resolved version must not roll")
+	g.Expect(cr.Status.Current.RolloutHash).To(Equal(roll1))
+
+	// A pullspec resolving to a DIFFERENT version rolls.
+	frp.versions["quay.io/ocp@sha256:newver"] = "4.24.0"
+	cr.Spec.ReleaseImage = "quay.io/ocp@sha256:newver"
+	g.Expect(c.Update(context.Background(), cr)).To(Succeed())
+	reconcileCR(t, r)
+	cr = getCR(t, c)
+	g.Expect(cr.Status.Current.RolloutGeneration).To(Equal(int64(2)), "new resolved version must roll")
+	g.Expect(cr.Status.Current.RolloutHash).ToNot(Equal(roll1))
+
+	// A Lookup failure is transient: the reconcile errors and does not mark the config invalid.
+	frp.err = fmt.Errorf("registry unavailable")
+	cr.Spec.ReleaseImage = "quay.io/ocp@sha256:another"
+	g.Expect(c.Update(context.Background(), cr)).To(Succeed())
+	_, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKey{Namespace: testNS, Name: "np-1"}})
+	g.Expect(err).To(HaveOccurred())
+	cr = getCR(t, c)
+	g.Expect(cr.Status.Current.RolloutGeneration).To(Equal(int64(2)), "lookup failure must not advance generation")
+	g.Expect(apimeta.IsStatusConditionFalse(cr.Status.Conditions, "PayloadGenerated")).To(BeFalse(), "lookup failure is not a validation failure")
+}
+
+// scenarioFullConfigAndCloudConfigHashes: the generator computes the MCS gate hash from the
+// in-namespace HCP (matching GetBackwardCompatibleConfigHash, so CPO's freshness gate accepts the
+// render) and the cloud-config hash from the platform provider config; both feed the payload
+// identity (refresh) but never the rollout hash.
+func scenarioFullConfigAndCloudConfigHashes(t *testing.T) {
+	g := NewWithT(t)
+	r, c, fp := newTestReconciler(t,
+		testCR(), pullSecret("ps"),
+		cfgMap(testNS, "user-a", mc("00-user-a")),
+		cfgMap(testNS, "core-fips", mc("00-core-fips")),
+		cfgMap(testNS, "haproxy", mc("00-haproxy")),
+	)
+
+	reconcileCR(t, r)
+	cr := getCR(t, c)
+	g.Expect(cr.Status.Current.RolloutGeneration).To(Equal(int64(1)))
+	roll1 := cr.Status.Current.RolloutHash
+
+	// The gate hash passed to GetPayload equals GetBackwardCompatibleConfigHash(hcp config), so CPO's
+	// machine-config-server freshness gate accepts the render; AWS has no cloud-config hash.
+	wantGate, err := backwardcompat.GetBackwardCompatibleConfigHash(testHCP().Spec.Configuration)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(fp.lastHCConfigHash).To(Equal(wantGate))
+	g.Expect(fp.lastCloudConfigHash).To(BeEmpty(), "AWS has no cloud-config hash")
+
+	// A change to hcp.Spec.Configuration refreshes the payload (identity) but does NOT roll.
+	live := &hyperv1.HostedControlPlane{}
+	g.Expect(c.Get(context.Background(), client.ObjectKey{Namespace: testNS, Name: "hcp"}, live)).To(Succeed())
+	live.Spec.Configuration = &hyperv1.ClusterConfiguration{Authentication: &configv1.AuthenticationSpec{ServiceAccountIssuer: "https://issuer.example"}}
+	g.Expect(c.Update(context.Background(), live)).To(Succeed())
+	callsBefore := fp.calls
+	reconcileCR(t, r)
+	cr = getCR(t, c)
+	g.Expect(cr.Status.Current.RolloutGeneration).To(Equal(int64(1)), "full-config change must not roll")
+	g.Expect(cr.Status.Current.RolloutHash).To(Equal(roll1))
+	g.Expect(fp.calls).To(Equal(callsBefore+1), "full-config change refreshes the payload")
+
+	// An Azure platform with a cloud-config ConfigMap yields a non-empty cloud hash feeding identity.
+	azureCM := manifests.AzureProviderConfig(testNS)
+	azureCM.Data = map[string]string{"config": "azure-cloud-config"}
+	azureHCP := &hyperv1.HostedControlPlane{
+		ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "hcp"},
+		Spec: hyperv1.HostedControlPlaneSpec{
+			Configuration: &hyperv1.ClusterConfiguration{},
+			Platform:      hyperv1.PlatformSpec{Type: hyperv1.AzurePlatform},
+		},
+	}
+	r2, _, fp2 := newTestReconciler(t, azureHCP, azureCM,
+		testCR(), pullSecret("ps"),
+		cfgMap(testNS, "user-a", mc("00-user-a")),
+		cfgMap(testNS, "core-fips", mc("00-core-fips")),
+		cfgMap(testNS, "haproxy", mc("00-haproxy")),
+	)
+	reconcileCR(t, r2)
+	g.Expect(fp2.lastCloudConfigHash).ToNot(BeEmpty(), "Azure cloud-config must produce a cloud hash")
 }
