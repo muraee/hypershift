@@ -27,30 +27,8 @@ func (ign *ignitionServer) adaptDeployment(cpContext component.WorkloadContext, 
 		return err
 	}
 
-	if hcp.Spec.Configuration != nil && hcp.Spec.Configuration.FeatureGate != nil {
-		featureGate := &configv1.FeatureGate{
-			TypeMeta: metav1.TypeMeta{
-				Kind:       "FeatureGate",
-				APIVersion: configv1.GroupVersion.String(),
-			},
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "cluster",
-			},
-			Spec: *hcp.Spec.Configuration.FeatureGate,
-		}
-
-		featureGateBuffer := &bytes.Buffer{}
-		if err := api.YamlSerializer.Encode(featureGate, featureGateBuffer); err != nil {
-			return fmt.Errorf("failed to encode feature gates: %w", err)
-		}
-		featureGateYAML := featureGateBuffer.String()
-
-		podspec.UpdateContainer("fetch-feature-gate", deployment.Spec.Template.Spec.InitContainers, func(c *corev1.Container) {
-			podspec.UpsertEnvVar(c, corev1.EnvVar{
-				Name:  "FEATURE_GATE_YAML",
-				Value: featureGateYAML,
-			})
-		})
+	if err := injectFeatureGateManifest(cpContext, deployment); err != nil {
+		return err
 	}
 
 	podspec.UpdateContainer(ComponentName, deployment.Spec.Template.Spec.Containers, func(c *corev1.Container) {
@@ -82,5 +60,41 @@ func (ign *ignitionServer) adaptDeployment(cpContext component.WorkloadContext, 
 		})
 	}
 
+	return nil
+}
+
+// injectFeatureGateManifest renders the hosted cluster's FeatureGate into the fetch-feature-gate init
+// container so the generation half (monolith server today, generator component in the split model) can
+// evaluate release-image feature gates while authoring payloads. It is a no-op when the hosted cluster
+// has no FeatureGate configuration. Shared by the serving component (legacy mode) and the generator.
+func injectFeatureGateManifest(cpContext component.WorkloadContext, deployment *appsv1.Deployment) error {
+	hcp := cpContext.HCP
+	if hcp.Spec.Configuration == nil || hcp.Spec.Configuration.FeatureGate == nil {
+		return nil
+	}
+
+	featureGate := &configv1.FeatureGate{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "FeatureGate",
+			APIVersion: configv1.GroupVersion.String(),
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "cluster",
+		},
+		Spec: *hcp.Spec.Configuration.FeatureGate,
+	}
+
+	featureGateBuffer := &bytes.Buffer{}
+	if err := api.YamlSerializer.Encode(featureGate, featureGateBuffer); err != nil {
+		return fmt.Errorf("failed to encode feature gates: %w", err)
+	}
+	featureGateYAML := featureGateBuffer.String()
+
+	podspec.UpdateContainer("fetch-feature-gate", deployment.Spec.Template.Spec.InitContainers, func(c *corev1.Container) {
+		podspec.UpsertEnvVar(c, corev1.EnvVar{
+			Name:  "FEATURE_GATE_YAML",
+			Value: featureGateYAML,
+		})
+	})
 	return nil
 }
