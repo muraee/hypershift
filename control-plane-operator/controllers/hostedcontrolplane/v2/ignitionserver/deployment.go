@@ -21,6 +21,10 @@ import (
 )
 
 func (ign *ignitionServer) adaptDeployment(cpContext component.WorkloadContext, deployment *appsv1.Deployment) error {
+	if ign.newModel {
+		return ign.adaptServingDeployment(cpContext, deployment)
+	}
+
 	hcp := cpContext.HCP
 	tlsArgs, err := config.TLSArgs(hcp.Spec.Configuration.GetTLSSecurityProfile())
 	if err != nil {

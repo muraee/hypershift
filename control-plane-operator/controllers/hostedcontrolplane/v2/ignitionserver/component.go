@@ -15,6 +15,15 @@ var _ component.ComponentOptions = &ignitionServer{}
 type ignitionServer struct {
 	releaseProvider      releaseinfo.ProviderWithOpenShiftImageRegistryOverrides
 	defaultIngressDomain string
+
+	// newModel selects the stateless serving tier of the split ignition system (HyperShift Operator
+	// image, ignition-payload-server subcommand, token-verification key) instead of the legacy
+	// generation+serving monolith (control-plane-operator image, ignition-server subcommand). Both
+	// share the ignition-server component name, asset directory, Service, Route and serving PKI, so the
+	// node-facing endpoint and CA are unchanged across the cutover.
+	newModel bool
+	// hypershiftOperatorImage is the image the serving tier runs in new-model mode; empty in legacy mode.
+	hypershiftOperatorImage string
 }
 
 // IsRequestServing implements controlplanecomponent.ComponentOptions.
@@ -32,14 +41,29 @@ func (r *ignitionServer) NeedsManagementKASAccess() bool {
 	return true
 }
 
+// NewComponent builds the legacy generation+serving ignition monolith reconciled by the CPO from the
+// control-plane release payload.
 func NewComponent(releaseProvider releaseinfo.ProviderWithOpenShiftImageRegistryOverrides, defaultIngressDomain string) component.ControlPlaneComponent {
-	ignition := &ignitionServer{
+	return (&ignitionServer{
 		releaseProvider:      releaseProvider,
 		defaultIngressDomain: defaultIngressDomain,
-	}
+	}).build()
+}
 
-	return component.NewDeploymentComponent(ComponentName, ignition).
-		WithAdaptFunction(ignition.adaptDeployment).
+// NewServerComponent builds the stateless serving tier of the split ignition system, reconciled by the
+// HyperShift Operator from its own image. It reuses the ignition-server component name, asset directory,
+// Service, Route and serving PKI, so the node-facing endpoint and CA do not change across the cutover.
+func NewServerComponent(hypershiftOperatorImage, defaultIngressDomain string) component.ControlPlaneComponent {
+	return (&ignitionServer{
+		newModel:                true,
+		hypershiftOperatorImage: hypershiftOperatorImage,
+		defaultIngressDomain:    defaultIngressDomain,
+	}).build()
+}
+
+func (ign *ignitionServer) build() component.ControlPlaneComponent {
+	builder := component.NewDeploymentComponent(ComponentName, ign).
+		WithAdaptFunction(ign.adaptDeployment).
 		WithPredicate(predicate).
 		WithManifestAdapter(
 			"service.yaml",
@@ -51,7 +75,7 @@ func NewComponent(releaseProvider releaseinfo.ProviderWithOpenShiftImageRegistry
 		).
 		WithManifestAdapter(
 			"route.yaml",
-			component.WithAdaptFunction(ignition.adaptRoute),
+			component.WithAdaptFunction(ign.adaptRoute),
 			component.WithPredicate(routePredicate),
 		).
 		WithManifestAdapter(
@@ -65,8 +89,18 @@ func NewComponent(releaseProvider releaseinfo.ProviderWithOpenShiftImageRegistry
 			component.WithAdaptFunction(adaptServingCertSecret),
 			component.DisableIfAnnotationExist(hyperv1.DisablePKIReconciliationAnnotation),
 			component.ReconcileExisting(),
-		).
-		Build()
+		)
+
+	// The stateless serving tier needs only to read the PayloadStore and record IgnitionReached; it
+	// drops the monolith's config/hostedcontrolplanes access. Legacy mode keeps the asset role as-is.
+	if ign.newModel {
+		builder = builder.WithManifestAdapter(
+			"role.yaml",
+			component.WithAdaptFunction(adaptServerRole),
+		)
+	}
+
+	return builder.Build()
 }
 
 func predicate(cpContext component.WorkloadContext) (bool, error) {
