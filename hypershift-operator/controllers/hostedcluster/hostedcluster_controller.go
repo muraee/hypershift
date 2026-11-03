@@ -146,6 +146,12 @@ const (
 	useRestrictedPodSecurityLabel                              = "io.openshift.hypershift.restricted-psa"
 	defaultToControlPlaneV2Label                               = "io.openshift.hypershift.control-plane-operator.v2-isdefault"
 	controlPlaneOperatorSupportsDeterministicLBLabel           = "io.openshift.hypershift.control-plane-operator-supports-deterministic-lb"
+	// controlPlaneOperatorSupportsIgnitionPayloadSystemLabel marks a CPO image whose control plane
+	// stands its ignition-server/-proxy components down so the HyperShift Operator can own the
+	// re-architected (split) ignition system. The HO only deploys the HO-side ignition components for a
+	// HostedCluster whose CPO advertises this, so enabling the gate on a fleet with older control planes
+	// does not double-run ignition or strand clusters whose CPO cannot stand down.
+	controlPlaneOperatorSupportsIgnitionPayloadSystemLabel = "io.openshift.hypershift.control-plane-operator-supports-ignition-payload-system"
 
 	apiOpenShiftComLabelPrefix = "api.openshift.com/"
 
@@ -1680,7 +1686,7 @@ func (r *HostedClusterReconciler) reconcile(ctx context.Context, req ctrl.Reques
 	report.executeOrBlock("OperatorDeployments", func() error {
 		return r.reconcileOperatorDeployments(ctx, createOrUpdate, hcluster, hcp, controlPlaneNamespace, p,
 			controlPlaneOperatorImage, utilitiesImage,
-			cpoHasUtilities, r.CertRotationScale, releaseImage, releaseImageVersion, releaseProvider)
+			cpoHasUtilities, r.CertRotationScale, releaseImage, releaseImageVersion, releaseProvider, controlPlaneOperatorImageLabels)
 	})
 
 	report.executeOrBlock("RBACAndPolicies", func() error {
@@ -1852,6 +1858,7 @@ func (r *HostedClusterReconciler) reconcileOperatorDeployments(ctx context.Conte
 	releaseImage *releaseinfo.ReleaseImage,
 	releaseImageVersion semver.Version,
 	releaseProvider releaseinfo.ProviderWithOpenShiftImageRegistryOverrides,
+	controlPlaneOperatorImageLabels map[string]string,
 ) error {
 	var errs []error
 
@@ -1898,8 +1905,12 @@ func (r *HostedClusterReconciler) reconcileOperatorDeployments(ctx context.Conte
 		errs = append(errs, fmt.Errorf("failed to reconcile karpenter operator: %w", err))
 	}
 	// When the re-architected ignition system is enabled, the HO owns the ignition components (the CPO
-	// stands them down via feature-set mutual exclusion). Gate the call so legacy clusters are untouched.
-	if featuregate.Gate().Enabled(featuregate.IgnitionPayloadSystem) {
+	// stands them down via feature-set mutual exclusion). Gate the call so legacy clusters are untouched,
+	// and additionally require the CPO to advertise support for the split system (via its image label):
+	// a HostedCluster on an older control plane whose CPO cannot stand ignition down must keep the
+	// CPO-managed components, so the HO must not also deploy its own.
+	_, cpoSupportsIgnitionPayloadSystem := controlPlaneOperatorImageLabels[controlPlaneOperatorSupportsIgnitionPayloadSystemLabel]
+	if featuregate.Gate().Enabled(featuregate.IgnitionPayloadSystem) && cpoSupportsIgnitionPayloadSystem {
 		if err := r.reconcileIgnitionPayloadComponents(cpContext,
 			r.HypershiftOperatorImage, releaseProvider); err != nil {
 			errs = append(errs, fmt.Errorf("failed to reconcile ignition payload components: %w", err))
