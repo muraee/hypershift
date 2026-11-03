@@ -83,6 +83,15 @@ func doGet(h http.HandlerFunc, path, token, gen string) *httptest.ResponseRecord
 	return rec
 }
 
+func TestHandleHealthz(t *testing.T) {
+	g := NewWithT(t)
+	s := &Server{Namespace: testNS}
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/healthz", nil)
+	rec := httptest.NewRecorder()
+	s.HandleHealthz(rec, req)
+	g.Expect(rec.Code).To(Equal(http.StatusOK))
+}
+
 func TestServe(t *testing.T) {
 	g := NewWithT(t)
 	key := testKey(t)
