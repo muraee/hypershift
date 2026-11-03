@@ -637,39 +637,54 @@ func (c *CAPI) propagateVersionAndTemplate(log logr.Logger, machineDeployment *c
 		specUpdated = true
 	}
 
-	// Bootstrap secret: the secret name encodes the full config Hash() including
-	// management-side content, so UserDataSecret().Name changes on any input
-	// change — even management-side-only ones like HAProxy image bumps. We must
-	// only propagate a new secret name when a spec-driven change occurred (version
-	// upgrade or rollout config change), otherwise we'd point the MachineDeployment
-	// at a secret that was never created (Token.isOutdated() skips creation for
-	// management-side-only changes).
-	versionChanged := specUpdated // at this point, specUpdated is true only if version changed
-	currentRolloutConfigHash := c.nodePool.Annotations[nodePoolAnnotationCurrentRolloutConfig]
-	rolloutConfigChanged := currentRolloutConfigHash != "" && c.RolloutHashWithoutVersion() != currentRolloutConfigHash
-	inProgressRollout := c.rolloutTargetHash()
-	revertPending := inProgressRollout != "" && c.RolloutHash() != inProgressRollout
-	if versionChanged || rolloutConfigChanged || revertPending {
-		_, effectiveUserData := c.secretsForHash(c.EffectiveHash())
-		targetDataSecretName := effectiveUserData.Name
-		if targetDataSecretName != ptr.Deref(machineDeployment.Spec.Template.Spec.Bootstrap.DataSecretName, "") {
-			log.Info("New user data Secret has been generated",
+	// Bootstrap secret. On the gate-ON IgnitionPayload path the consumer owns userdata naming
+	// (adoption / canonical re-point), so bypass the legacy hash-driven state machine entirely and
+	// point the MachineDeployment at the name the consumer decided. An empty override means no payload
+	// is published yet — leave the existing DataSecretName untouched and let the reconcile requeue.
+	if c.ignitionPayloadConsumerActive {
+		if c.userDataSecretNameOverride != "" &&
+			c.userDataSecretNameOverride != ptr.Deref(machineDeployment.Spec.Template.Spec.Bootstrap.DataSecretName, "") {
+			log.Info("Re-pointing MachineDeployment at the IgnitionPayload userdata Secret",
 				"current", machineDeployment.Spec.Template.Spec.Bootstrap.DataSecretName,
-				"target", targetDataSecretName)
-			machineDeployment.Spec.Template.Spec.Bootstrap.DataSecretName = ptr.To(targetDataSecretName)
+				"target", c.userDataSecretNameOverride)
+			machineDeployment.Spec.Template.Spec.Bootstrap.DataSecretName = ptr.To(c.userDataSecretNameOverride)
 			specUpdated = true
 		}
-		if c.nodePool.Annotations == nil {
-			c.nodePool.Annotations = make(map[string]string)
+	} else {
+		// The secret name encodes the full config Hash() including
+		// management-side content, so UserDataSecret().Name changes on any input
+		// change — even management-side-only ones like HAProxy image bumps. We must
+		// only propagate a new secret name when a spec-driven change occurred (version
+		// upgrade or rollout config change), otherwise we'd point the MachineDeployment
+		// at a secret that was never created (Token.isOutdated() skips creation for
+		// management-side-only changes).
+		versionChanged := specUpdated // at this point, specUpdated is true only if version changed
+		currentRolloutConfigHash := c.nodePool.Annotations[nodePoolAnnotationCurrentRolloutConfig]
+		rolloutConfigChanged := currentRolloutConfigHash != "" && c.RolloutHashWithoutVersion() != currentRolloutConfigHash
+		inProgressRollout := c.rolloutTargetHash()
+		revertPending := inProgressRollout != "" && c.RolloutHash() != inProgressRollout
+		if versionChanged || rolloutConfigChanged || revertPending {
+			_, effectiveUserData := c.secretsForHash(c.EffectiveHash())
+			targetDataSecretName := effectiveUserData.Name
+			if targetDataSecretName != ptr.Deref(machineDeployment.Spec.Template.Spec.Bootstrap.DataSecretName, "") {
+				log.Info("New user data Secret has been generated",
+					"current", machineDeployment.Spec.Template.Spec.Bootstrap.DataSecretName,
+					"target", targetDataSecretName)
+				machineDeployment.Spec.Template.Spec.Bootstrap.DataSecretName = ptr.To(targetDataSecretName)
+				specUpdated = true
+			}
+			if c.nodePool.Annotations == nil {
+				c.nodePool.Annotations = make(map[string]string)
+			}
+			c.nodePool.Annotations[nodePoolAnnotationInProgressRolloutConfig] = c.RolloutHash()
 		}
-		c.nodePool.Annotations[nodePoolAnnotationInProgressRolloutConfig] = c.RolloutHash()
+		// Persist request identity with the bootstrap reference, including when
+		// adopting an existing workload. This is metadata, not template content.
+		if machineDeployment.Annotations == nil {
+			machineDeployment.Annotations = make(map[string]string)
+		}
+		machineDeployment.Annotations[nodePoolAnnotationTargetRolloutConfig] = c.RolloutHash()
 	}
-	// Persist request identity with the bootstrap reference, including when
-	// adopting an existing workload. This is metadata, not template content.
-	if machineDeployment.Annotations == nil {
-		machineDeployment.Annotations = make(map[string]string)
-	}
-	machineDeployment.Annotations[nodePoolAnnotationTargetRolloutConfig] = c.RolloutHash()
 
 	// Infrastructure template: compared against the MachineDeployment's current
 	// infrastructure ref. A mismatch means a platform-level change (e.g. AMI,
@@ -702,47 +717,73 @@ func (c *CAPI) propagateVersionAndTemplateToMachineSet(log logr.Logger, machineS
 		specUpdated = true
 	}
 
-	// Bootstrap secret: same gate as propagateVersionAndTemplate — only propagate
-	// when a spec-driven change occurred. See propagateVersionAndTemplate for
-	// full rationale.
-	versionChanged := specUpdated
-	currentRolloutConfigHash := c.nodePool.Annotations[nodePoolAnnotationCurrentRolloutConfig]
-	rolloutConfigChanged := currentRolloutConfigHash != "" && c.RolloutHashWithoutVersion() != currentRolloutConfigHash
-	inProgressRollout := c.rolloutTargetHash()
-	revertPending := inProgressRollout != "" && c.RolloutHash() != inProgressRollout
-	if versionChanged || rolloutConfigChanged || revertPending {
-		_, effectiveUserData := c.secretsForHash(c.EffectiveHash())
-		targetDataSecretName := effectiveUserData.Name
-		if targetDataSecretName != ptr.Deref(machineSet.Spec.Template.Spec.Bootstrap.DataSecretName, "") {
-			if rolloutConfigChanged {
-				log.Info("Starting config upgrade: Propagating new config to the MachineSet",
-					"current", currentRolloutConfigHash, "target", c.RolloutHashWithoutVersion())
-			}
-			log.Info("New user data Secret has been generated",
+	if c.ignitionPayloadConsumerActive {
+		// Gate-ON: the consumer owns userdata naming. Re-point at the override when set (empty = no
+		// payload yet, leave untouched). For InPlace, HCCO keys on the targetConfigVersion annotation
+		// (token-<machineSet>-<configVersion>); stamp it only for a genuine rollout
+		// (inPlaceConfigVersionOverride set) — during adoption it stays empty so already-joined nodes
+		// are not rebooted. A brand-new MachineSet still gets its currentConfigVersion initialized so
+		// the first in-place evaluation is a no-op.
+		if machineSet.Annotations == nil {
+			machineSet.Annotations = make(map[string]string)
+		}
+		if c.userDataSecretNameOverride != "" &&
+			c.userDataSecretNameOverride != ptr.Deref(machineSet.Spec.Template.Spec.Bootstrap.DataSecretName, "") {
+			log.Info("Re-pointing MachineSet at the IgnitionPayload userdata Secret",
 				"current", machineSet.Spec.Template.Spec.Bootstrap.DataSecretName,
-				"target", targetDataSecretName)
-			machineSet.Spec.Template.Spec.Bootstrap.DataSecretName = ptr.To(targetDataSecretName)
+				"target", c.userDataSecretNameOverride)
+			machineSet.Spec.Template.Spec.Bootstrap.DataSecretName = ptr.To(c.userDataSecretNameOverride)
 			specUpdated = true
 		}
+		if c.inPlaceConfigVersionOverride != "" {
+			machineSet.Annotations[nodePoolAnnotationTargetConfigVersion] = c.inPlaceConfigVersionOverride
+			if _, ok := machineSet.Annotations[nodePoolAnnotationCurrentConfigVersion]; !ok {
+				machineSet.Annotations[nodePoolAnnotationCurrentConfigVersion] = c.inPlaceConfigVersionOverride
+			}
+		}
+	} else {
+		// Bootstrap secret: same gate as propagateVersionAndTemplate — only propagate
+		// when a spec-driven change occurred. See propagateVersionAndTemplate for
+		// full rationale.
+		versionChanged := specUpdated
+		currentRolloutConfigHash := c.nodePool.Annotations[nodePoolAnnotationCurrentRolloutConfig]
+		rolloutConfigChanged := currentRolloutConfigHash != "" && c.RolloutHashWithoutVersion() != currentRolloutConfigHash
+		inProgressRollout := c.rolloutTargetHash()
+		revertPending := inProgressRollout != "" && c.RolloutHash() != inProgressRollout
+		if versionChanged || rolloutConfigChanged || revertPending {
+			_, effectiveUserData := c.secretsForHash(c.EffectiveHash())
+			targetDataSecretName := effectiveUserData.Name
+			if targetDataSecretName != ptr.Deref(machineSet.Spec.Template.Spec.Bootstrap.DataSecretName, "") {
+				if rolloutConfigChanged {
+					log.Info("Starting config upgrade: Propagating new config to the MachineSet",
+						"current", currentRolloutConfigHash, "target", c.RolloutHashWithoutVersion())
+				}
+				log.Info("New user data Secret has been generated",
+					"current", machineSet.Spec.Template.Spec.Bootstrap.DataSecretName,
+					"target", targetDataSecretName)
+				machineSet.Spec.Template.Spec.Bootstrap.DataSecretName = ptr.To(targetDataSecretName)
+				specUpdated = true
+			}
 
-		// In-place upgrade annotations (MachineSet-specific): signal the in-place
-		// upgrader when a version or config change is detected. For brand-new
-		// MachineSets, also initialize the current config version so the upgrade
-		// is a no-op.
-		targetConfigVersionHash := c.EffectiveHash()
-		machineSet.Annotations[nodePoolAnnotationTargetConfigVersion] = targetConfigVersionHash
-		if _, ok := machineSet.Annotations[nodePoolAnnotationCurrentConfigVersion]; !ok {
-			machineSet.Annotations[nodePoolAnnotationCurrentConfigVersion] = targetConfigVersionHash
+			// In-place upgrade annotations (MachineSet-specific): signal the in-place
+			// upgrader when a version or config change is detected. For brand-new
+			// MachineSets, also initialize the current config version so the upgrade
+			// is a no-op.
+			targetConfigVersionHash := c.EffectiveHash()
+			machineSet.Annotations[nodePoolAnnotationTargetConfigVersion] = targetConfigVersionHash
+			if _, ok := machineSet.Annotations[nodePoolAnnotationCurrentConfigVersion]; !ok {
+				machineSet.Annotations[nodePoolAnnotationCurrentConfigVersion] = targetConfigVersionHash
+			}
+			if c.nodePool.Annotations == nil {
+				c.nodePool.Annotations = make(map[string]string)
+			}
+			c.nodePool.Annotations[nodePoolAnnotationInProgressRolloutConfig] = c.RolloutHash()
 		}
-		if c.nodePool.Annotations == nil {
-			c.nodePool.Annotations = make(map[string]string)
+		if machineSet.Annotations == nil {
+			machineSet.Annotations = make(map[string]string)
 		}
-		c.nodePool.Annotations[nodePoolAnnotationInProgressRolloutConfig] = c.RolloutHash()
+		machineSet.Annotations[nodePoolAnnotationTargetRolloutConfig] = c.RolloutHash()
 	}
-	if machineSet.Annotations == nil {
-		machineSet.Annotations = make(map[string]string)
-	}
-	machineSet.Annotations[nodePoolAnnotationTargetRolloutConfig] = c.RolloutHash()
 
 	// Infrastructure template: compared against the MachineSet's current
 	// infrastructure ref.
