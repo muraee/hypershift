@@ -1400,6 +1400,31 @@ func (c *CAPI) machineSet() *capiv1.MachineSet {
 	}
 }
 
+// currentUserDataSecretName returns the pool's live CAPI Bootstrap.DataSecretName, read from the
+// MachineDeployment (Replace) or MachineSet (InPlace), or "" when the workload or its bootstrap ref
+// does not exist yet. The IgnitionPayload consumer adopts off this live name so an already-provisioned
+// pool keeps its exact userdata name across gate enablement (no roll).
+func (c *CAPI) currentUserDataSecretName(ctx context.Context) (string, error) {
+	if c.nodePool.Spec.Management.UpgradeType == hyperv1.UpgradeTypeInPlace {
+		ms := c.machineSet()
+		if err := c.Get(ctx, client.ObjectKeyFromObject(ms), ms); err != nil {
+			if apierrors.IsNotFound(err) {
+				return "", nil
+			}
+			return "", err
+		}
+		return ptr.Deref(ms.Spec.Template.Spec.Bootstrap.DataSecretName, ""), nil
+	}
+	md := c.machineDeployment()
+	if err := c.Get(ctx, client.ObjectKeyFromObject(md), md); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	return ptr.Deref(md.Spec.Template.Spec.Bootstrap.DataSecretName, ""), nil
+}
+
 func (c *CAPI) machineHealthCheck() *capiv1.MachineHealthCheck {
 	return &capiv1.MachineHealthCheck{
 		TypeMeta: metav1.TypeMeta{},

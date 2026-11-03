@@ -125,11 +125,11 @@ func TestReconcileIgnitionPayloadConsumer(t *testing.T) {
 			machineSetName:          "np-1",
 		}
 
-		// The consumer returns the generator-authored userData Secret name from status.current; it
-		// never mints userdata itself.
-		userDataName, err := reconcileIgnitionPayloadConsumer(ctx, c, store, nodePool, hc, in)
+		// A never-provisioned pool (no existing DataSecretName) is born on the generator's canonical
+		// userData Secret name from status.current; the consumer never mints userdata itself.
+		decision, err := reconcileIgnitionPayloadConsumer(ctx, c, store, nodePool, hc, in)
 		g.Expect(err).ToNot(HaveOccurred())
-		g.Expect(userDataName).To(Equal("np-1-1"))
+		g.Expect(decision.userDataSecretName).To(Equal("np-1-1"))
 
 		// CR spec authored with the classified refs + endpoint rollout input + finalizer; status
 		// preserved.
@@ -187,10 +187,10 @@ func TestReconcileIgnitionPayloadConsumer(t *testing.T) {
 		store := payloadstore.NewMemStore()
 
 		in := ignitionConsumerInputs{releaseVersion: "4.23.0", haproxyRaw: "h", machineSetName: "np-1"}
-		// No status.current yet: the consumer authors the CR but returns no userData Secret name.
-		userDataName, err := reconcileIgnitionPayloadConsumer(ctx, c, store, nodePool, hc, in)
+		// No status.current yet: the consumer authors the CR but returns the zero adoption decision.
+		decision, err := reconcileIgnitionPayloadConsumer(ctx, c, store, nodePool, hc, in)
 		g.Expect(err).ToNot(HaveOccurred())
-		g.Expect(userDataName).To(BeEmpty())
+		g.Expect(decision.userDataSecretName).To(BeEmpty())
 		g.Expect(c.Get(ctx, client.ObjectKey{Namespace: hcpNS, Name: "np-1"}, &hyperv1.IgnitionPayload{})).To(Succeed())
 	})
 }
