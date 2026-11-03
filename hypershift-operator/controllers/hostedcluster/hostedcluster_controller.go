@@ -49,6 +49,7 @@ import (
 	"github.com/openshift/hypershift/hypershift-operator/controllers/manifests/controlplaneoperator"
 	controlplanepkioperatormanifests "github.com/openshift/hypershift/hypershift-operator/controllers/manifests/controlplanepkioperator"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/manifests/ignitionserver"
+	"github.com/openshift/hypershift/hypershift-operator/featuregate"
 	kvinfra "github.com/openshift/hypershift/kubevirtexternalinfra"
 	cpconst "github.com/openshift/hypershift/pkg/controlplane"
 	pkgmanifests "github.com/openshift/hypershift/pkg/manifests"
@@ -1895,6 +1896,14 @@ func (r *HostedClusterReconciler) reconcileOperatorDeployments(ctx context.Conte
 	if err := r.reconcileKarpenterOperator(cpContext, hcluster,
 		r.HypershiftOperatorImage, controlPlaneOperatorImage); err != nil {
 		errs = append(errs, fmt.Errorf("failed to reconcile karpenter operator: %w", err))
+	}
+	// When the re-architected ignition system is enabled, the HO owns the ignition components (the CPO
+	// stands them down via feature-set mutual exclusion). Gate the call so legacy clusters are untouched.
+	if featuregate.Gate().Enabled(featuregate.IgnitionPayloadSystem) {
+		if err := r.reconcileIgnitionPayloadComponents(cpContext,
+			r.HypershiftOperatorImage, releaseProvider); err != nil {
+			errs = append(errs, fmt.Errorf("failed to reconcile ignition payload components: %w", err))
+		}
 	}
 	return utilerrors.NewAggregate(errs)
 }
