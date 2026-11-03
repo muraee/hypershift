@@ -7,9 +7,12 @@ import (
 	. "github.com/onsi/gomega"
 
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
+	"github.com/openshift/hypershift/hypershift-operator/featuregate"
 	pkgmanifests "github.com/openshift/hypershift/pkg/manifests"
 	"github.com/openshift/hypershift/support/api"
 	payloadstore "github.com/openshift/hypershift/support/ignitionpayload"
+
+	configv1 "github.com/openshift/api/config/v1"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -18,6 +21,27 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
+
+// TestIgnitionPayloadConsumerEnabled is serial (no t.Parallel): it mutates the global management
+// feature gate and restores it on return. Top-level tests run sequentially, so the flip is not observed
+// by other tests.
+func TestIgnitionPayloadConsumerEnabled(t *testing.T) {
+	g := NewWithT(t)
+	defer featuregate.ConfigureFeatureSet(string(configv1.Default))
+
+	hc := &hyperv1.HostedCluster{}
+	disabled := &hyperv1.HostedCluster{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{hyperv1.DisableIgnitionServerAnnotation: "true"}},
+	}
+
+	featuregate.ConfigureFeatureSet(string(configv1.Default))
+	g.Expect(ignitionPayloadConsumerEnabled(hc, true)).To(BeFalse(), "gate off ⇒ legacy path")
+
+	featuregate.ConfigureFeatureSet(string(configv1.TechPreviewNoUpgrade))
+	g.Expect(ignitionPayloadConsumerEnabled(hc, true)).To(BeTrue(), "gate on + CPO supports split ignition ⇒ new path")
+	g.Expect(ignitionPayloadConsumerEnabled(hc, false)).To(BeFalse(), "gate on but CPO lacks split-ignition support ⇒ legacy path")
+	g.Expect(ignitionPayloadConsumerEnabled(disabled, true)).To(BeFalse(), "ignition disabled on the HC ⇒ legacy path")
+}
 
 func TestEnqueueNodePoolForIgnitionPayload(t *testing.T) {
 	g := NewWithT(t)
