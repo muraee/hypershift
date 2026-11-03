@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	"github.com/openshift/hypershift/hypershift-operator/featuregate"
@@ -93,8 +94,15 @@ func (r *NodePoolReconciler) reconcileIgnitionPayloadConsumerForNodePool(ctx con
 
 	token.userDataSecretNameOverride = decision.userDataSecretName
 	token.inPlaceConfigVersionOverride = decision.inPlaceConfigVersion
-	// TODO(phase5c): decision.sweepInFlight drives the one-shot in-flight Machine sweep (recreate
-	// not-yet-joined Machines carrying stale userdata). Added in the following commit.
+
+	// On the one adoption reconcile, recreate not-yet-joined Machines that baked in stale userdata
+	// before the content was refreshed in place. The cutoff is taken after the consumer copied the
+	// content, so Machines created afterward (new userdata) are never candidates.
+	if decision.sweepInFlight {
+		if err := capi.sweepInFlightMachines(ctx, time.Now()); err != nil {
+			return fmt.Errorf("failed to sweep in-flight Machines during adoption: %w", err)
+		}
+	}
 	return nil
 }
 

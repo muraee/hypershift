@@ -4015,6 +4015,50 @@ func TestReconcileMachineSetStatus(t *testing.T) {
 	})
 }
 
+func TestSweepInFlightMachines(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	const ns = "hcp-ns"
+	nodePool := &hyperv1.NodePool{ObjectMeta: metav1.ObjectMeta{Namespace: "clusters", Name: "np-1"}}
+	nodePoolKey := client.ObjectKeyFromObject(nodePool).String()
+
+	cutoff := time.Now()
+	old := metav1.NewTime(cutoff.Add(-time.Hour))
+	recent := metav1.NewTime(cutoff.Add(time.Hour))
+
+	machine := func(name, npAnnotation string, created metav1.Time, joined bool) *capiv1.Machine {
+		m := &capiv1.Machine{ObjectMeta: metav1.ObjectMeta{
+			Namespace:         ns,
+			Name:              name,
+			CreationTimestamp: created,
+			Annotations:       map[string]string{nodePoolAnnotation: npAnnotation},
+		}}
+		if joined {
+			m.Status.NodeRef = capiv1.MachineNodeReference{Name: "node-" + name}
+		}
+		return m
+	}
+
+	// Only the not-yet-joined Machine of this pool created before the cutoff is swept.
+	inflightOld := machine("inflight-old", nodePoolKey, old, false)    // deleted
+	inflightNew := machine("inflight-new", nodePoolKey, recent, false) // kept: created after the refresh
+	joinedOld := machine("joined-old", nodePoolKey, old, true)         // kept: already joined
+	otherPool := machine("other-pool", "clusters/np-2", old, false)    // kept: different NodePool
+
+	c := fake.NewClientBuilder().WithScheme(api.Scheme).WithObjects(inflightOld, inflightNew, joinedOld, otherPool).Build()
+	capi := &CAPI{Token: &Token{ConfigGenerator: &ConfigGenerator{Client: c, nodePool: nodePool, controlplaneNamespace: ns}}}
+
+	g.Expect(capi.sweepInFlightMachines(ctx, cutoff)).To(Succeed())
+
+	remaining := &capiv1.MachineList{}
+	g.Expect(c.List(ctx, remaining, client.InNamespace(ns))).To(Succeed())
+	names := make([]string, 0, len(remaining.Items))
+	for i := range remaining.Items {
+		names = append(names, remaining.Items[i].Name)
+	}
+	g.Expect(names).To(ConsistOf("inflight-new", "joined-old", "other-pool"))
+}
+
 func TestPropagateLabelsAndTaintsToMachines(t *testing.T) {
 	testCases := []struct {
 		name             string

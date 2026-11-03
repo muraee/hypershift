@@ -1400,6 +1400,39 @@ func (c *CAPI) machineSet() *capiv1.MachineSet {
 	}
 }
 
+// sweepInFlightMachines deletes not-yet-joined Machines whose baked-in userdata predates the adoption
+// refresh, so CAPI recreates them off the refreshed content. It is a one-shot tied to the first
+// adoption reconcile (enhancement §"In-flight Machines"): the candidate set — Machines of this pool with
+// no NodeRef AND creationTimestamp before cutoff — is fixed at cutoff and only shrinks, so a Machine
+// created afterward (already carrying the new userdata) is never a candidate and the sweep cannot loop.
+// Already-joined Machines consumed their userdata at first boot and never re-fetch, so they are left be.
+func (c *CAPI) sweepInFlightMachines(ctx context.Context, cutoff time.Time) error {
+	log := ctrl.LoggerFrom(ctx)
+	machineList := &capiv1.MachineList{}
+	if err := c.List(ctx, machineList, client.InNamespace(c.controlplaneNamespace)); err != nil {
+		return err
+	}
+	nodePoolKey := client.ObjectKeyFromObject(c.nodePool).String()
+	for i := range machineList.Items {
+		machine := &machineList.Items[i]
+		if machine.GetAnnotations()[nodePoolAnnotation] != nodePoolKey {
+			continue
+		}
+		if machine.Status.NodeRef.IsDefined() {
+			continue
+		}
+		if !machine.CreationTimestamp.Time.Before(cutoff) {
+			continue
+		}
+		log.Info("Deleting in-flight Machine with stale userdata so CAPI recreates it off the refreshed content",
+			"machine", machine.Name, "nodePool", nodePoolKey)
+		if err := c.Delete(ctx, machine); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
+	return nil
+}
+
 // currentUserDataSecretName returns the pool's live CAPI Bootstrap.DataSecretName, read from the
 // MachineDeployment (Replace) or MachineSet (InPlace), or "" when the workload or its bootstrap ref
 // does not exist yet. The IgnitionPayload consumer adopts off this live name so an already-provisioned
