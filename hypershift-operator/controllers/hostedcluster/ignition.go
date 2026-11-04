@@ -33,19 +33,29 @@ func (r *HostedClusterReconciler) reconcileIgnitionPayloadComponents(cpContext c
 		return fmt.Errorf("failed to determine default ingress domain: %w", err)
 	}
 
-	// Generation half: the leader-elected controller that authors payloads into the PayloadStore and
-	// mints node bearer tokens. Runs the HO image's ignition-payload-controller subcommand.
-	generator := ignitionserverv2.NewGeneratorComponent(hypershiftOperatorImage, releaseProvider)
-	if err := generator.Reconcile(cpContext); err != nil {
-		return fmt.Errorf("failed to reconcile ignition-server-generator component: %w", err)
-	}
-
 	// Serving half: the stateless server that verifies node tokens and serves from the PayloadStore.
 	// Reuses the ignition-server component name/Service/Route/serving-cert; runs the HO image's
 	// ignition-payload-server subcommand.
+	//
+	// This MUST be reconciled before the generator: the serving component authors the ignition-server
+	// Route, and the generator's adapt resolves that Route's admitted host to bake the node endpoint
+	// into the userData it generates — returning an error ("ignition server address not yet available")
+	// until the host is known. Reconciling the generator first would return that error before the
+	// serving component ever creates the Route, so the Route would never be created and the generator
+	// could never resolve it: a permanent deadlock. The serving component's Reconcile returns nil even
+	// while its pod waits on the generator-authored signing-key secret (pod readiness is a status
+	// condition, not a Reconcile error), so ordering it first does not block the generator.
 	server := ignitionserverv2.NewServerComponent(hypershiftOperatorImage, defaultIngressDomain)
 	if err := server.Reconcile(cpContext); err != nil {
 		return fmt.Errorf("failed to reconcile ignition-server component: %w", err)
+	}
+
+	// Generation half: the leader-elected controller that authors payloads into the PayloadStore and
+	// mints node bearer tokens. Runs the HO image's ignition-payload-controller subcommand. Reconciled
+	// after the serving component so the ignition-server Route it depends on already exists.
+	generator := ignitionserverv2.NewGeneratorComponent(hypershiftOperatorImage, releaseProvider)
+	if err := generator.Reconcile(cpContext); err != nil {
+		return fmt.Errorf("failed to reconcile ignition-server-generator component: %w", err)
 	}
 
 	// Node-facing proxy (reused unchanged); its predicate skips IBM Cloud, where the server is exposed
