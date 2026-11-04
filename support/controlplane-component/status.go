@@ -43,7 +43,15 @@ var (
 		"karpenter-operator",
 		"karpenter",
 		"router",
+		// The ignition system (serving tier, its generator, and the proxy) must bootstrap nodes
+		// independently of the guest kube-apiserver: it is management-side (the generator renders
+		// payloads from the release image and management-namespace config, with no guest-KAS client)
+		// and nodes fetch ignition at first boot before any guest-KAS dependency exists. Gating any of
+		// the three on kube-apiserver reintroduces that coupling — because the serving tier's
+		// signing-key secret is authored by the generator, a generator gated on KAS transitively
+		// blocks serving too. Keep all three excluded.
 		"ignition-server",
+		"ignition-server-generator",
 		"ignition-server-proxy",
 		// Allow External OIDC webhook resources, including the CA needed by KAS, to reconcile before KAS.
 		"external-oidc-webhook",

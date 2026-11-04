@@ -465,6 +465,34 @@ func TestCheckDependencies(t *testing.T) {
 			},
 		},
 		{
+			testName:        "Should not include kube-apiserver as dependency for ignition-server component",
+			mockComponents:  []hyperv1.ControlPlaneComponent{},
+			expectedMissing: []string{},
+			setup: func(cpContext *ControlPlaneContext) *controlPlaneWorkload[*appsv1.Deployment] {
+				return createMockWorkload("ignition-server", nil)
+			},
+		},
+		{
+			// Regression: the ignition generator is management-side (it renders payloads from the
+			// release image and management-namespace config and holds no guest-KAS client), and it
+			// authors the serving tier's signing-key secret. Gating it on kube-apiserver would
+			// transitively block ignition serving, so it must be excluded like its sibling components.
+			testName:        "Should not include kube-apiserver as dependency for ignition-server-generator component",
+			mockComponents:  []hyperv1.ControlPlaneComponent{},
+			expectedMissing: []string{},
+			setup: func(cpContext *ControlPlaneContext) *controlPlaneWorkload[*appsv1.Deployment] {
+				return createMockWorkload("ignition-server-generator", nil)
+			},
+		},
+		{
+			testName:        "Should not include kube-apiserver as dependency for ignition-server-proxy component",
+			mockComponents:  []hyperv1.ControlPlaneComponent{},
+			expectedMissing: []string{},
+			setup: func(cpContext *ControlPlaneContext) *controlPlaneWorkload[*appsv1.Deployment] {
+				return createMockWorkload("ignition-server-proxy", nil)
+			},
+		},
+		{
 			testName: "Should remove etcd from dependencies when etcd management type is unmanaged",
 			mockComponents: []hyperv1.ControlPlaneComponent{
 				createMockControlPlaneComponent(kubeAPIServerComponentName, true, true, testVersion),
