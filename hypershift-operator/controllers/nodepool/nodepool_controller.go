@@ -528,6 +528,17 @@ func (r *NodePoolReconciler) reconcile(ctx context.Context, hcluster *hyperv1.Ho
 		return ctrl.Result{}, nil
 	}
 
+	// Gate-ON: the IgnitionPayload generator publishes this pool's userdata asynchronously, so the
+	// consumer leaves userDataSecretNameOverride empty until status.current is set. Reconciling CAPI now
+	// would create a MachineDeployment/MachineSet with an empty bootstrap, which the CAPI webhook rejects
+	// ("spec.template.spec.bootstrap: Required value"). Requeue until the payload lands: a brand-new pool
+	// is then born directly on the published userdata, and an already-provisioned pool keeps its existing
+	// Machines untouched in the meantime. (The legacy Token path is synchronous, so it cannot hit this.)
+	if useIgnitionPayloadConsumer && token.userDataSecretNameOverride == "" {
+		log.Info("Waiting for the IgnitionPayload to publish userdata before reconciling Machines", "nodePool", nodePool.Name)
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
 	if err := capi.Reconcile(ctx); err != nil {
 		var notReadyErr *NotReadyError
 		if coreerrors.As(err, &notReadyErr) {
