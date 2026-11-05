@@ -15,9 +15,12 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/utils/ptr"
 
+	capiv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
@@ -144,6 +147,37 @@ func advanceRetiredRolloutGeneration(ctx context.Context, c client.Client, cr *h
 	return nil
 }
 
+// previousGenerationDrained reports whether the Replace rollout onto currentUserData has fully
+// completed — every replica up-to-date (on the current template) and available, with status observed
+// for the latest spec generation. Only then has CAPI scaled the superseded MachineSet to zero, so the
+// previous generation's Machines are gone and its payload can be retired. It is the trigger for
+// advancing retiredRolloutGeneration (enhancement step 7). InPlace pools upgrade Machines in place
+// (no MachineDeployment rollout) and are out of scope here — their previous payload is bounded by
+// delete-on-evict on the next rollout.
+func previousGenerationDrained(ctx context.Context, c client.Client, hcpNamespace, nodePoolName string, upgradeType hyperv1.UpgradeType, currentUserData string) (bool, error) {
+	if upgradeType != hyperv1.UpgradeTypeReplace {
+		return false, nil
+	}
+	md := &capiv1.MachineDeployment{ObjectMeta: metav1.ObjectMeta{Namespace: hcpNamespace, Name: nodePoolName}}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(md), md); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	// The MD must actually be pointed at the current userData; otherwise "up-to-date" would count
+	// replicas still on the previous generation as current.
+	if ptr.Deref(md.Spec.Template.Spec.Bootstrap.DataSecretName, "") != currentUserData || md.Spec.Replicas == nil {
+		return false, nil
+	}
+	want := *md.Spec.Replicas
+	s := md.Status
+	return s.ObservedGeneration >= md.Generation &&
+		ptr.Deref(s.Replicas, -1) == want &&
+		ptr.Deref(s.UpToDateReplicas, -1) == want &&
+		ptr.Deref(s.AvailableReplicas, -1) == want, nil
+}
+
 // ignitionConsumerInputs carries the resolved inputs the Phase-5 live reconcile supplies to the
 // consumer: the gathered config ConfigMaps, the release-derived values, and the endpoint-identity
 // rollout input. Release-image resolution, HAProxy generation, and the endpoint derivation
@@ -221,6 +255,22 @@ func reconcileIgnitionPayloadConsumer(ctx context.Context, c client.Client, stor
 	if err := reconcileLegacyInPlaceSecret(ctx, c, store, in.machineSetName,
 		nodePool.Spec.Management.UpgradeType, in.releaseVersion, cr.Status.Current, cr); err != nil {
 		return adoptionDecision{}, err
+	}
+
+	// Once the Replace rollout onto the current generation has drained the superseded one, advance
+	// retiredRolloutGeneration so the generator frees the previous payload + userData Secret and clears
+	// status.previous (enhancement step 7). Level-triggered and monotonic; a no-op until drain.
+	if cr.Status.Previous.RolloutGeneration > 0 {
+		drained, err := previousGenerationDrained(ctx, c, hcpNamespace, nodePool.GetName(),
+			nodePool.Spec.Management.UpgradeType, cr.Status.Current.UserDataSecret.Name)
+		if err != nil {
+			return adoptionDecision{}, err
+		}
+		if drained {
+			if err := advanceRetiredRolloutGeneration(ctx, c, cr, cr.Status.Previous.RolloutGeneration); err != nil {
+				return adoptionDecision{}, err
+			}
+		}
 	}
 
 	return decision, nil

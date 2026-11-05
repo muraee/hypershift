@@ -17,7 +17,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/utils/ptr"
 
+	capiv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -105,6 +107,71 @@ func TestAdvanceRetiredRolloutGeneration(t *testing.T) {
 		fetched := &hyperv1.IgnitionPayload{}
 		g.Expect(c.Get(ctx, client.ObjectKeyFromObject(cr), fetched)).To(Succeed())
 		g.Expect(fetched.Spec.RetiredRolloutGeneration).To(Equal(int64(5)))
+	})
+}
+
+func TestPreviousGenerationDrained(t *testing.T) {
+	ctx := context.Background()
+	const ns, np, current = "hcp", "np-1", "np-1-2"
+
+	// md builds a Replace MachineDeployment pointed at dataSecret with the given rollout counts.
+	md := func(dataSecret string, gen, observed int64, replicas, upToDate, available int32) *capiv1.MachineDeployment {
+		return &capiv1.MachineDeployment{
+			ObjectMeta: metav1.ObjectMeta{Name: np, Namespace: ns, Generation: gen},
+			Spec: capiv1.MachineDeploymentSpec{
+				Replicas: ptr.To[int32](2),
+				Template: capiv1.MachineTemplateSpec{Spec: capiv1.MachineSpec{
+					Bootstrap: capiv1.Bootstrap{DataSecretName: ptr.To(dataSecret)},
+				}},
+			},
+			Status: capiv1.MachineDeploymentStatus{
+				ObservedGeneration: observed,
+				Replicas:           ptr.To(replicas),
+				UpToDateReplicas:   ptr.To(upToDate),
+				AvailableReplicas:  ptr.To(available),
+			},
+		}
+	}
+	check := func(objs []client.Object, upgradeType hyperv1.UpgradeType) (bool, error) {
+		c := fake.NewClientBuilder().WithScheme(api.Scheme).WithObjects(objs...).Build()
+		return previousGenerationDrained(ctx, c, ns, np, upgradeType, current)
+	}
+
+	t.Run("Replace fully rolled out onto current ⇒ drained", func(t *testing.T) {
+		g := NewWithT(t)
+		drained, err := check([]client.Object{md(current, 1, 1, 2, 2, 2)}, hyperv1.UpgradeTypeReplace)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(drained).To(BeTrue())
+	})
+	t.Run("Replace not yet fully up-to-date ⇒ not drained", func(t *testing.T) {
+		g := NewWithT(t)
+		drained, err := check([]client.Object{md(current, 1, 1, 2, 1, 2)}, hyperv1.UpgradeTypeReplace)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(drained).To(BeFalse())
+	})
+	t.Run("Replace status lagging spec generation ⇒ not drained", func(t *testing.T) {
+		g := NewWithT(t)
+		drained, err := check([]client.Object{md(current, 2, 1, 2, 2, 2)}, hyperv1.UpgradeTypeReplace)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(drained).To(BeFalse())
+	})
+	t.Run("Replace MD still on previous userData ⇒ not drained", func(t *testing.T) {
+		g := NewWithT(t)
+		drained, err := check([]client.Object{md("np-1-1", 1, 1, 2, 2, 2)}, hyperv1.UpgradeTypeReplace)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(drained).To(BeFalse())
+	})
+	t.Run("Replace MD absent ⇒ not drained", func(t *testing.T) {
+		g := NewWithT(t)
+		drained, err := check(nil, hyperv1.UpgradeTypeReplace)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(drained).To(BeFalse())
+	})
+	t.Run("InPlace is out of scope ⇒ not drained", func(t *testing.T) {
+		g := NewWithT(t)
+		drained, err := check([]client.Object{md(current, 1, 1, 2, 2, 2)}, hyperv1.UpgradeTypeInPlace)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(drained).To(BeFalse())
 	})
 }
 
