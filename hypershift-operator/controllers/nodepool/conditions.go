@@ -20,6 +20,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 
@@ -643,6 +644,19 @@ func (r NodePoolReconciler) validGeneratedPayloadCondition(ctx context.Context, 
 }
 
 func (r NodePoolReconciler) reachedIgnitionEndpointCondition(ctx context.Context, nodePool *hyperv1.NodePool, hcluster *hyperv1.HostedCluster) (*ctrl.Result, error) {
+	// New ignition path: the legacy token Secret (and its ignition-reached annotation) does not exist,
+	// so derive this condition from the IgnitionPayload CR's IgnitionReached condition — set True by the
+	// serving tier once a node fetches the current payload. Without this the condition is stuck False on
+	// the new path, which also blocks MachineHealthCheck creation on autoRepair pools. The CPO-capability
+	// gate matches the main reconcile so this condition is derived from the same source the active path uses.
+	cpoCapabilities, err := r.detectCPOCapabilities(ctx, hcluster)
+	if err != nil {
+		return &ctrl.Result{}, fmt.Errorf("failed to detect CPO capabilities: %w", err)
+	}
+	if ignitionPayloadConsumerEnabled(hcluster, cpoCapabilities.SupportsIgnitionPayloadSystem) {
+		SetStatusCondition(&nodePool.Status.Conditions, *r.ignitionPayloadReachedCondition(ctx, nodePool, hcluster))
+		return nil, nil
+	}
 	token, err := r.token(ctx, hcluster, nodePool)
 	if err != nil {
 		return &ctrl.Result{}, fmt.Errorf("error getting token: %w", err)
@@ -1009,6 +1023,43 @@ func (r NodePoolReconciler) createReachedIgnitionEndpointCondition(ctx context.C
 	}
 
 	return condition, nil
+}
+
+// ignitionPayloadReachedCondition maps the IgnitionPayload CR's IgnitionReached condition onto the
+// NodePool's NodePoolReachedIgnitionEndpoint condition for the gate-ON (new ignition) path. The
+// serving tier sets the CR's IgnitionReached to True once a booting node fetches the current payload,
+// which is the new-model equivalent of the legacy token Secret's ignition-reached annotation. The CR
+// lives in the HCP namespace under the NodePool's name.
+func (r NodePoolReconciler) ignitionPayloadReachedCondition(ctx context.Context, nodePool *hyperv1.NodePool, hcluster *hyperv1.HostedCluster) *hyperv1.NodePoolCondition {
+	hcpNamespace := manifests.HostedControlPlaneNamespace(hcluster.Namespace, hcluster.Name)
+	cr := &hyperv1.IgnitionPayload{}
+	if err := r.Get(ctx, crclient.ObjectKey{Namespace: hcpNamespace, Name: nodePool.GetName()}, cr); err != nil {
+		reason := hyperv1.NodePoolNotFoundReason
+		if !apierrors.IsNotFound(err) {
+			reason = hyperv1.NodePoolFailedToGetReason
+		}
+		return &hyperv1.NodePoolCondition{
+			Type:               hyperv1.NodePoolReachedIgnitionEndpoint,
+			Status:             corev1.ConditionFalse,
+			Reason:             reason,
+			Message:            err.Error(),
+			ObservedGeneration: nodePool.Generation,
+		}
+	}
+	if apimeta.IsStatusConditionTrue(cr.Status.Conditions, hyperv1.IgnitionPayloadIgnitionReachedCondition) {
+		return &hyperv1.NodePoolCondition{
+			Type:               hyperv1.NodePoolReachedIgnitionEndpoint,
+			Status:             corev1.ConditionTrue,
+			Reason:             hyperv1.AsExpectedReason,
+			ObservedGeneration: nodePool.Generation,
+		}
+	}
+	return &hyperv1.NodePoolCondition{
+		Type:               hyperv1.NodePoolReachedIgnitionEndpoint,
+		Status:             corev1.ConditionFalse,
+		Reason:             hyperv1.IgnitionNotReached,
+		ObservedGeneration: nodePool.Generation,
+	}
 }
 
 // createValidGeneratedPayloadCondition creates a condition for the NodePool based on the tokenSecret data.
