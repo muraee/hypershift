@@ -122,6 +122,13 @@ func (s *Server) HandleIgnition(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// HandleHealthz is the liveness/readiness probe endpoint. It returns 200 once the server process is
+// up and serving; the deployment's probes target it on the serving port.
+func (s *Server) HandleHealthz(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok"))
+}
+
 // lookup resolves (owner, rolloutGeneration) via the cached reader, falling back to the uncached
 // (API) reader on a cache miss so a payload is servable the instant the generator's Put returns.
 func (s *Server) lookup(ctx context.Context, owner payloadstore.OwnerRef, rolloutGeneration int64) ([]byte, error) {

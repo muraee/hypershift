@@ -130,6 +130,7 @@ func run(ctx context.Context, opts Options) error {
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", srv.HandleHealthz)
 	mux.HandleFunc("/", srv.HandleIgnition)
 
 	server := &http.Server{

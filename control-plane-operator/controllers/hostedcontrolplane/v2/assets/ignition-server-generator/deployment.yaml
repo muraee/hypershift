@@ -1,0 +1,102 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ignition-server-generator
+  labels:
+    app: ignition-server-generator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ignition-server-generator
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: ignition-server-generator
+    spec:
+      containers:
+      - name: ignition-server-generator
+        # image is replaced by adaptDeployment with the HyperShift Operator image.
+        image: ignition-server-generator
+        command:
+        - /usr/bin/hypershift-operator
+        - ignition-payload-controller
+        args:
+        - --work-dir=/payloads
+        - --feature-gate-manifest=/shared/99_feature-gate.yaml
+        env:
+        - name: MY_NAMESPACE
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.namespace
+        - name: OPENSHIFT_IMG_OVERRIDES
+          value: =
+        resources:
+          requests:
+            cpu: 10m
+            memory: 40Mi
+        volumeMounts:
+        - mountPath: /payloads
+          name: payloads
+        - mountPath: /shared
+          name: shared
+        - mountPath: /etc/pki/ca-trust/extracted/pem
+          name: openshift-config-managed-trusted-ca-bundle
+          readOnly: true
+      initContainers:
+      - args:
+        - -c
+        - |
+          #!/bin/bash
+          set -e
+          cd /tmp
+          mkdir input output manifests
+
+          touch /tmp/manifests/99_feature-gate.yaml
+          cat <<EOF >/tmp/manifests/99_feature-gate.yaml
+          $(FEATURE_GATE_YAML)
+
+          EOF
+
+          cp /tmp/manifests/99_feature-gate.yaml /shared/99_feature-gate.yaml
+        command:
+        - /bin/bash
+        env:
+        - name: FEATURE_GATE_YAML
+          value: |
+            apiVersion: config.openshift.io/v1
+            kind: FeatureGate
+            metadata:
+              creationTimestamp: null
+              name: cluster
+            spec: {}
+            status:
+              featureGates: null
+        image: cluster-config-api
+        name: fetch-feature-gate
+        resources:
+          requests:
+            cpu: 10m
+            memory: 40Mi
+        volumeMounts:
+        - mountPath: /shared
+          name: shared
+      serviceAccount: ignition-server-generator
+      serviceAccountName: ignition-server-generator
+      terminationGracePeriodSeconds: 10
+      volumes:
+      - emptyDir: {}
+        name: payloads
+      - emptyDir: {}
+        name: shared
+      - configMap:
+          defaultMode: 420
+          items:
+          - key: ca-bundle.crt
+            path: tls-ca-bundle.pem
+          name: openshift-config-managed-trusted-ca-bundle
+          optional: true
+        name: openshift-config-managed-trusted-ca-bundle

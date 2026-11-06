@@ -1,0 +1,55 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ignition-server-generator
+rules:
+# Leader election: the generator is a singleton, so only one replica reconciles at a time.
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - '*'
+# The generator owns IgnitionPayload resources and their status. It also authors the userData and
+# PayloadStore Secrets with an ownerReference back to the IgnitionPayload (blockOwnerDeletion=true for
+# cascade cleanup); the garbage-collection admission plugin requires update on the owner's
+# finalizers subresource to set blockOwnerDeletion, so ignitionpayloads/finalizers is included.
+- apiGroups:
+  - hypershift.openshift.io
+  resources:
+  - ignitionpayloads
+  - ignitionpayloads/status
+  - ignitionpayloads/finalizers
+  verbs:
+  - '*'
+# Reads config/MachineConfig/pull-secret inputs and writes the Secret-backed PayloadStore and the
+# authored userData + token-signing key.
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - '*'
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  verbs:
+  - get
+  - list
+  - watch
+# Reads the HostedControlPlane for release/config inputs feeding the payload identity hash.
+- apiGroups:
+  - hypershift.openshift.io
+  resources:
+  - hostedcontrolplanes
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - '*'

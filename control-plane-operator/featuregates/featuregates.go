@@ -14,6 +14,11 @@ const (
 	ExternalOIDCWithUpstreamParity           featuregate.Feature = "ExternalOIDCWithUpstreamParity"
 	KubeletHAProxyRouting                    featuregate.Feature = "KubeletHAProxyRouting"
 	ExternalOIDCAsWebhook                    featuregate.Feature = "ExternalOIDCAsWebhook"
+	// IgnitionPayloadSystem mirrors the HyperShift Operator gate of the same name. The CPO reads it
+	// (propagated via HYPERSHIFT_FEATURESET) only to stand its ignition components down: when the gate
+	// is active the HO owns the re-architected ignition system, so the CPO must not also reconcile the
+	// same-named ignition-server / ignition-server-proxy components.
+	IgnitionPayloadSystem featuregate.Feature = "IgnitionPayloadSystem"
 )
 
 // Initialize new features here
@@ -24,6 +29,7 @@ var (
 	externalOIDCWithUpstreamParityFeature           = featuregates.NewFeature(ExternalOIDCWithUpstreamParity, featuregates.WithEnableForFeatureSets(configv1.TechPreviewNoUpgrade, configv1.Default))
 	kubeletHAProxyRoutingFeature                    = featuregates.NewFeature(KubeletHAProxyRouting, featuregates.WithEnableForFeatureSets(configv1.TechPreviewNoUpgrade))
 	externalOIDCAsWebhook                           = featuregates.NewFeature(ExternalOIDCAsWebhook, featuregates.WithEnableForFeatureSets(configv1.TechPreviewNoUpgrade))
+	ignitionPayloadSystemFeature                    = featuregates.NewFeature(IgnitionPayloadSystem, featuregates.WithEnableForFeatureSets(configv1.TechPreviewNoUpgrade))
 )
 
 func init() {
@@ -32,6 +38,7 @@ func init() {
 	allFeatures.AddFeature(externalOIDCWithUpstreamParityFeature)
 	allFeatures.AddFeature(kubeletHAProxyRoutingFeature)
 	allFeatures.AddFeature(externalOIDCAsWebhook)
+	allFeatures.AddFeature(ignitionPayloadSystemFeature)
 	// Default to configuring the Default featureset
 	ConfigureFeatureSet(string(configv1.Default))
 }
