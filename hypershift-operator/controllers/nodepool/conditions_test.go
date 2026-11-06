@@ -1453,3 +1453,54 @@ func TestReachedIgnitionEndpointCondition(t *testing.T) {
 		})
 	}
 }
+
+func TestIgnitionPayloadReachedCondition(t *testing.T) {
+	hc := &hyperv1.HostedCluster{ObjectMeta: metav1.ObjectMeta{Namespace: "clusters", Name: "test"}}
+	np := &hyperv1.NodePool{ObjectMeta: metav1.ObjectMeta{Namespace: "clusters", Name: "np-1", Generation: 3}}
+	const hcpNS = "clusters-test" // manifests.HostedControlPlaneNamespace(clusters, test)
+
+	crWith := func(status metav1.ConditionStatus) *hyperv1.IgnitionPayload {
+		cr := &hyperv1.IgnitionPayload{ObjectMeta: metav1.ObjectMeta{Namespace: hcpNS, Name: "np-1"}}
+		if status != "" {
+			cr.Status.Conditions = []metav1.Condition{{
+				Type: hyperv1.IgnitionPayloadIgnitionReachedCondition, Status: status,
+				Reason: "x", LastTransitionTime: metav1.Now(),
+			}}
+		}
+		return cr
+	}
+	condFor := func(cr *hyperv1.IgnitionPayload) *hyperv1.NodePoolCondition {
+		builder := fake.NewClientBuilder().WithScheme(api.Scheme)
+		if cr != nil {
+			builder = builder.WithObjects(cr)
+		}
+		r := &NodePoolReconciler{Client: builder.Build()}
+		return r.ignitionPayloadReachedCondition(context.Background(), np, hc)
+	}
+
+	t.Run("CR IgnitionReached True ⇒ ReachedIgnitionEndpoint True", func(t *testing.T) {
+		g := NewWithT(t)
+		cond := condFor(crWith(metav1.ConditionTrue))
+		g.Expect(cond.Status).To(Equal(corev1.ConditionTrue))
+		g.Expect(cond.Reason).To(Equal(hyperv1.AsExpectedReason))
+		g.Expect(cond.ObservedGeneration).To(Equal(int64(3)))
+	})
+	t.Run("CR IgnitionReached False ⇒ False/ignitionNotReached", func(t *testing.T) {
+		g := NewWithT(t)
+		cond := condFor(crWith(metav1.ConditionFalse))
+		g.Expect(cond.Status).To(Equal(corev1.ConditionFalse))
+		g.Expect(cond.Reason).To(Equal(hyperv1.IgnitionNotReached))
+	})
+	t.Run("CR without IgnitionReached condition ⇒ False/ignitionNotReached", func(t *testing.T) {
+		g := NewWithT(t)
+		cond := condFor(crWith(""))
+		g.Expect(cond.Status).To(Equal(corev1.ConditionFalse))
+		g.Expect(cond.Reason).To(Equal(hyperv1.IgnitionNotReached))
+	})
+	t.Run("CR absent ⇒ False/NotFound", func(t *testing.T) {
+		g := NewWithT(t)
+		cond := condFor(nil)
+		g.Expect(cond.Status).To(Equal(corev1.ConditionFalse))
+		g.Expect(cond.Reason).To(Equal(hyperv1.NodePoolNotFoundReason))
+	})
+}

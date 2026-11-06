@@ -105,6 +105,11 @@ const (
 	controlPlaneOperatorManagesDecompressAndDecodeConfig = "io.openshift.hypershift.control-plane-operator-manages.decompress-decode-config"
 
 	controlPlaneOperatorCreatesDefaultAWSSecurityGroup = "io.openshift.hypershift.control-plane-operator-creates-aws-sg"
+	// controlPlaneOperatorSupportsIgnitionPayloadSystemLabel marks a CPO image whose control plane stands
+	// its ignition components down so the HO owns the re-architected (split) ignition system. The consumer
+	// only takes the new path for a HostedCluster whose CPO advertises this, so enabling the gate on a
+	// fleet with older control planes keeps those NodePools on the legacy ignition path.
+	controlPlaneOperatorSupportsIgnitionPayloadSystemLabel = "io.openshift.hypershift.control-plane-operator-supports-ignition-payload-system"
 
 	labelManagedPrefix = "managed.hypershift.openshift.io"
 )
@@ -130,6 +135,7 @@ type NotReadyError struct {
 type CPOCapabilities struct {
 	DecompressAndDecodeConfig     bool
 	CreateDefaultAWSSecurityGroup bool
+	SupportsIgnitionPayloadSystem bool
 }
 
 // when using the conditions.SetSummary, with the WithStepCounter or WithStepCounterIf(true) options,
@@ -160,6 +166,9 @@ func (r *NodePoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.enqueueNodePoolsForCloudConfig), builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
 			return obj.GetName() == "azure-cloud-config" || obj.GetName() == "openstack-cloud-config"
 		}))).
+		// On the IgnitionPayloadSystem path, re-reconcile a NodePool when its IgnitionPayload CR changes
+		// (e.g. the generator advanced status.current), so the consumer re-points CAPI promptly.
+		Watches(&hyperv1.IgnitionPayload{}, handler.EnqueueRequestsFromMapFunc(r.enqueueNodePoolForIgnitionPayload)).
 		WithOptions(controller.Options{
 			RateLimiter:             workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](1*time.Second, 10*time.Second),
 			MaxConcurrentReconciles: 10,
@@ -471,21 +480,37 @@ func (r *NodePoolReconciler) reconcile(ctx context.Context, hcluster *hyperv1.Ho
 
 	// 2. - Reconcile towards expected state of the world.
 
-	// Look up the CAPI workload's current bootstrap hash before token
-	// reconciliation so effectiveSecrets() can maintain the in-progress
-	// rollout target when management-side drift changes the calculated hash.
-	if err := r.resolveDeployedBootstrapHash(ctx, token, nodePool, hcluster); err != nil {
-		return ctrl.Result{}, err
-	}
+	// On the IgnitionPayloadSystem (gate-ON) path the IgnitionPayload consumer — not the legacy Token —
+	// owns userdata generation and CAPI naming for this NodePool. The gate-OFF path below is unchanged.
+	useIgnitionPayloadConsumer := ignitionPayloadConsumerEnabled(hcluster, cpoCapabilities.SupportsIgnitionPayloadSystem)
+	if useIgnitionPayloadConsumer {
+		if err := r.reconcileIgnitionPayloadConsumerForNodePool(ctx, token, capi, nodePool, hcluster,
+			configGenerator, releaseImage, resolvedRHELStream, haproxyRawConfig, controlPlaneNamespace); err != nil {
+			return ctrl.Result{}, err
+		}
+	} else {
+		// Look up the CAPI workload's current bootstrap hash before token
+		// reconciliation so effectiveSecrets() can maintain the in-progress
+		// rollout target when management-side drift changes the calculated hash.
+		if err := r.resolveDeployedBootstrapHash(ctx, token, nodePool, hcluster); err != nil {
+			return ctrl.Result{}, err
+		}
 
-	if err := token.Reconcile(ctx); err != nil {
-		return ctrl.Result{}, err
-	}
+		if err := token.Reconcile(ctx); err != nil {
+			return ctrl.Result{}, err
+		}
 
-	seedRolloutAnnotation(token)
+		seedRolloutAnnotation(token)
+	}
 
 	// non automated infrastructure should not have any machine level cluster-api components
 	if !isAutomatedMachineManagement(nodePool) {
+		if useIgnitionPayloadConsumer {
+			// The IgnitionPayload CR and its projected configs are authored above so the serving tier
+			// can serve this pool; there are no Machines to manage or re-point.
+			nodePool.Status.Version = releaseImage.Version()
+			return ctrl.Result{}, nil
+		}
 		targetConfigHash := token.HashWithoutVersion()
 		targetPayloadConfigHash := token.Hash()
 		targetRolloutConfigHash := token.RolloutHashWithoutVersion()
@@ -501,6 +526,17 @@ func (r *NodePoolReconciler) reconcile(ctx context.Context, hcluster *hyperv1.Ho
 		nodePool.Annotations[nodePoolAnnotationCurrentConfigVersion] = targetPayloadConfigHash
 		nodePool.Annotations[nodePoolAnnotationCurrentRolloutConfig] = targetRolloutConfigHash
 		return ctrl.Result{}, nil
+	}
+
+	// Gate-ON: the IgnitionPayload generator publishes this pool's userdata asynchronously, so the
+	// consumer leaves userDataSecretNameOverride empty until status.current is set. Reconciling CAPI now
+	// would create a MachineDeployment/MachineSet with an empty bootstrap, which the CAPI webhook rejects
+	// ("spec.template.spec.bootstrap: Required value"). Requeue until the payload lands: a brand-new pool
+	// is then born directly on the published userdata, and an already-provisioned pool keeps its existing
+	// Machines untouched in the meantime. (The legacy Token path is synchronous, so it cannot hit this.)
+	if useIgnitionPayloadConsumer && token.userDataSecretNameOverride == "" {
+		log.Info("Waiting for the IgnitionPayload to publish userdata before reconciling Machines", "nodePool", nodePool.Name)
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
 	if err := capi.Reconcile(ctx); err != nil {
@@ -716,6 +752,21 @@ func (r *NodePoolReconciler) delete(ctx context.Context, nodePool *hyperv1.NodeP
 	// Delete all secrets related to the NodePool
 	if err = r.deleteNodePoolSecrets(ctx, nodePool); err != nil {
 		return fmt.Errorf("failed to delete NodePool secrets: %w", err)
+	}
+
+	// Tear down this NodePool's IgnitionPayload CR (if any): delete it, then remove the consumer
+	// finalizer so it can be reclaimed once the generator's store-cleanup finalizer also clears. A
+	// no-op on clusters that never created one (gate-OFF, or the CR cannot live cross-namespace with the
+	// NodePool so there is no owner-reference GC). Runs unconditionally so a CR left from a prior
+	// gate-ON period is still cleaned up.
+	ignitionPayloadCR := &hyperv1.IgnitionPayload{
+		ObjectMeta: metav1.ObjectMeta{Namespace: controlPlaneNamespace, Name: nodePool.GetName()},
+	}
+	if err = r.Delete(ctx, ignitionPayloadCR); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete IgnitionPayload: %w", err)
+	}
+	if err = finalizeIgnitionPayloadConsumer(ctx, r.Client, controlPlaneNamespace, nodePool.GetName()); err != nil {
+		return fmt.Errorf("failed to finalize IgnitionPayload consumer: %w", err)
 	}
 
 	err = r.deleteKubeVirtCache(ctx, nodePool, controlPlaneNamespace)
@@ -1318,6 +1369,7 @@ func (r *NodePoolReconciler) detectCPOCapabilities(ctx context.Context, hostedCl
 	result := &CPOCapabilities{}
 	_, result.DecompressAndDecodeConfig = imageLabels[controlPlaneOperatorManagesDecompressAndDecodeConfig]
 	_, result.CreateDefaultAWSSecurityGroup = imageLabels[controlPlaneOperatorCreatesDefaultAWSSecurityGroup]
+	_, result.SupportsIgnitionPayloadSystem = imageLabels[controlPlaneOperatorSupportsIgnitionPayloadSystemLabel]
 
 	return result, nil
 }

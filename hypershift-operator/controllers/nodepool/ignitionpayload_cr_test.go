@@ -30,7 +30,7 @@ func TestIgnitionPayloadSpec(t *testing.T) {
 	nodePool := testNodePool("np-1")
 	hc := &hyperv1.HostedCluster{
 		Spec: hyperv1.HostedClusterSpec{
-			PullSecret:            corev1.LocalObjectReference{Name: "pull-secret"},
+			PullSecret:            corev1.LocalObjectReference{Name: "aclu-pull-secret"},
 			AdditionalTrustBundle: &corev1.LocalObjectReference{Name: "trust-bundle"},
 		},
 	}
@@ -40,7 +40,11 @@ func TestIgnitionPayloadSpec(t *testing.T) {
 	spec := ignitionPayloadSpec(nodePool, hc, rolloutRefs, mgmtRefs, "rollout-global", "rhel-9", "private=false,port=6443")
 
 	g.Expect(spec.ReleaseImage).To(Equal("quay.io/openshift/release:4.23"))
+	// The CR lives in the HCP namespace and the generator resolves the pull secret there, so the spec
+	// must reference the HCP-namespace "pull-secret" — not the HC's own (clusters-namespace) pull
+	// secret name ("aclu-pull-secret"), which does not exist in the HCP namespace.
 	g.Expect(spec.PullSecret.Name).To(Equal("pull-secret"))
+	g.Expect(spec.PullSecret.Name).ToNot(Equal(hc.Spec.PullSecret.Name))
 	g.Expect(spec.AdditionalTrustBundle.Name).To(Equal("trust-bundle"))
 	g.Expect(spec.OSImageStream.Name).To(Equal("rhel-9"))
 	g.Expect(spec.RolloutGlobalConfig.Name).To(Equal("rollout-global"))

@@ -94,6 +94,24 @@ func (r *secretJanitor) Reconcile(ctx context.Context, req reconcile.Request) (r
 		return ctrl.Result{}, r.cleanupSecretForDeletion(ctx, secret)
 	}
 
+	// On the IgnitionPayloadSystem path the consumer (not the legacy Token) owns this NodePool's
+	// userdata and InPlace compat Secrets — including the adopted Secret that keeps its legacy
+	// user-data-/token- name but is now IgnitionPayload-owned. Their names no longer match the legacy
+	// expected set, so the validity check below would wrongly delete the live, CR-owned adopted Secret
+	// and strand the pool. Skip it; these Secrets are garbage-collected with the IgnitionPayload CR on
+	// NodePool teardown. The orphan-cleanup branches above (missing NodePool / deleting HostedCluster)
+	// still run. The CPO-capability gate matches the main reconcile so the janitor's view of the active
+	// path agrees with it: the consumer path is only taken when the CPO advertises support for the split
+	// ignition system.
+	cpoCapabilities, err := r.detectCPOCapabilities(ctx, hcluster)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to detect CPO capabilities: %w", err)
+	}
+	if ignitionPayloadConsumerEnabled(hcluster, cpoCapabilities.SupportsIgnitionPayloadSystem) {
+		log.V(3).Info("Skipping secretJanitor validity check on the IgnitionPayload path")
+		return ctrl.Result{}, nil
+	}
+
 	shouldKeepOldUserData, err := r.shouldKeepOldUserData(ctx, hcluster)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -121,10 +139,6 @@ func (r *secretJanitor) Reconcile(ctx context.Context, req reconcile.Request) (r
 	configGenerator, err := NewConfigGenerator(ctx, r.Client, hcluster, nodePool, releaseImage, haproxyRawConfig, controlPlaneNamespace, resolvedRHELStream)
 	if err != nil {
 		return ctrl.Result{}, err
-	}
-	cpoCapabilities, err := r.detectCPOCapabilities(ctx, hcluster)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to detect CPO capabilities: %w", err)
 	}
 	token, err := NewToken(ctx, configGenerator, cpoCapabilities)
 	if err != nil {

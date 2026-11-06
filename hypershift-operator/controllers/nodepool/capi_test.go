@@ -3079,6 +3079,42 @@ func TestPropagateVersionAndTemplate(t *testing.T) {
 			"bootstrap secret should still reference the old secret, not the new computed name")
 	})
 
+	// Gate-ON: the IgnitionPayload consumer owns userdata naming, so CAPI re-points at the override
+	// (or leaves the bootstrap untouched when no payload is published yet), bypassing the legacy
+	// hash-driven state machine.
+	t.Run("When the IgnitionPayload consumer is active, it re-points at the override name", func(t *testing.T) {
+		g := NewWithT(t)
+		cg := &ConfigGenerator{
+			rolloutConfig: &rolloutConfig{
+				releaseImage: &releaseinfo.ReleaseImage{
+					ImageStream: &imageapi.ImageStream{ObjectMeta: metav1.ObjectMeta{Name: "4.17.0"}},
+				},
+			},
+			nodePool:              &hyperv1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "test-np", Namespace: "test-ns"}},
+			controlplaneNamespace: "cp-ns",
+		}
+		newMD := func() *capiv1.MachineDeployment {
+			return &capiv1.MachineDeployment{Spec: capiv1.MachineDeploymentSpec{Template: capiv1.MachineTemplateSpec{Spec: capiv1.MachineSpec{
+				Bootstrap:         capiv1.Bootstrap{DataSecretName: ptr.To("existing-userdata")},
+				InfrastructureRef: capiv1.ContractVersionedObjectReference{Name: "same-template"},
+				Version:           "4.17.0",
+			}}}}
+		}
+		templateCR := &capiaws.AWSMachineTemplate{ObjectMeta: metav1.ObjectMeta{Name: "same-template"}}
+
+		// Override set and different → re-point, return true.
+		capi := &CAPI{Token: &Token{ConfigGenerator: cg, ignitionPayloadConsumerActive: true, userDataSecretNameOverride: "np-gen-2"}}
+		md := newMD()
+		g.Expect(capi.propagateVersionAndTemplate(logr.Discard(), md, templateCR)).To(BeTrue())
+		g.Expect(*md.Spec.Template.Spec.Bootstrap.DataSecretName).To(Equal("np-gen-2"))
+
+		// Empty override (no payload yet) → leave the existing DataSecretName untouched, return false.
+		capiEmpty := &CAPI{Token: &Token{ConfigGenerator: cg, ignitionPayloadConsumerActive: true}}
+		mdEmpty := newMD()
+		g.Expect(capiEmpty.propagateVersionAndTemplate(logr.Discard(), mdEmpty, templateCR)).To(BeFalse())
+		g.Expect(*mdEmpty.Spec.Template.Spec.Bootstrap.DataSecretName).To(Equal("existing-userdata"))
+	})
+
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
@@ -3159,6 +3195,45 @@ func TestPropagateVersionAndTemplate(t *testing.T) {
 }
 
 func TestPropagateVersionAndTemplateToMachineSet(t *testing.T) {
+	// Gate-ON: the IgnitionPayload consumer owns userdata naming. For InPlace pools, CAPI stamps the
+	// MachineSet targetConfigVersion (HCCO's in-place key) only for a genuine rollout
+	// (inPlaceConfigVersionOverride set); during adoption it stays empty so already-joined nodes are
+	// not rebooted.
+	t.Run("When the IgnitionPayload consumer is active, it re-points and stamps config version only on a genuine rollout", func(t *testing.T) {
+		g := NewWithT(t)
+		cg := &ConfigGenerator{
+			rolloutConfig: &rolloutConfig{
+				releaseImage: &releaseinfo.ReleaseImage{
+					ImageStream: &imageapi.ImageStream{ObjectMeta: metav1.ObjectMeta{Name: "4.17.0"}},
+				},
+			},
+			nodePool:              &hyperv1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "test-np", Namespace: "test-ns"}},
+			controlplaneNamespace: "cp-ns",
+		}
+		newMS := func() *capiv1.MachineSet {
+			return &capiv1.MachineSet{Spec: capiv1.MachineSetSpec{Template: capiv1.MachineTemplateSpec{Spec: capiv1.MachineSpec{
+				Bootstrap:         capiv1.Bootstrap{DataSecretName: ptr.To("existing-userdata")},
+				InfrastructureRef: capiv1.ContractVersionedObjectReference{Name: "same-template"},
+				Version:           "4.17.0",
+			}}}}
+		}
+		templateCR := &capiaws.AWSMachineTemplate{ObjectMeta: metav1.ObjectMeta{Name: "same-template"}}
+
+		// Adoption: override set, but no config-version override → re-point, do NOT stamp targetConfigVersion.
+		adopt := &CAPI{Token: &Token{ConfigGenerator: cg, ignitionPayloadConsumerActive: true, userDataSecretNameOverride: "existing-userdata"}}
+		msAdopt := newMS()
+		adopt.propagateVersionAndTemplateToMachineSet(logr.Discard(), msAdopt, templateCR)
+		g.Expect(msAdopt.Annotations).ToNot(HaveKey(nodePoolAnnotationTargetConfigVersion))
+
+		// Genuine rollout: override + config-version override → re-point and stamp targetConfigVersion.
+		roll := &CAPI{Token: &Token{ConfigGenerator: cg, ignitionPayloadConsumerActive: true, userDataSecretNameOverride: "np-gen-3", inPlaceConfigVersionOverride: "cfg-3"}}
+		msRoll := newMS()
+		g.Expect(roll.propagateVersionAndTemplateToMachineSet(logr.Discard(), msRoll, templateCR)).To(BeTrue())
+		g.Expect(*msRoll.Spec.Template.Spec.Bootstrap.DataSecretName).To(Equal("np-gen-3"))
+		g.Expect(msRoll.Annotations[nodePoolAnnotationTargetConfigVersion]).To(Equal("cfg-3"))
+		g.Expect(msRoll.Annotations[nodePoolAnnotationCurrentConfigVersion]).To(Equal("cfg-3"))
+	})
+
 	testCases := []struct {
 		name                     string
 		currentBootstrapName     string
@@ -3938,6 +4013,50 @@ func TestReconcileMachineSetStatus(t *testing.T) {
 		g.Expect(nodePool.Annotations[nodePoolAnnotationCurrentConfigVersion]).To(Equal(completedHash),
 			"currentConfigVersion should not be updated for management-side-only changes")
 	})
+}
+
+func TestSweepInFlightMachines(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	const ns = "hcp-ns"
+	nodePool := &hyperv1.NodePool{ObjectMeta: metav1.ObjectMeta{Namespace: "clusters", Name: "np-1"}}
+	nodePoolKey := client.ObjectKeyFromObject(nodePool).String()
+
+	cutoff := time.Now()
+	old := metav1.NewTime(cutoff.Add(-time.Hour))
+	recent := metav1.NewTime(cutoff.Add(time.Hour))
+
+	machine := func(name, npAnnotation string, created metav1.Time, joined bool) *capiv1.Machine {
+		m := &capiv1.Machine{ObjectMeta: metav1.ObjectMeta{
+			Namespace:         ns,
+			Name:              name,
+			CreationTimestamp: created,
+			Annotations:       map[string]string{nodePoolAnnotation: npAnnotation},
+		}}
+		if joined {
+			m.Status.NodeRef = capiv1.MachineNodeReference{Name: "node-" + name}
+		}
+		return m
+	}
+
+	// Only the not-yet-joined Machine of this pool created before the cutoff is swept.
+	inflightOld := machine("inflight-old", nodePoolKey, old, false)    // deleted
+	inflightNew := machine("inflight-new", nodePoolKey, recent, false) // kept: created after the refresh
+	joinedOld := machine("joined-old", nodePoolKey, old, true)         // kept: already joined
+	otherPool := machine("other-pool", "clusters/np-2", old, false)    // kept: different NodePool
+
+	c := fake.NewClientBuilder().WithScheme(api.Scheme).WithObjects(inflightOld, inflightNew, joinedOld, otherPool).Build()
+	capi := &CAPI{Token: &Token{ConfigGenerator: &ConfigGenerator{Client: c, nodePool: nodePool, controlplaneNamespace: ns}}}
+
+	g.Expect(capi.sweepInFlightMachines(ctx, cutoff)).To(Succeed())
+
+	remaining := &capiv1.MachineList{}
+	g.Expect(c.List(ctx, remaining, client.InNamespace(ns))).To(Succeed())
+	names := make([]string, 0, len(remaining.Items))
+	for i := range remaining.Items {
+		names = append(names, remaining.Items[i].Name)
+	}
+	g.Expect(names).To(ConsistOf("inflight-new", "joined-old", "other-pool"))
 }
 
 func TestPropagateLabelsAndTaintsToMachines(t *testing.T) {

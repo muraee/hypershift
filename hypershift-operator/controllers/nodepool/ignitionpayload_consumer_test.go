@@ -7,17 +7,43 @@ import (
 	. "github.com/onsi/gomega"
 
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
+	"github.com/openshift/hypershift/hypershift-operator/featuregate"
 	pkgmanifests "github.com/openshift/hypershift/pkg/manifests"
 	"github.com/openshift/hypershift/support/api"
 	payloadstore "github.com/openshift/hypershift/support/ignitionpayload"
 
+	configv1 "github.com/openshift/api/config/v1"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/utils/ptr"
 
+	capiv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
+
+// TestIgnitionPayloadConsumerEnabled is serial (no t.Parallel): it mutates the global management
+// feature gate and restores it on return. Top-level tests run sequentially, so the flip is not observed
+// by other tests.
+func TestIgnitionPayloadConsumerEnabled(t *testing.T) {
+	g := NewWithT(t)
+	defer featuregate.ConfigureFeatureSet(string(configv1.Default))
+
+	hc := &hyperv1.HostedCluster{}
+	disabled := &hyperv1.HostedCluster{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{hyperv1.DisableIgnitionServerAnnotation: "true"}},
+	}
+
+	featuregate.ConfigureFeatureSet(string(configv1.Default))
+	g.Expect(ignitionPayloadConsumerEnabled(hc, true)).To(BeFalse(), "gate off ⇒ legacy path")
+
+	featuregate.ConfigureFeatureSet(string(configv1.TechPreviewNoUpgrade))
+	g.Expect(ignitionPayloadConsumerEnabled(hc, true)).To(BeTrue(), "gate on + CPO supports split ignition ⇒ new path")
+	g.Expect(ignitionPayloadConsumerEnabled(hc, false)).To(BeFalse(), "gate on but CPO lacks split-ignition support ⇒ legacy path")
+	g.Expect(ignitionPayloadConsumerEnabled(disabled, true)).To(BeFalse(), "ignition disabled on the HC ⇒ legacy path")
+}
 
 func TestEnqueueNodePoolForIgnitionPayload(t *testing.T) {
 	g := NewWithT(t)
@@ -84,6 +110,71 @@ func TestAdvanceRetiredRolloutGeneration(t *testing.T) {
 	})
 }
 
+func TestPreviousGenerationDrained(t *testing.T) {
+	ctx := context.Background()
+	const ns, np, current = "hcp", "np-1", "np-1-2"
+
+	// md builds a Replace MachineDeployment pointed at dataSecret with the given rollout counts.
+	md := func(dataSecret string, gen, observed int64, replicas, upToDate, available int32) *capiv1.MachineDeployment {
+		return &capiv1.MachineDeployment{
+			ObjectMeta: metav1.ObjectMeta{Name: np, Namespace: ns, Generation: gen},
+			Spec: capiv1.MachineDeploymentSpec{
+				Replicas: ptr.To[int32](2),
+				Template: capiv1.MachineTemplateSpec{Spec: capiv1.MachineSpec{
+					Bootstrap: capiv1.Bootstrap{DataSecretName: ptr.To(dataSecret)},
+				}},
+			},
+			Status: capiv1.MachineDeploymentStatus{
+				ObservedGeneration: observed,
+				Replicas:           ptr.To(replicas),
+				UpToDateReplicas:   ptr.To(upToDate),
+				AvailableReplicas:  ptr.To(available),
+			},
+		}
+	}
+	check := func(objs []client.Object, upgradeType hyperv1.UpgradeType) (bool, error) {
+		c := fake.NewClientBuilder().WithScheme(api.Scheme).WithObjects(objs...).Build()
+		return previousGenerationDrained(ctx, c, ns, np, upgradeType, current)
+	}
+
+	t.Run("Replace fully rolled out onto current ⇒ drained", func(t *testing.T) {
+		g := NewWithT(t)
+		drained, err := check([]client.Object{md(current, 1, 1, 2, 2, 2)}, hyperv1.UpgradeTypeReplace)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(drained).To(BeTrue())
+	})
+	t.Run("Replace not yet fully up-to-date ⇒ not drained", func(t *testing.T) {
+		g := NewWithT(t)
+		drained, err := check([]client.Object{md(current, 1, 1, 2, 1, 2)}, hyperv1.UpgradeTypeReplace)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(drained).To(BeFalse())
+	})
+	t.Run("Replace status lagging spec generation ⇒ not drained", func(t *testing.T) {
+		g := NewWithT(t)
+		drained, err := check([]client.Object{md(current, 2, 1, 2, 2, 2)}, hyperv1.UpgradeTypeReplace)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(drained).To(BeFalse())
+	})
+	t.Run("Replace MD still on previous userData ⇒ not drained", func(t *testing.T) {
+		g := NewWithT(t)
+		drained, err := check([]client.Object{md("np-1-1", 1, 1, 2, 2, 2)}, hyperv1.UpgradeTypeReplace)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(drained).To(BeFalse())
+	})
+	t.Run("Replace MD absent ⇒ not drained", func(t *testing.T) {
+		g := NewWithT(t)
+		drained, err := check(nil, hyperv1.UpgradeTypeReplace)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(drained).To(BeFalse())
+	})
+	t.Run("InPlace is out of scope ⇒ not drained", func(t *testing.T) {
+		g := NewWithT(t)
+		drained, err := check([]client.Object{md(current, 1, 1, 2, 2, 2)}, hyperv1.UpgradeTypeInPlace)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(drained).To(BeFalse())
+	})
+}
+
 // seedConsumerCR creates a CR whose generator has already published status.current, plus the
 // matching store entry, so the consumer end-to-end path has a payload to reference.
 func seedConsumerCR(ctx context.Context, g *WithT, hcpNS string) (client.Client, payloadstore.PayloadStore) {
@@ -125,11 +216,11 @@ func TestReconcileIgnitionPayloadConsumer(t *testing.T) {
 			machineSetName:          "np-1",
 		}
 
-		// The consumer returns the generator-authored userData Secret name from status.current; it
-		// never mints userdata itself.
-		userDataName, err := reconcileIgnitionPayloadConsumer(ctx, c, store, nodePool, hc, in)
+		// A never-provisioned pool (no existing DataSecretName) is born on the generator's canonical
+		// userData Secret name from status.current; the consumer never mints userdata itself.
+		decision, err := reconcileIgnitionPayloadConsumer(ctx, c, store, nodePool, hc, in)
 		g.Expect(err).ToNot(HaveOccurred())
-		g.Expect(userDataName).To(Equal("np-1-1"))
+		g.Expect(decision.userDataSecretName).To(Equal("np-1-1"))
 
 		// CR spec authored with the classified refs + endpoint rollout input + finalizer; status
 		// preserved.
@@ -187,10 +278,10 @@ func TestReconcileIgnitionPayloadConsumer(t *testing.T) {
 		store := payloadstore.NewMemStore()
 
 		in := ignitionConsumerInputs{releaseVersion: "4.23.0", haproxyRaw: "h", machineSetName: "np-1"}
-		// No status.current yet: the consumer authors the CR but returns no userData Secret name.
-		userDataName, err := reconcileIgnitionPayloadConsumer(ctx, c, store, nodePool, hc, in)
+		// No status.current yet: the consumer authors the CR but returns the zero adoption decision.
+		decision, err := reconcileIgnitionPayloadConsumer(ctx, c, store, nodePool, hc, in)
 		g.Expect(err).ToNot(HaveOccurred())
-		g.Expect(userDataName).To(BeEmpty())
+		g.Expect(decision.userDataSecretName).To(BeEmpty())
 		g.Expect(c.Get(ctx, client.ObjectKey{Namespace: hcpNS, Name: "np-1"}, &hyperv1.IgnitionPayload{})).To(Succeed())
 	})
 }

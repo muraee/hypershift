@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
+	"github.com/openshift/hypershift/support/manifests"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -28,8 +29,12 @@ const consumerFinalizer = "hypershift.openshift.io/ignition-payload-consumer"
 func ignitionPayloadSpec(nodePool *hyperv1.NodePool, hc *hyperv1.HostedCluster,
 	rolloutRefs, mgmtRefs []hyperv1.ConfigMapReference, rolloutGlobalConfigName, osStream, additionalRolloutInputs string) hyperv1.IgnitionPayloadSpec {
 	spec := hyperv1.IgnitionPayloadSpec{
-		ReleaseImage:            nodePool.Spec.Release.Image,
-		PullSecret:              hyperv1.SecretReference{Name: hc.Spec.PullSecret.Name},
+		ReleaseImage: nodePool.Spec.Release.Image,
+		// The CR lives in the HCP namespace, and the generator resolves spec.pullSecret in that same
+		// namespace. hc.Spec.PullSecret.Name is the pull secret's name in the HC's own (clusters)
+		// namespace, which does not exist in the HCP namespace. Reference the HCP-namespace pull
+		// secret, which the control plane always reconciles under the canonical "pull-secret" name.
+		PullSecret:              hyperv1.SecretReference{Name: manifests.PullSecret("").Name},
 		RolloutGlobalConfig:     hyperv1.ConfigMapReference{Name: rolloutGlobalConfigName},
 		AdditionalRolloutInputs: additionalRolloutInputs,
 		RolloutConfigMaps:       rolloutRefs,

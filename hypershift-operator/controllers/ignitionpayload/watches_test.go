@@ -43,6 +43,22 @@ func TestReconciler_EnqueueIgnitionPayloadsForConfigMap(t *testing.T) {
 	g.Expect(r.enqueueIgnitionPayloadsForConfigMap(ctx, cfgMap(testNS, "haproxy-b", ""))).To(ConsistOf(reqFor("b")))
 	g.Expect(r.enqueueIgnitionPayloadsForConfigMap(ctx, cfgMap(testNS, "gc-b", ""))).To(ConsistOf(reqFor("b")))
 	g.Expect(r.enqueueIgnitionPayloadsForConfigMap(ctx, cfgMap(testNS, "unrelated", ""))).To(BeEmpty())
+
+	// A cloud-provider-config ConfigMap feeds every payload's identity hash, so it enqueues all.
+	g.Expect(r.enqueueIgnitionPayloadsForConfigMap(ctx, cfgMap(testNS, "azure-cloud-config", ""))).To(ConsistOf(reqFor("a"), reqFor("b")))
+	g.Expect(r.enqueueIgnitionPayloadsForConfigMap(ctx, cfgMap(testNS, "openstack-cloud-config", ""))).To(ConsistOf(reqFor("a"), reqFor("b")))
+}
+
+func TestReconciler_EnqueueAllForHostedControlPlane(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	crA := crWithRefs("a", hyperv1.IgnitionPayloadSpec{})
+	crB := crWithRefs("b", hyperv1.IgnitionPayloadSpec{})
+	c := fake.NewClientBuilder().WithScheme(api.Scheme).WithObjects(crA, crB).Build()
+	r := &Reconciler{Client: c, Namespace: testNS}
+
+	hcp := &hyperv1.HostedControlPlane{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "hcp"}}
+	g.Expect(r.enqueueAllForHostedControlPlane(ctx, hcp)).To(ConsistOf(reqFor("a"), reqFor("b")))
 }
 
 func TestReconciler_EnqueueIgnitionPayloadsForSecret(t *testing.T) {

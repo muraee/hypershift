@@ -87,6 +87,25 @@ type Token struct {
 	// secretState records which state the secret maintenance state machine
 	// resolved to during this reconcile cycle.
 	secretState secretMaintenanceState
+
+	// ignitionPayloadConsumerActive is true on the IgnitionPayloadSystem (gate-ON) path, where the
+	// IgnitionPayload consumer — not this Token — owns userdata generation and naming for the NodePool.
+	// When true, CAPI bypasses the legacy hash-driven bootstrap re-point entirely and instead points
+	// Machines at userDataSecretNameOverride (the name the consumer decided via adoption). When false
+	// (gate-OFF) every consumer branch is skipped, so the legacy path is byte-for-byte unchanged.
+	ignitionPayloadConsumerActive bool
+	// userDataSecretNameOverride is the userdata Secret name the consumer decided for this NodePool
+	// (the adopted legacy name, or the canonical <ignitionpayload-name>-<rolloutGeneration>). An empty
+	// value on the gate-ON path means no payload is published yet, so CAPI leaves the existing
+	// DataSecretName untouched and the reconcile requeues. Ignored when ignitionPayloadConsumerActive
+	// is false.
+	userDataSecretNameOverride string
+	// inPlaceConfigVersionOverride is the config version HCCO's in-place upgrader keys on
+	// (token-<machineSet>-<configVersion>), set on the gate-ON path to status.current.configHash for a
+	// genuine InPlace rollout. It is deliberately empty during adoption so CAPI does NOT re-stamp the
+	// MachineSet targetConfigVersion annotation (which would reboot the pool's already-joined nodes).
+	// Ignored when ignitionPayloadConsumerActive is false.
+	inPlaceConfigVersionOverride string
 }
 
 // userData contains the input necessary to generate the user data secret
