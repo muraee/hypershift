@@ -6527,9 +6527,11 @@ func TestRouterComponentComesAfterRouteCreatingComponents(t *testing.T) {
 
 	// These components create Route objects via their manifest adapters.
 	// The router must come after all of them so its HAProxy config includes
-	// every route on the first reconcile pass.
+	// every route on the first reconcile pass. ignition-server is intentionally
+	// not listed: with IgnitionPayloadSystem enabled by default the HO owns the
+	// ignition components and the CPO stands them down, so the CPO no longer
+	// registers ignition-server as a route-creating component.
 	routeCreatingComponents := []string{
-		ignitionserverv2.ComponentName,
 		metricsproxyv2.ComponentName,
 	}
 	for _, name := range routeCreatingComponents {

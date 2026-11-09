@@ -240,6 +240,16 @@ func GetControlPlaneWorkloads() []WorkloadSpec {
 			},
 		},
 		{
+			// The payload generator is reconciled from the HO image alongside the serving tier when the
+			// IgnitionPayloadSystem gate is on (default); registered so it inherits the shared workload
+			// compliance coverage and is not flagged as an unrecognized pod.
+			Type: "Deployment",
+			Name: "ignition-server-generator",
+			PodSelector: map[string]string{
+				"app": "ignition-server-generator",
+			},
+		},
+		{
 			Type: "Deployment",
 			Name: "ignition-server-proxy",
 			PodSelector: map[string]string{

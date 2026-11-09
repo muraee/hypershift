@@ -29,7 +29,7 @@ var (
 	externalOIDCWithUpstreamParityFeature           = featuregates.NewFeature(ExternalOIDCWithUpstreamParity, featuregates.WithEnableForFeatureSets(configv1.TechPreviewNoUpgrade, configv1.Default))
 	kubeletHAProxyRoutingFeature                    = featuregates.NewFeature(KubeletHAProxyRouting, featuregates.WithEnableForFeatureSets(configv1.TechPreviewNoUpgrade))
 	externalOIDCAsWebhook                           = featuregates.NewFeature(ExternalOIDCAsWebhook, featuregates.WithEnableForFeatureSets(configv1.TechPreviewNoUpgrade))
-	ignitionPayloadSystemFeature                    = featuregates.NewFeature(IgnitionPayloadSystem, featuregates.WithEnableForFeatureSets(configv1.TechPreviewNoUpgrade))
+	ignitionPayloadSystemFeature                    = featuregates.NewFeature(IgnitionPayloadSystem, featuregates.WithEnableForFeatureSets(configv1.TechPreviewNoUpgrade, configv1.Default))
 )
 
 func init() {

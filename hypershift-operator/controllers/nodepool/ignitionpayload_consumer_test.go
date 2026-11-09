@@ -36,8 +36,14 @@ func TestIgnitionPayloadConsumerEnabled(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{hyperv1.DisableIgnitionServerAnnotation: "true"}},
 	}
 
-	featuregate.ConfigureFeatureSet(string(configv1.Default))
+	// Gate off (a feature set that does not enable IgnitionPayloadSystem) ⇒ legacy path, regardless of
+	// CPO capability.
+	featuregate.ConfigureFeatureSet(string(configv1.DevPreviewNoUpgrade))
 	g.Expect(ignitionPayloadConsumerEnabled(hc, true)).To(BeFalse(), "gate off ⇒ legacy path")
+
+	// IgnitionPayloadSystem is enabled by default, and also under TechPreviewNoUpgrade.
+	featuregate.ConfigureFeatureSet(string(configv1.Default))
+	g.Expect(ignitionPayloadConsumerEnabled(hc, true)).To(BeTrue(), "gate on (default) + CPO supports split ignition ⇒ new path")
 
 	featuregate.ConfigureFeatureSet(string(configv1.TechPreviewNoUpgrade))
 	g.Expect(ignitionPayloadConsumerEnabled(hc, true)).To(BeTrue(), "gate on + CPO supports split ignition ⇒ new path")
