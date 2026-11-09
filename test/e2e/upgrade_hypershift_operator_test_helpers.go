@@ -28,6 +28,19 @@ const (
 	nodePoolAnnotation             = "hypershift.openshift.io/nodePool"
 )
 
+// ignitionPayloadSystemActive reports whether the re-architected ignition system (IgnitionPayloadSystem)
+// is active for this control plane: when it is, the generator authors an IgnitionPayload CR per NodePool
+// in the HCP namespace and owns userData plus signed-JWT token rotation (the NodePool consumer never calls
+// token.Reconcile), so the legacy token-Secret rotation assertions no longer apply. Returns false when the
+// CRD is absent (older operator / legacy path), which is the correct behavior for that case.
+func ignitionPayloadSystemActive(ctx context.Context, client crclient.Client, hcpNamespace string) bool {
+	list := &hyperv1.IgnitionPayloadList{}
+	if err := client.List(ctx, list, crclient.InNamespace(hcpNamespace)); err != nil {
+		return false
+	}
+	return len(list.Items) > 0
+}
+
 // bootstrapChainState captures the complete bootstrap credential chain for a NodePool,
 // including the CAPI workload's bootstrap Secret reference and the referenced token/userdata Secrets.
 type bootstrapChainState struct {

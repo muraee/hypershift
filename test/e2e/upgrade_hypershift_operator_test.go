@@ -251,6 +251,14 @@ func TestUpgradeHyperShiftOperator(t *testing.T) {
 		})).To(gomega.BeTrue(), "Verify upgrade invariants should succeed")
 
 		g.Expect(t.Run("Verify token rotation after upgrade", func(t *testing.T) {
+			// The re-architected ignition system (IgnitionPayloadSystem, default-on) retires the legacy
+			// token-Secret rotation: the generator authors userData and re-issues the signed JWT, and the
+			// NodePool consumer never calls token.Reconcile. When it is active these legacy rotation checks
+			// do not apply (new-path rotation is covered by the JWT-minter unit tests); the no-roll
+			// invariants above still run unconditionally and remain the fleet-safety gate.
+			if ignitionPayloadSystemActive(ctx, mgmtClient, hcpNameSpace) {
+				t.Skip("IgnitionPayloadSystem active: legacy token-Secret rotation is retired on the new ignition path")
+			}
 			t.Log("Verifying token rotation and bootstrap credential updates after operator upgrade")
 			g := gomega.NewWithT(t)
 
