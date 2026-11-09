@@ -41,9 +41,6 @@
                     },
                     {
                         "name": "AWSManagedDNS"
-                    },
-                    {
-                        "name": "IgnitionPayloadSystem"
                     }
                 ],
                 "enabled": [
@@ -69,6 +66,9 @@
                     },
                     {
                         "name": "HCPUserFacingOperatorLogs"
+                    },
+                    {
+                        "name": "IgnitionPayloadSystem"
                     }
                 ],
                 "version": ""

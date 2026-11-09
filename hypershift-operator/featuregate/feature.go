@@ -79,12 +79,12 @@ const (
 	// owner: @jparrill
 	// alpha: v0.1.84
 	KubeletHAProxyRouting featuregate.Feature = "KubeletHAProxyRouting"
-	// IgnitionPayloadSystem gates the re-architected ignition system. In this phase, enabling it
-	// (through the TechPreviewNoUpgrade feature set) only installs the IgnitionPayload CRD —
-	// nothing consumes the gate at runtime yet. Later phases wire it up so the HO deploys the
-	// split ignition-payload-controller + ignition-payload-server (+ proxy) from the HO image and
-	// switches the NodePool controller onto the IgnitionPayload path in place of the legacy
-	// ignition-server. Fleet-wide selector (no per-HostedCluster opt-in).
+	// IgnitionPayloadSystem gates the re-architected ignition system: the HO deploys the split
+	// ignition-payload-controller + ignition-payload-server (+ proxy) from the HO image and the
+	// NodePool controller drives the IgnitionPayload path in place of the legacy ignition-server.
+	// Enabled by default; a HostedCluster only switches over once its CPO advertises support via the
+	// control-plane-operator-supports-ignition-payload-system image label, so mixed-control-plane-version
+	// fleets adopt existing NodePools without rolling them. Fleet-wide selector (no per-HostedCluster opt-in).
 	// owner: @muraee
 	// alpha: v0.1.84
 	IgnitionPayloadSystem featuregate.Feature = "IgnitionPayloadSystem"
@@ -104,7 +104,7 @@ var (
 	deterministicLBIPFeature       = featuregates.NewFeature(DeterministicLBIP, featuregates.WithEnableForFeatureSets(configv1.TechPreviewNoUpgrade))
 	awsManagedDNSFeature           = featuregates.NewFeature(AWSManagedDNS, featuregates.WithEnableForFeatureSets(configv1.TechPreviewNoUpgrade))
 	kubeletHAProxyRoutingFeature   = featuregates.NewFeature(KubeletHAProxyRouting, featuregates.WithEnableForFeatureSets(configv1.TechPreviewNoUpgrade))
-	ignitionPayloadSystemFeature   = featuregates.NewFeature(IgnitionPayloadSystem, featuregates.WithEnableForFeatureSets(configv1.TechPreviewNoUpgrade))
+	ignitionPayloadSystemFeature   = featuregates.NewFeature(IgnitionPayloadSystem, featuregates.WithEnableForFeatureSets(configv1.TechPreviewNoUpgrade, configv1.Default))
 )
 
 func init() {
