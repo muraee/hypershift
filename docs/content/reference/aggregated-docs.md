@@ -14976,7 +14976,7 @@ Pull request callers resolve their reusable workflows from `main`, while post-me
 | Caller | Reusable | Purpose |
 |--------|----------|---------|
 | `codespell.yaml` | `codespell-reusable.yaml` | Spell checking across the codebase |
-| `deadcode.yaml` | `deadcode-reusable.yaml` | Whole-program dead-code analysis; fails on any candidate |
+| `deadcode.yaml` | `deadcode-reusable.yaml` | Whole-program dead-code analysis; temporarily advisory pending CNTRLPLANE-4936 |
 | `gitlint.yaml` | `gitlint-reusable.yaml` | Commit message format validation |
 | `lint.yaml` | `lint-reusable.yaml` | Go linting via `golangci-lint` |
 | `verify.yaml` | `verify-reusable.yaml` | Full verification (`make verify`) |
@@ -15802,7 +15802,6 @@ Post in #forum-ocp-hypershift and tag `@hypershift-engineering-ic` with:
 - Verify and debug — Reading test results, Ginkgo output, and cluster dumps
 - V2 E2E Testing Guides — Authoring, migration, execution flow, and CI configuration
 - CI Pipeline Configuration — How presubmit jobs are configured
-- Test Flow — End-to-end CI sequence, process boundaries, and inter-process communication
 - Daily CI Health — Monitoring periodic and presubmit job health
 
 
@@ -15972,7 +15971,7 @@ Or find the run in the Prow job history :octicons-link-external-16:.
 
 Use this page when adding or changing CI jobs. For test authoring and selection
 in existing jobs, follow Writing V2 Tests. For execution and
-process boundaries, see Test Flow.
+process boundaries, see the execution model.
 
 ## Repository ownership
 
@@ -15989,12 +15988,23 @@ Use the current source for implementation details:
 - Platform configuration
   and test plans:
   supported interfaces and plan validation.
+- Platform implementations:
+  current variants and coverage allocation.
 - HyperShift step registry
   and job configurations:
   workflows, credentials, images, timeouts, and job selection.
 
 For registry conventions and workflow, chain, and ref definitions, follow the
 OpenShift CI step registry documentation.
+
+## Lifecycle handoff
+
+Creation records cluster identities and teardown inputs in a
+shared manifest
+before provisioning. Execution, collection, and teardown consume that manifest,
+allowing cleanup after partial provisioning. Preserve this handoff when changing
+orchestration, and ensure the CI workflow schedules diagnostic collection and
+teardown after failures.
 
 ## Add or change a job
 
@@ -16035,9 +16045,36 @@ for CI reporting and Component Readiness.
   local verification, and debugging.
 - Migrating from V1 to V2: Procedure for transferring test
   responsibility and retiring the corresponding v1 execution.
-- Test Flow: Execution flow, process boundaries, and test isolation.
 - CI Pipeline Configuration: Job infrastructure and integration
   with the openshift/release step registry.
+
+## Execution model
+
+The v2 lifecycle separates provisioning, test execution, diagnostic collection,
+and teardown. Tests consume operational hosted clusters; lifecycle orchestration
+owns provisioning and initial readiness.
+
+```mermaid
+flowchart LR
+    P["Test plan"] --> C["Provision guests"]
+    P --> R["Run selected test groups"]
+    C --> S["Shared cluster manifest"]
+    S --> R
+    S --> D["Collect diagnostics"]
+    S --> T["Destroy guests"]
+    R --> B["Test subprocesses"]
+    B --> A["JUnit reports"]
+```
+
+This diagram shows responsibilities and data dependencies. CI workflows define
+when collection and teardown execute, including after failures; see
+CI Pipeline Configuration.
+
+A `TestPlan` selects cluster variants and arranges test groups. Platform
+implementations own how those variants are provisioned. Each group runs in a
+separate test subprocess targeting one hosted cluster, with labels selecting
+its coverage. For scheduling and cluster isolation, follow the
+selection rules.
 
 
 ---
@@ -16229,458 +16266,15 @@ equivalence. No permanent inventory of semantic identities is required.
 
 ---
 
-## Source: docs/content/how-to/ci/v2-testing/test-flow.md
-
-# E2E v2 Test Flow
-
-This document describes the end-to-end flow of the HyperShift v2 e2e test framework,
-from CI job trigger through test execution and teardown. It covers process boundaries,
-inter-process communication, and the sequencing of mutually exclusive tests.
-
-## Contents
-
-- Ginkgo Decorators, Hooks, and Labels for Test Isolation
-    - Decorators
-    - Hooks
-    - Labels
-    - How These Layers Compose
-- High-Level Flow
-- Inside a test-e2e-v2 Process (Ginkgo Lifecycle)
-- Process Boundary Summary
-- Sequencing of Mutually Exclusive Tests
-- Inter-Process Communication
-
-## Ginkgo Decorators, Hooks, and Labels for Test Isolation
-
-The v2 framework uses Ginkgo features at two levels to keep tests from interfering
-with each other: the [**`run-tests` orchestrator**][run-tests] isolates test groups
-into separate OS processes targeting different clusters, and **within each process**,
-Ginkgo decorators and hooks manage execution order, state mutation, cleanup, and
-reporting semantics.
-
-### Decorators
-
-| Decorator | Purpose | Used by |
-|-----------|---------|---------|
-| **`Ordered`** | Specs in the container run in declaration order. If one fails, subsequent specs in the same container are skipped. Prevents dependent steps from running against corrupted state. | [BackupRestore, EtcdSnapshot][backup-restore-test], [EtcdChaos][etcd-chaos-test], [AzurePrivateLink, AzureEndpointAccess][azure-test], [PKI operator TLS modification][pki-test], [AdmissionPolicies][security-test], [ImageRegistryCapability][image-registry-test], [ExternalOIDCKeycloakAuth][external-oidc-test] |
-| **`Serial`** | Specs never run concurrently with other specs, even if Ginkgo parallel mode were enabled. Applied alongside `Ordered` when a test mutates shared cluster state that could interfere with other specs. | [BackupRestore, EtcdSnapshot][backup-restore-test] (separate binary), [PKI operator TLS modification][pki-test] |
-
-`Ordered` is the primary tool for inter-test dependencies within a single feature
-(e.g., backup must complete before restore can start). `Serial` adds the guarantee
-that no other spec in the process runs at the same time, which matters for tests
-that mutate cluster-wide resources like HostedCluster configuration or etcd state.
-In practice, since `run-tests` does not pass `--procs` to Ginkgo, all specs within
-a process already run sequentially — but `Serial` makes the constraint explicit and
-future-proof.
-
-### Hooks
-
-| Hook | Scope | Purpose |
-|------|-------|---------|
-| **`BeforeSuite`** | Once per process | Initializes the global [`TestContext`][test-context] from env vars (cluster name, namespace, artifact dir, management client). Runs before any spec. See [`suite_test.go`][suite-test]. |
-| **`BeforeAll`** | Once per `Ordered` container | Initializes shared state for an ordered sequence (e.g., resolve `TestContext`, validate platform support, capture original config for later restoration). Runs once before the first spec in the container. |
-| **`AfterAll`** | Once per `Ordered` container | Tears down shared state created by `BeforeAll` (e.g., delete backup resources, restore original HostedCluster config). |
-| **`BeforeEach`** | Before every spec | Top-level: resolves `TestContext` and validates the hosted cluster resource exists on the management cluster. (`Ordered` containers use `BeforeAll` for the same purpose.) Nested (in `Context`/`When` blocks) or inline in specs: runs platform guards (`Skip()` if wrong platform) or other precondition checks. |
-| **`DeferCleanup`** | After each spec (LIFO) | Restores mutated state or deletes created resources. Registered immediately after mutation/creation so cleanup runs even if the test panics or fails before reaching manual deletion. |
-
-The `BeforeAll`/`AfterAll` pair is critical for lifecycle tests that share expensive
-preconditions across multiple ordered specs (e.g., backup-restore creates a backup
-once, then multiple specs verify different aspects of the restore). Without `Ordered`,
-`BeforeAll`/`AfterAll` cannot be used — Ginkgo enforces this at the framework level.
-
-### Labels
-
-| Label | Effect |
-|-------|--------|
-| **`lifecycle`** | Marks tests that mutate cluster state (upgrades, nodepool scaling, etcd chaos, global pull secret, OS image stream, autoscaling, platform-specific lifecycle). The simple [`hypershift-e2e-v2` CI chain][e2e-v2-chain] filters these out with `--ginkgo.label-filter='!lifecycle'` so that read-only compliance runs don't trigger mutations. The `run-tests` orchestrator runs lifecycle tests on dedicated clusters via specific label filters. |
-| **`Informing`** | The custom [`InformingAwareFailHandler`][fail-handler] converts failures on specs with this label into skips. The test appears as "skipped" in JUnit XML rather than "failed", so it doesn't block the CI job. Used for tests validating optional or in-progress features (e.g., metrics forwarding, custom labels/tolerations). |
-| **Feature/platform labels** (e.g., `self-managed-azure-public`, `nodepool-autoscaling`, `control-plane-upgrade`) | Control which specs run in which `test-e2e-v2` process. The [`run-tests` orchestrator][run-tests] passes `--ginkgo.label-filter` expressions from the [`TestMatrix`][azure-platform]. The default Azure plan intentionally reuses `hosted-cluster-health` and `control-plane-workloads` in the post-upgrade health step, so those specs run again after upgrade. |
-
-### How These Layers Compose
-
-```text
-run-tests orchestrator
-├── Sequential group (public cluster)
-│   ├── Process 1a: --ginkgo.label-filter="self-managed-azure-public || control-plane-workloads || ..."
-│   │   ├── Describe "Control Plane Workloads" ← read-only, no Ordered needed
-│   │   └── Context "Custom labels" [Informing] ← failure → skip, non-blocking
-│   └── Process 1b: --ginkgo.label-filter="nodepool-vm-size-rollout || ..."
-│       └── Describe "NodePool Lifecycle" ← independently labeled mutation specs
-├── Parallel process (private cluster): --ginkgo.label-filter="self-managed-azure-private || ..."
-│   └── ...
-└── Sequential group (upgrade cluster):
-        ├── Process 6a: --ginkgo.label-filter="control-plane-upgrade" ← must finish before 6b
-        │   └── Describe "Control Plane Upgrade" ← triggers version rollout
-        ├── Process 6b: --ginkgo.label-filter="hosted-cluster-health || control-plane-workloads" ← must finish before 6c
-        │   └── Describe "Post-upgrade health" ← validates recovered workloads
-        ├── Process 6c: --ginkgo.label-filter="control-plane-pki-operator" ← must finish before 6d
-        │   └── Describe "Control Plane TLS" ← validates certificate rotation
-        └── Process 6d: --ginkgo.label-filter="etcd-chaos" ← only runs if 6c passed
-            └── Describe "Etcd Chaos" [Ordered] ← specs run in order, BeforeAll snapshots etcd
-```
-
-For the default Azure `TestPlan`, cluster-level isolation (different processes target
-different clusters) prevents inter-group interference. A custom `TEST_PLAN` must keep
-each hosted-cluster variant in one top-level execution lane; the runner does not
-reject a variant used by multiple concurrent lanes. Within a process, `Ordered`/`Serial`
-prevent inter-spec interference for mutation-heavy features. `DeferCleanup` ensures
-each spec restores what it touched. `Informing` decouples experimental coverage from
-gate status. The `lifecycle` label separates mutation tests from read-only compliance
-runs at the CI job level.
-
-## High-Level Flow
-
-The diagram below shows the general v2 e2e flow. The framework is
-platform-agnostic — each platform implements the [`PlatformConfig`][platform]
-interface. Azure and AWS provide implementations; Azure serves as the reference
-for the multi-cluster lifecycle flow. The concrete examples here follow the
-[`e2e-azure-v2-self-managed`][ci-job-config] CI job and its
-[workflow][workflow]. ci-operator builds the [`hypershift-tests`][dockerfile-e2e]
-image (via [`Dockerfile.e2e`][dockerfile-e2e], which invokes several
-[`Makefile`][makefile] targets), then chains together cluster creation, test
-execution, and teardown steps.
-
-```mermaid
-sequenceDiagram
-    autonumber
-
-    box Prow Cluster
-        participant Prow
-        participant CIO as ci-operator
-    end
-
-    box CI Pod (hypershift-tests image)
-        participant CG as create-guests
-        participant RT as run-tests
-        participant T as test-e2e-v2<br/>(subprocesses)
-        participant DG as destroy-guests
-    end
-
-    participant MC as Management Cluster<br/>(nested OCP)
-
-    Note over Prow,MC: Phase 1: CI Job Setup (openshift-release workflow)
-
-    Prow->>CIO: Trigger job (PR event / periodic)
-    CIO->>CIO: Build hypershift-tests image (Dockerfile.e2e)
-
-    Note over CIO: Key v2 binaries:<br/>test-e2e-v2, test-backuprestore, create-guests,<br/>run-tests, destroy-guests, dump-guests, hypershift
-
-    CIO->>CIO: Execute workflow pre steps
-
-    Note over CIO,MC: Pre steps (sequential):<br/>1. ipi-install-rbac<br/>2. hypershift-setup-nested-management-cluster<br/>3. hypershift-azure-setup-private-link<br/>4. hypershift-install (HyperShift operator)<br/>5. hypershift-resolve-nodepool-releases<br/>6. create-selfmanaged-guests (shown below)
-
-    Note over Prow,MC: Phase 2: Guest Cluster Creation (create-guests binary, pre step 6)
-
-    CIO->>CG: Run create-selfmanaged-guests step<br/>(KUBECONFIG=management_cluster_kubeconfig)
-
-    activate CG
-    Note over CG: Single Go process, phases run sequentially.<br/>Phases 1, 3, and 5 use internal goroutines for parallelism.
-
-    par Phase 1: Create 6 clusters in parallel (goroutines + exec.Command)
-        CG->>MC: Create public-{hash}
-        CG->>MC: Create private-{hash} (Private endpoint access)
-        CG->>MC: Create oauth-lb-{hash} (OAuth via LoadBalancer)
-        CG->>MC: Create oauth-lb-private-{hash} (Private access, OAuth via LoadBalancer)
-        CG->>MC: Create upgrade-{hash} (N-1 release, HA control plane)
-        CG->>MC: Create external-oidc-{hash}
-    end
-    Note right of CG: Each calls `hypershift create cluster azure`<br/>with variant-specific flags.<br/>Hooks run between phases:<br/>PreCreate (deploy Keycloak),<br/>PostCreate (patch OperatorConfiguration),<br/>PostAvailable, PostVersionRollout (OIDC config).
-
-    CG->>MC: Watch all clusters for Available condition<br/>(controller-runtime Watch, 45m timeout)
-    MC-->>CG: All 6 clusters Available
-
-    CG->>MC: Watch for version rollout completion<br/>(VersionState=Completed on all history entries)
-    MC-->>CG: All 6 clusters rolled out
-
-    CG->>CG: Write cluster names and<br/>platform-specific config to SHARED_DIR
-    deactivate CG
-
-    Note over Prow,MC: Phase 3: Test Execution (run-tests binary)
-
-    CIO->>RT: Run run-e2e-v2-selfmanaged step<br/>(KUBECONFIG=management_cluster_kubeconfig)
-
-    activate RT
-    Note over RT: Reads HYPERSHIFT_PLATFORM → resolves the default TestPlan or TEST_PLAN<br/>Reads cluster names and platform config from SHARED_DIR
-
-    RT->>RT: PlatformConfig.SetupTestEnv()<br/>(set env vars from SHARED_DIR files)
-
-    par Test lanes (each lane is a goroutine, steps within each lane are sequential)
-        RT->>T: private-{hash} (private topology + compliance)
-        RT->>T: oauth-lb-private-{hash} (private topology with OAuth via LoadBalancer)
-        RT->>T: public-{hash} (platform, feature, then NodePool rollout tests)
-        RT->>T: oauth-lb-{hash} (OAuth/configuration, NodePool config including MachineConfig rollout, then autoscaling balancing)
-        RT->>T: external-oidc-{hash} (OIDC/pull-secret, autoscaling scale-up/down, then trust bundle tests)
-    end
-    Note right of RT: Each subprocess receives the cluster name via env vars,<br/>plus its label filter via --ginkgo.label-filter
-
-    par Sequential group: upgrade-and-chaos (single goroutine, steps run in order)
-        RT->>T: upgrade-{hash} (upgrade tests)
-        Note over T: Process 6a (upgrade)
-        T-->>RT: exit 0 (upgrade passed)
-
-        RT->>T: upgrade-{hash} (post-upgrade-health)
-        Note over T: Process 6b (post-upgrade-health)
-        T-->>RT: exit 0 (post-upgrade-health passed)
-
-        RT->>T: upgrade-{hash} (control-plane-tls)
-        Note over T: Process 6c (control-plane-tls)
-        T-->>RT: exit 0 (control-plane-tls passed)
-
-        RT->>T: upgrade-{hash} (etcd-chaos, same cluster)
-        Note over T: Process 6d (etcd-chaos)
-        T-->>RT: exit 0 or error
-    end
-
-    T-->>RT: All test lanes return exit codes
-    RT->>RT: Collect results, report pass/fail summary
-    RT-->>CIO: exit code (0 if all passed)
-    deactivate RT
-
-    Note over Prow,MC: Phase 4: Teardown (post steps, always run)
-
-    CIO->>CIO: Run dump-guests<br/>(collect artifacts from all clusters)
-
-    CIO->>DG: Run destroy-selfmanaged-guests step (best_effort: true)
-    activate DG
-    par Destroy all 6 clusters in parallel
-        DG->>MC: hypershift destroy cluster azure<br/>for each variant (--cluster-grace-period=40m)
-    end
-    DG-->>CIO: exit code
-    deactivate DG
-
-    CIO->>CIO: Destroy nested management cluster
-    CIO->>Prow: Report results (JUnit XML)
-```
-
-## Inside a test-e2e-v2 Process (Ginkgo Lifecycle)
-
-Each `test-e2e-v2` invocation is a single OS process running the Ginkgo v2 test
-framework. The process is a compiled Go test binary (`go test -c`) with the `e2ev2`
-build tag.
-
-```mermaid
-sequenceDiagram
-    autonumber
-
-    participant RT as run-tests<br/>(parent process)
-    participant G as test-e2e-v2<br/>(Ginkgo process)
-    participant MC as Management<br/>Cluster API
-    participant HCA as HostedCluster<br/>API (guest)
-
-    RT->>G: exec test-e2e-v2 with label filter,<br/>env: E2E_HOSTED_CLUSTER_NAME/NAMESPACE
-
-    activate G
-    Note over G: Go test framework calls TestE2EV2(t)<br/>which calls ginkgo.RunSpecs(t, "hypershift-e2e")
-
-    G->>G: BeforeSuite: SetupTestContextFromEnv()<br/>(management client, cluster identity, artifact dir)
-
-    Note over G: Ginkgo builds spec tree from all<br/>var _ = Describe(...) registrations
-
-    G->>G: Label filter prunes spec tree<br/>(only specs matching --ginkgo.label-filter run)
-
-    loop For each matching spec (It block)
-        G->>G: BeforeEach: get TestContext,<br/>platform guard (Skip if wrong platform)
-
-        alt First access to HostedCluster (sync.Once)
-            G->>MC: Get HostedCluster {name}/{namespace}
-            MC-->>G: HostedCluster object (cached for process lifetime)
-        end
-
-        alt First access to HostedCluster client (sync.Once)
-            G->>MC: Get kubeconfig Secret from HC status
-            MC-->>G: Secret with kubeconfig data
-            G->>G: Build REST config + controller-runtime client<br/>(cached for process lifetime)
-        end
-
-        G->>MC: Test assertions against management cluster
-        G->>HCA: Test assertions against hosted cluster
-
-        alt Test has "Informing" label and fails
-            G->>G: InformingAwareFailHandler converts<br/>Fail → Skip (test marked skipped, not failed)
-        else Test fails normally
-            G->>G: Standard Ginkgo Fail (spec marked failed)
-        end
-
-        G->>G: DeferCleanup runs (restore mutations)
-    end
-
-    G->>G: Write JUnit XML report to ARTIFACT_DIR
-    G-->>RT: exit code (0=all passed, 1=failures)
-    deactivate G
-```
-
-## Process Boundary Summary
-
-| Process | Binary | Lifecycle | Communication |
-|---------|--------|-----------|---------------|
-| **ci-operator** | CI infrastructure | Manages the entire [job][ci-job-config] | Runs [workflow steps][workflow] as pods |
-| **Step shell** | bash | One per CI step | Sets KUBECONFIG, runs Go binaries ([create][create-guests-sh], [run][run-tests-chain], [destroy][destroy-guests-chain]) |
-| **[create-guests][]** | `/hypershift/bin/create-guests` | Runs once in pre step | Forks `hypershift` CLI via `exec.Command`, writes cluster names and platform-specific config to `SHARED_DIR` |
-| **[run-tests][]** | `/hypershift/bin/run-tests` | Runs once in test step | Forks one `test-e2e-v2` process per test group via `exec.Command`. Env vars pass cluster name + config. Collects exit codes. |
-| **test-e2e-v2** | `/hypershift/bin/test-e2e-v2` | One process per test group; sequential lanes run one group at a time | Reads env vars for cluster identity. Talks to management + hosted cluster APIs via kubeconfig. Writes JUnit XML to `ARTIFACT_DIR`. Entry point: [`suite_test.go`][suite-test]. |
-| **[destroy-guests][]** | `/hypershift/bin/destroy-guests` | Runs once in post step | Forks `hypershift` CLI via `exec.Command` for each cluster (parallel goroutines). |
-
-## Sequencing of Mutually Exclusive Tests
-
-Mutual exclusion between test groups is achieved through **cluster isolation** and
-**sequential groups**, not through in-process locking:
-
-```mermaid
-flowchart TD
-    subgraph TestMatrix["TestMatrix (defined by PlatformConfig)"]
-        subgraph Parallel["Parallel lanes"]
-            P1["private cluster<br/>(private topology + compliance)"]
-            P2["oauth-lb-private cluster<br/>(private topology + OAuth LoadBalancer)"]
-        end
-
-        subgraph Public["Sequential lane: public cluster"]
-            direction TB
-            PUB1["platform + feature tests"]
-            PUB2["NodePool rollout tests"]
-            PUB1 --> PUB2
-        end
-
-        subgraph OAuth["Sequential lane: oauth-lb cluster"]
-            direction TB
-            OAUTH1["OAuth, health, metrics, registry"]
-            OAUTH2["NodePool configuration tests"]
-            OAUTH3["Autoscaling balancing"]
-            OAUTH1 --> OAUTH2 --> OAUTH3
-        end
-
-        subgraph OIDC["Sequential lane: external-oidc cluster"]
-            direction TB
-            OIDC1["External OIDC + global pull-secret"]
-            OIDC2["Autoscaling scale-up/down"]
-            OIDC3["Trust bundle tests"]
-            OIDC1 --> OIDC2 --> OIDC3
-        end
-
-        subgraph Sequential["Sequential lane: upgrade cluster"]
-            direction TB
-            S1["Step 1: upgrade tests<br/>label: control-plane-upgrade"]
-            S2["Step 2: post-upgrade-health tests<br/>label: hosted-cluster-health"]
-            S3["Step 3: control-plane-tls tests<br/>label: control-plane-pki-operator"]
-            S4["Step 4: etcd-chaos tests<br/>label: etcd-chaos"]
-            S1 -->|"pass → continue"| S2 -->|"pass → continue"| S3 -->|"pass → continue"| S4
-            S1 -.->|"fail → skip remaining"| SKIP["Steps skipped"]
-        end
-    end
-
-    RT["run-tests orchestrator"] --> Parallel
-    RT --> Public
-    RT --> OAuth
-    RT --> OIDC
-    RT --> Sequential
-
-```
-
-**Key mechanisms:**
-
-1. **Cluster-per-lane isolation**: The Azure matrix provisions six HostedClusters:
-   `private`, `oauth-lb-private`, `public`, `oauth-lb`, `external-oidc`, and
-   `upgrade`. Each top-level execution lane targets exactly one cluster. Tests
-   within a lane share that cluster, while different lanes never touch the same
-   cluster.
-
-2. **Label-based selection**: Ginkgo's `--ginkgo.label-filter` selects the
-   intended feature specs for each process. Some labels intentionally appear in
-   multiple lanes because those lanes target different HostedClusters; lane
-   isolation prevents their processes from interfering with each other.
-
-3. **Sequential groups for ordered dependencies**: The [Azure matrix][azure-platform]
-   runs configuration-specific tests before autoscaling tests on the `oauth-lb` and
-   `external-oidc` clusters. The `upgrade-and-chaos` lane runs upgrade first, then
-   etcd-chaos on the **same cluster**. The [`run-tests` orchestrator][run-tests]
-   enforces ordering by running steps sequentially within one goroutine. If an
-   earlier step fails, the remaining steps in that lane are skipped.
-
-4. **Matrix validation protects JUnit paths**: `TestMatrix.Validate` rejects
-   duplicate group names and names that are unsafe as JUnit filename components.
-   It does not reject a variant used by multiple top-level lanes, so custom plans
-   must keep each variant in a single lane to prevent concurrent cluster access.
-
-5. **No in-process mutex**: Each `test-e2e-v2` process targets exactly one cluster,
-   so no mutex is needed between test specs. Ginkgo runs specs within a single
-   process serially by default (no `--procs` flag is passed).
-
-## Inter-Process Communication
-
-```mermaid
-flowchart LR
-    subgraph "SHARED_DIR (filesystem)"
-        F1["cluster-name-{variant}<br/>(one per cluster)"]
-        F2["management_cluster_kubeconfig"]
-        F3["platform-specific config<br/>(OIDC bundles, subnet IDs, etc.)"]
-    end
-
-    CG["create-guests"] -->|"writes"| F1
-    CG -->|"writes"| F3
-
-    RT["run-tests"] -->|"reads"| F1
-    RT -->|"reads"| F3
-    RT -->|"env vars"| TB["test-e2e-v2<br/>(subprocess)"]
-    TB -->|"JUnit XML"| AD["ARTIFACT_DIR"]
-
-    DG["destroy-guests"] -->|"derives names from<br/>PROW_JOB_ID + sha256"| MC["Management Cluster"]
-
-```
-
-- **SHARED_DIR**: Filesystem directory shared across all CI steps within a job.
-  [`create-guests`][create-guests] writes cluster names and platform-specific
-  config; [`run-tests`][run-tests] reads them. This is the primary IPC mechanism
-  between CI steps.
-- **Environment variables**: `run-tests` passes cluster identity to each `test-e2e-v2`
-  subprocess via `E2E_HOSTED_CLUSTER_NAME` and `E2E_HOSTED_CLUSTER_NAMESPACE` env vars.
-- **PROW_JOB_ID + SHA256**: [`destroy-guests`][destroy-guests] does not read
-  SHARED_DIR cluster names. Instead, it re-derives cluster names deterministically
-  from `PROW_JOB_ID` using the same [`DeriveClusterName()`][platform] function as
-  `create-guests`. This makes teardown idempotent and independent of whether creation
-  succeeded.
-- **KUBECONFIG**: All processes authenticate to the management cluster via the
-  kubeconfig file at `${SHARED_DIR}/management_cluster_kubeconfig`, set up by the
-  nested management cluster provisioning step.
-- **Exit codes**: `run-tests` collects exit codes from all `test-e2e-v2` subprocesses
-  and exits non-zero if any group failed.
-- **JUnit XML**: Each `test-e2e-v2` process writes a separate JUnit report to
-  `ARTIFACT_DIR`. ci-operator collects these for Sippy/Prow reporting.
-
-<!-- HyperShift repo links (openshift/hypershift, main branch) -->
-[run-tests]: https://github.com/openshift/hypershift/blob/main/test/e2e/v2/cmd/run-tests/main.go
-[create-guests]: https://github.com/openshift/hypershift/blob/main/test/e2e/v2/cmd/create-guests/main.go
-[destroy-guests]: https://github.com/openshift/hypershift/blob/main/test/e2e/v2/cmd/destroy-guests/main.go
-[suite-test]: https://github.com/openshift/hypershift/blob/main/test/e2e/v2/tests/suite_test.go
-[test-context]: https://github.com/openshift/hypershift/blob/main/test/e2e/v2/internal/test_context.go
-[fail-handler]: https://github.com/openshift/hypershift/blob/main/test/e2e/v2/internal/fail_handler.go
-[platform]: https://github.com/openshift/hypershift/blob/main/test/e2e/v2/lifecycle/platform.go
-[azure-platform]: https://github.com/openshift/hypershift/blob/main/test/e2e/v2/lifecycle/azure.go
-[backup-restore-test]: https://github.com/openshift/hypershift/blob/main/test/e2e/v2/tests/backup_restore_test.go
-[etcd-chaos-test]: https://github.com/openshift/hypershift/blob/main/test/e2e/v2/tests/etcd_chaos_test.go
-[azure-test]: https://github.com/openshift/hypershift/blob/main/test/e2e/v2/tests/hosted_cluster_azure_test.go
-[pki-test]: https://github.com/openshift/hypershift/blob/main/test/e2e/v2/tests/control_plane_pki_operator_test.go
-[security-test]: https://github.com/openshift/hypershift/blob/main/test/e2e/v2/tests/hosted_cluster_security_test.go
-[image-registry-test]: https://github.com/openshift/hypershift/blob/main/test/e2e/v2/tests/hosted_cluster_image_registry_test.go
-[external-oidc-test]: https://github.com/openshift/hypershift/blob/main/test/e2e/v2/tests/hosted_cluster_external_oidc_test.go
-[dockerfile-e2e]: https://github.com/openshift/hypershift/blob/main/Dockerfile.e2e
-[makefile]: https://github.com/openshift/hypershift/blob/main/Makefile
-
-<!-- openshift/release repo links (main branch) -->
-[ci-job-config]: https://github.com/openshift/release/blob/main/ci-operator/config/openshift/hypershift/openshift-hypershift-main.yaml
-[workflow]: https://github.com/openshift/release/blob/main/ci-operator/step-registry/hypershift/azure/e2e/v2-self-managed/hypershift-azure-e2e-v2-self-managed-workflow.yaml
-[create-guests-sh]: https://github.com/openshift/release/blob/main/ci-operator/step-registry/hypershift/azure/create-selfmanaged-guests/hypershift-azure-create-selfmanaged-guests-commands.sh
-[run-tests-chain]: https://github.com/openshift/release/blob/main/ci-operator/step-registry/hypershift/azure/run-e2e-v2-selfmanaged/hypershift-azure-run-e2e-v2-selfmanaged-chain.yaml
-[destroy-guests-chain]: https://github.com/openshift/release/blob/main/ci-operator/step-registry/hypershift/azure/destroy-selfmanaged-guests/hypershift-azure-destroy-selfmanaged-guests-chain.yaml
-[e2e-v2-chain]: https://github.com/openshift/release/blob/main/ci-operator/step-registry/hypershift/e2e-v2/hypershift-e2e-v2-chain.yaml
-
-
----
-
 ## Source: docs/content/how-to/ci/v2-testing/writing-tests.md
 
 # Writing V2 Tests
 
 Follow these invariants when adding or migrating v2 E2E tests. Existing tests
 that violate them are migration debt, not examples to copy.
+
+For hooks, decorators, and filtering, consult the
+Ginkgo documentation.
 
 ## Choose the test boundary
 
@@ -16708,7 +16302,8 @@ Use the registration pattern in
 register specs during Ginkgo tree construction and obtain the runtime test
 context inside hooks or specs. Do not register specs inside `BeforeEach` or `It`.
 
-The suite supplies a shared
+The suite
+supplies a shared
 `TestContext`.
 Fetch the HostedCluster and assert the returned error before testing platform or
 configuration preconditions:
@@ -19156,6 +18751,175 @@ spec:
 ```
 
 For more details on the individual identity providers: refer to upstream openshift documentation
+
+---
+
+## Source: docs/content/how-to/configure-ocp-components/kubeapi-server-event-ttl.md
+
+---
+title: Configuring the kube-apiserver Event TTL
+---
+
+# Configuring the kube-apiserver Event TTL
+
+## Overview
+
+The kube-apiserver stores Kubernetes Events in etcd and deletes them once they exceed the event
+TTL. Hosted control planes use a 3 hour TTL by default, matching standalone OpenShift.
+
+In event-heavy hosted clusters — CI/CD, GitOps, and pipeline workloads in particular — accumulated
+events consume a meaningful share of etcd storage. Lowering the TTL reduces that storage without
+affecting any other cluster behaviour.
+
+You configure the TTL per hosted cluster with the
+`spec.operatorConfiguration.kubeAPIServer.eventTTLMinutes` field on the HostedCluster.
+
+!!! note
+
+    Hosted control planes have no kube-apiserver operator, so the standalone OpenShift
+    `eventTTLMinutes` field on the `KubeAPIServer` operator resource does not apply to hosted
+    clusters. The HostedCluster field uses the same name, units, range and default as the
+    standalone field. See the
+    event-ttl enhancement
+    for the full design.
+
+!!! important
+
+    This field is behind the `KubeAPIServerEventTTL` feature gate and is currently available only
+    in the `TechPreviewNoUpgrade` feature set.
+
+## Valid values
+
+| | |
+|---|---|
+| Type | Integer number of minutes (`int32`) |
+| Minimum | 5 minutes |
+| Maximum | 180 minutes |
+| Default | 180 minutes (3 hours), used when the field is omitted |
+
+Values below 5 minutes expire events faster than a typical troubleshooting window. The maximum is
+the existing default, because raising it would only increase etcd storage pressure.
+
+The field is optional and has no CRD-level default. Omitting it means "no opinion", and the
+platform applies the 180 minute default when it renders the kube-apiserver arguments. The
+rendered flag is always expressed in minutes, so the default appears as `--event-ttl=180m` and
+setting `eventTTLMinutes: 180` explicitly renders exactly the same value.
+
+## Setting the event TTL
+
+Patch the HostedCluster on the management cluster:
+
+```bash
+oc patch hostedcluster my-cluster -n clusters --type=merge \
+  -p '{"spec":{"operatorConfiguration":{"kubeAPIServer":{"eventTTLMinutes":60}}}}'
+```
+
+Or set it at creation time in the HostedCluster manifest:
+
+```yaml
+apiVersion: hypershift.openshift.io/v1beta1
+kind: HostedCluster
+metadata:
+  name: my-cluster
+  namespace: clusters
+spec:
+  operatorConfiguration:
+    kubeAPIServer:
+      eventTTLMinutes: 60
+```
+
+## Reverting to the default
+
+Remove the field:
+
+```bash
+oc patch hostedcluster my-cluster -n clusters --type=merge \
+  -p '{"spec":{"operatorConfiguration":{"kubeAPIServer":{"eventTTLMinutes":null}}}}'
+```
+
+!!! warning
+
+    `kubeAPIServer` must contain at least one setting. If `eventTTLMinutes` is the only one you
+    set, the patch above leaves an empty `kubeAPIServer` object and the API server rejects it:
+
+    ```
+    The HostedCluster "my-cluster" is invalid: spec.operatorConfiguration.kubeAPIServer:
+    Invalid value: 0: spec.operatorConfiguration.kubeAPIServer in body should have at least 1 properties
+    ```
+
+    Remove the whole object instead:
+
+    ```bash
+    oc patch hostedcluster my-cluster -n clusters --type=merge \
+      -p '{"spec":{"operatorConfiguration":{"kubeAPIServer":null}}}'
+    ```
+
+    Check what else is set before choosing which patch to use:
+
+    ```bash
+    oc get hostedcluster my-cluster -n clusters \
+      -o jsonpath='{.spec.operatorConfiguration.kubeAPIServer}'
+    ```
+
+    If `operatorConfiguration` itself holds nothing but `kubeAPIServer`, you can remove it in one
+    step with `-p '{"spec":{"operatorConfiguration":null}}'`.
+
+## Behaviour
+
+The field is **day-2 mutable** — you can change it on a running hosted cluster and you do not
+need to recreate the cluster. Applying a change works as follows:
+
+1. The HyperShift Operator copies `spec.operatorConfiguration` onto the HostedControlPlane.
+2. The Control Plane Operator renders `--event-ttl` into the kube-apiserver configuration.
+3. The changed configuration rolls the kube-apiserver pods.
+
+Because the change rolls the kube-apiserver, expect a brief control plane API rollout. On a
+highly available control plane the rollout is performed one replica at a time.
+
+!!! important
+
+    The TTL applies to **events created after the change**. Events that already exist keep the TTL
+    they were written with and expire on their original schedule. Storage savings therefore appear
+    gradually, over roughly one TTL period.
+
+Existing hosted clusters are unaffected by upgrades to a HyperShift version that supports this
+field: with no value set, the kube-apiserver continues to run with the 180 minute default.
+
+## Verifying
+
+Check the rendered kube-apiserver argument in the control plane namespace:
+
+```bash
+oc get configmap kas-config -n clusters-my-cluster \
+  -o jsonpath='{.data.config\.json}' | jq '.apiServerArguments["event-ttl"]'
+```
+
+```json
+[
+  "60m"
+]
+```
+
+An unconfigured hosted cluster reports the default, `["180m"]`.
+
+## Invalid values
+
+The range is enforced by the CRD schema, so a value outside 5–180 is rejected by the management
+cluster's API server at admission time and you get an immediate error:
+
+```bash
+oc patch hostedcluster my-cluster -n clusters --type=merge \
+  -p '{"spec":{"operatorConfiguration":{"kubeAPIServer":{"eventTTLMinutes":240}}}}'
+```
+
+```
+The HostedCluster "my-cluster" is invalid: spec.operatorConfiguration.kubeAPIServer.eventTTLMinutes:
+Invalid value: 240: spec.operatorConfiguration.kubeAPIServer.eventTTLMinutes in body should be less than or equal to 180
+```
+
+Setting `eventTTLMinutes: 0` explicitly is rejected by the same validation, so the field cannot be
+used to disable event expiry.
+
 
 ---
 
@@ -27012,6 +26776,124 @@ It will install four priority classes in a management cluster with the following
 - `hypershift-etcd`: Pods for etcd.
 - `hypershift-api-critical`: Pods that are required for API calls and resource admission to succeed. This includes pods like kube-apiserver, aggregated API servers, and webhooks.
 - `hypershift-control-plane`: pods in the HyperShift Control Plane that are not API critical but still need elevated priority. E.g Cluster Version Operator.
+
+
+---
+
+## Source: docs/content/how-to/etcd-sharding.md
+
+# Etcd Sharding by Resource Kind (Tech Preview)
+
+Etcd sharding splits a hosted cluster's managed etcd into several independent
+etcd clusters, each owning a set of resource kinds.
+
+For example, you can use sharding to put high-churn kinds (events, leases) into
+a dedicated etcd so they don't compete with the rest of the cluster's state for
+etcd write bandwidth, compaction, and defragmentation.
+
+!!! important
+
+    `EtcdSharding` is a **management cluster** feature gate in the
+    `TechPreviewNoUpgrade` set. Install the HyperShift Operator with
+    `hypershift install --tech-preview-no-upgrade`; without it,
+    `spec.etcd.managed.shards` is not part of the installed `HostedCluster`
+    CRD. See Feature Gates for the distinction between
+    management cluster and hosted cluster gates.
+
+## How it works
+
+Each shard becomes its own StatefulSet, client and discovery Services, serving
+and peer certificates, and — at three replicas — a PodDisruptionBudget. The
+kube-apiserver is then given one `--etcd-servers-overrides` entry per sharded
+resource, pointing at the owning shard's client Service.
+
+Because routing goes through `--etcd-servers-overrides`, only resource types
+compiled into the kube-apiserver binary are routed. CRD-backed and
+aggregated-API resources always stay in the default etcd.
+
+Sharding is a **create-time only** decision. There is no mechanism to migrate
+existing keys between etcd clusters, so the API rejects adding, removing,
+renaming, or re-pointing shards after creation.
+
+## Configuring shards
+
+Set `spec.etcd.managed.shards` on the `HostedCluster`:
+
+```yaml
+spec:
+  etcd:
+    managementType: Managed
+    managed:
+      shards:
+      - name: events
+        replicas: 3
+        storage:
+          type: EmptyDir
+        resources:
+        - apiGroup: ""
+          resource: events
+        - apiGroup: events.k8s.io
+          resource: events
+      - name: leases
+        replicas: 3
+        storage:
+          type: PersistentVolume
+        resources:
+        - apiGroup: coordination.k8s.io
+          resource: leases
+```
+
+Events are a natural fit for `EmptyDir` storage: they are already TTL'd and
+losing them on restart is acceptable, so the shard trades durability for
+throughput.
+
+Resources must not overlap across shards, and `replicas` must be 1 or 3.
+
+### From the CLI
+
+`hypershift create cluster` exposes the same thing through a repeatable
+`--etcd-shard` flag:
+
+```shell
+hypershift create cluster aws \
+  --control-plane-availability-policy=HighlyAvailable \
+  --etcd-shard "name=events,resources=/events;events.k8s.io/events,replicas=3,storage=EmptyDir" \
+  --etcd-shard "name=leases,resources=coordination.k8s.io/leases,replicas=3,storage=PersistentVolume" \
+  ...
+```
+
+The value is a comma-separated list of `key=value` fields:
+
+| Field | Required | Description |
+|---|---|---|
+| `name` | yes | Shard name. The StatefulSet is `etcd-<name>`. |
+| `resources` | yes | Semicolon-separated `<apiGroup>/<resource>` list. Use a leading slash for the core group, e.g. `/events`. |
+| `replicas` | no | `1` or `3`. Defaults to `3`. |
+| `storage` | no | `PersistentVolume` or `EmptyDir`. |
+| `storageClassName` | no | Only valid with `PersistentVolume`; implies it when set. |
+
+Shards run three members by default, so pair them with
+`--control-plane-availability-policy=HighlyAvailable`.
+
+## Verifying
+
+Each shard gets its own StatefulSet named `etcd-<shard>` in the control plane
+namespace, alongside the default `etcd`:
+
+```shell
+oc get statefulset -n clusters-<cluster>
+```
+
+To confirm the kube-apiserver is routing to them, read the generated config.
+It carries one `etcd-servers-overrides` entry per sharded resource, in
+`<apiGroup>/<resource>#<endpoint>` form — the API group is empty for core
+resources, so core events appear as `/events#...`:
+
+```shell
+oc get configmap kas-config -n clusters-<cluster> \
+  -o jsonpath='{.data.config\.json}' \
+  | jq '.apiServerArguments["etcd-servers-overrides"]'
+```
 
 
 ---
@@ -50541,6 +50423,39 @@ and reports missing images if any.</p>
 </td>
 </tr></tbody>
 </table>
+###ConfigMapReference { #hypershift.openshift.io/v1beta1.ConfigMapReference }
+<p>
+(<em>Appears on:</em>
+<a href="#hypershift.openshift.io/v1beta1.IgnitionPayloadSpec">IgnitionPayloadSpec</a>)
+</p>
+<p>
+<p>ConfigMapReference references a ConfigMap by name.
+The ConfigMap must exist in the same namespace as the referencing resource.</p>
+</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>
+<code>name</code></br>
+<em>
+string
+</em>
+</td>
+<td>
+<p>name is the name of a ConfigMap in the same namespace as this resource. It must
+be a valid DNS-1123 subdomain: at most 253 characters, consisting of lowercase
+alphanumeric characters, hyphens, and periods. Each period-separated segment must
+start and end with an alphanumeric character.</p>
+</td>
+</tr>
+</tbody>
+</table>
 ###ConfigurationStatus { #hypershift.openshift.io/v1beta1.ConfigurationStatus }
 <p>
 (<em>Appears on:</em>
@@ -55656,6 +55571,338 @@ github.com/openshift/api/config/v1.IBMCloudProviderType
 </tr>
 </tbody>
 </table>
+###IgnitionPayload { #hypershift.openshift.io/v1beta1.IgnitionPayload }
+<p>
+<p>IgnitionPayload requests an Ignition payload for booting nodes. spec describes the
+inputs used to generate the payload, and status reports the generated payloads and
+rollout progress.</p>
+</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>
+<code>metadata</code></br>
+<em>
+<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.22/#objectmeta-v1-meta">
+Kubernetes meta/v1.ObjectMeta
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>metadata is the standard object metadata.</p>
+Refer to the Kubernetes API documentation for the fields of the
+<code>metadata</code> field.
+</td>
+</tr>
+<tr>
+<td>
+<code>spec,omitzero</code></br>
+<em>
+<a href="#hypershift.openshift.io/v1beta1.IgnitionPayloadSpec">
+IgnitionPayloadSpec
+</a>
+</em>
+</td>
+<td>
+<p>spec describes the inputs used to generate the payload.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>status,omitzero</code></br>
+<em>
+<a href="#hypershift.openshift.io/v1beta1.IgnitionPayloadStatus">
+IgnitionPayloadStatus
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>status reports the generated payloads and rollout progress.</p>
+</td>
+</tr>
+</tbody>
+</table>
+###IgnitionPayloadSpec { #hypershift.openshift.io/v1beta1.IgnitionPayloadSpec }
+<p>
+(<em>Appears on:</em>
+<a href="#hypershift.openshift.io/v1beta1.IgnitionPayload">IgnitionPayload</a>)
+</p>
+<p>
+<p>IgnitionPayloadSpec is written entirely by the consumer; the PayloadController
+treats it as read-only input.</p>
+</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>
+<code>releaseImage</code></br>
+<em>
+string
+</em>
+</td>
+<td>
+<p>releaseImage is the pullspec of the OCP release whose machine-config-server
+binaries render the payload. It is resolved to an immutable digest before the
+payload is generated. This field is required.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>pullSecret,omitzero</code></br>
+<em>
+<a href="#hypershift.openshift.io/v1beta1.SecretReference">
+SecretReference
+</a>
+</em>
+</td>
+<td>
+<p>pullSecret references the pull-secret Secret in the IgnitionPayload&rsquo;s namespace
+(conventionally named &ldquo;pull-secret&rdquo;) that the generator reads to fetch the release
+image and embed in the generated payload. This field is required and immutable:
+change the pull secret in place (via the global pull secret mechanism) rather than
+updating this reference, so it never triggers a node rollout.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>additionalTrustBundle,omitzero</code></br>
+<em>
+<a href="#hypershift.openshift.io/v1beta1.ConfigMapReference">
+ConfigMapReference
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>additionalTrustBundle optionally references a ConfigMap in the IgnitionPayload&rsquo;s namespace
+holding additional CA certificates for booting nodes to trust. The CA bundle is
+read from the &ldquo;ca-bundle.crt&rdquo; key, PEM-encoded. When omitted, no additional
+trust bundle is embedded in the payload.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>osImageStream,omitzero</code></br>
+<em>
+<a href="#hypershift.openshift.io/v1beta1.OSImageStreamReference">
+OSImageStreamReference
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>osImageStream selects the RHEL OS stream the payload targets. Valid values are
+&ldquo;rhel-9&rdquo; (RHEL 9 boot images) and &ldquo;rhel-10&rdquo; (RHEL 10 boot images). When omitted,
+the stream defaults to the one implied by the release version (rhel-9 for OCP &lt; 5.0,
+rhel-10 for OCP &gt;= 5.0). rhel-9 is the legacy stream and is expected to be retired
+as supported releases move to RHEL 10. If the generator does not support the selected
+stream, it does not render a payload and reports PayloadGenerated=False.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>rolloutGlobalConfig,omitzero</code></br>
+<em>
+<a href="#hypershift.openshift.io/v1beta1.ConfigMapReference">
+ConfigMapReference
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>rolloutGlobalConfig references an IgnitionPayload-owned ConfigMap in the
+IgnitionPayload&rsquo;s namespace holding the rollout-relevant subset of the hosted
+cluster&rsquo;s global configuration, canonicalized and authored by the consumer. The
+content is read from the &ldquo;config&rdquo; key and feeds the rollout hash; a ConfigMap
+missing that key contributes nothing. When omitted, no global configuration
+contributes to the payload.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>additionalRolloutInputs</code></br>
+<em>
+string
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>additionalRolloutInputs is an opaque, consumer-authored summary of rollout-relevant inputs
+that are not otherwise captured by the referenced ConfigMaps. It is folded into the rollout
+hash only (never into configHash), so setting or changing it advances rolloutGeneration and
+rolls running nodes, while the payload bytes (and configHash) are unaffected. Use it to roll
+running nodes for a change the rollout hash would otherwise miss — typically an input that
+lives in a managementConfigMaps ConfigMap (which on its own only refreshes the payload for new
+nodes) but must also roll existing nodes, e.g. the API server endpoint identity (access mode,
+advertise address, port) carried in the apiserver-HAProxy config. It stays out of configHash
+so configHash remains the payload&rsquo;s byte identity. Must be printable ASCII with no whitespace
+so the rollout hash stays deterministic. When omitted, no out-of-band input contributes to the
+rollout hash.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>rolloutConfigMaps</code></br>
+<em>
+<a href="#hypershift.openshift.io/v1beta1.ConfigMapReference">
+[]ConfigMapReference
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>rolloutConfigMaps lists ConfigMaps in the IgnitionPayload&rsquo;s namespace whose
+contents are rollout-relevant (user, core, and NTO machine configs). Each referenced
+ConfigMap provides its content under the &ldquo;config&rdquo; key as multi-document YAML of
+MachineConfig manifests; a ConfigMap missing that key contributes nothing. Names
+must be unique (enforced as a map keyed by name) and must not also appear in
+managementConfigMaps. A change to any listed ConfigMap feeds the rollout hash and
+can therefore trigger a node rollout. When omitted, no rollout-relevant ConfigMaps
+contribute to the payload. At least 1 and at most 100 entries.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>managementConfigMaps</code></br>
+<em>
+<a href="#hypershift.openshift.io/v1beta1.ConfigMapReference">
+[]ConfigMapReference
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>managementConfigMaps lists ConfigMaps in the IgnitionPayload&rsquo;s namespace whose
+contents are management-side only (e.g. the apiserver-HAProxy config). Each
+referenced ConfigMap provides its content under the &ldquo;config&rdquo; key as multi-document
+YAML of MachineConfig manifests; a ConfigMap missing that key contributes nothing.
+Names must be unique (enforced as a map keyed by name) and must not also appear in
+rolloutConfigMaps. A change to any listed ConfigMap refreshes the generated payload
+bytes WITHOUT advancing rolloutGeneration, so it does not trigger a node rollout.
+When omitted, no management-only ConfigMaps contribute to the payload. At least 1
+and at most 100 entries.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>retiredRolloutGeneration</code></br>
+<em>
+int64
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>retiredRolloutGeneration releases the previous payload early. At most two payloads
+are retained — current and previous — and a new rollout always evicts the old
+previous regardless of this field. Set it to the highest rolloutGeneration whose
+nodes have all been replaced to free previous before the next rollout; the current
+payload is always kept. It only ever increases. Minimum 1.</p>
+</td>
+</tr>
+</tbody>
+</table>
+###IgnitionPayloadStatus { #hypershift.openshift.io/v1beta1.IgnitionPayloadStatus }
+<p>
+(<em>Appears on:</em>
+<a href="#hypershift.openshift.io/v1beta1.IgnitionPayload">IgnitionPayload</a>)
+</p>
+<p>
+<p>IgnitionPayloadStatus has two writers. The PayloadController owns current,
+previous, and the PayloadGenerated condition, and resets IgnitionReached to False
+when rolloutGeneration advances; the serving tier sets IgnitionReached to True
+(field-scoped patch) once a node fetches the current payload.</p>
+</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>
+<code>conditions</code></br>
+<em>
+<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.22/#condition-v1-meta">
+[]Kubernetes meta/v1.Condition
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>conditions reports generation and rollout progress. Known condition types are
+PayloadGenerated and IgnitionReached. PayloadGenerated is True when the payload for
+the current spec has been generated; its observedGeneration is the metadata.generation
+last processed, so it shows whether current reflects the latest spec. IgnitionReached
+is False after each new rollout until a node has fetched the current payload, then
+True. At least 1 and at most 100 entries.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>current,omitzero</code></br>
+<em>
+<a href="#hypershift.openshift.io/v1beta1.PayloadReference">
+PayloadReference
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>current describes the payload for the latest validated, generated config. It is
+absent until the first payload has been generated.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>previous,omitzero</code></br>
+<em>
+<a href="#hypershift.openshift.io/v1beta1.PayloadReference">
+PayloadReference
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>previous describes the immediately prior payload, retained during a rollout so
+in-flight boots on the previous generation are served until they drain. It is absent when
+there is no prior payload (e.g. the first generation) or once the prior payload
+has fully drained.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>rolloutHashVersion</code></br>
+<em>
+int64
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>rolloutHashVersion identifies the version of the formula used to compute
+current.rolloutHash. It is absent until the first payload has been generated. When a
+newer formula is adopted, current.rolloutHash is recomputed and this field is updated
+without advancing rolloutGeneration, so a formula change does not trigger a node
+rollout. When present, it must be at least 1.</p>
+</td>
+</tr>
+</tbody>
+</table>
 ###ImageContentSource { #hypershift.openshift.io/v1beta1.ImageContentSource }
 <p>
 (<em>Appears on:</em>
@@ -56372,6 +56619,26 @@ ComponentLogLevelSpec
 <p>
 (Members of <code>ComponentLogLevelSpec</code> are embedded into this type.)
 </p>
+</td>
+</tr>
+<tr>
+<td>
+<code>eventTTLMinutes</code></br>
+<em>
+int32
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>eventTTLMinutes specifies the amount of time, in minutes, that events are stored
+in etcd before being deleted.
+The TTL is allowed between 5 minutes minimum up to a maximum of 180 minutes (3 hours).</p>
+<p>Lowering this value will reduce the storage required in etcd. Note that this setting
+will only apply to new events being created and will not update existing events.</p>
+<p>Changing this value causes the kube-apiserver to be rolled out with the new setting.</p>
+<p>When omitted this means no opinion, and the platform is left to choose a reasonable
+default, which is subject to change over time.
+The current default value is 180 minutes (3 hours).</p>
 </td>
 </tr>
 </tbody>
@@ -59470,6 +59737,7 @@ the management cluster.</p>
 ###OSImageStreamReference { #hypershift.openshift.io/v1beta1.OSImageStreamReference }
 <p>
 (<em>Appears on:</em>
+<a href="#hypershift.openshift.io/v1beta1.IgnitionPayloadSpec">IgnitionPayloadSpec</a>,
 <a href="#hypershift.openshift.io/v1beta1.NodePoolSpec">NodePoolSpec</a>,
 <a href="#hypershift.openshift.io/v1beta1.NodePoolStatus">NodePoolStatus</a>)
 </p>
@@ -59492,7 +59760,7 @@ string
 </em>
 </td>
 <td>
-<p>name is a required reference to an OSImageStream to be used for the pool.</p>
+<p>name is a required reference to an OSImageStream. Valid values are &ldquo;rhel-9&rdquo; and &ldquo;rhel-10&rdquo;.</p>
 </td>
 </tr>
 </tbody>
@@ -60438,6 +60706,86 @@ Settings are grouped by platform.</p>
 </tr><tr><td><p>&#34;S390X&#34;</p></td>
 <td></td>
 </tr></tbody>
+</table>
+###PayloadReference { #hypershift.openshift.io/v1beta1.PayloadReference }
+<p>
+(<em>Appears on:</em>
+<a href="#hypershift.openshift.io/v1beta1.IgnitionPayloadStatus">IgnitionPayloadStatus</a>)
+</p>
+<p>
+<p>PayloadReference identifies one generated payload version and its store key.</p>
+</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>
+<code>configHash</code></br>
+<em>
+string
+</em>
+</td>
+<td>
+<p>configHash is the payload-identity hash over the whole validated config. It is an
+opaque hash string: consumers compare it for equality and must not parse it.
+It is required and consists of 1 to 64 lowercase hexadecimal characters (0-9, a-f).</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>rolloutHash</code></br>
+<em>
+string
+</em>
+</td>
+<td>
+<p>rolloutHash is the hash over the rollout-relevant inputs. It is an opaque hash
+string: consumers compare it for equality and must not parse it.
+It is required and consists of 1 to 64 lowercase hexadecimal characters (0-9, a-f).</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>userDataSecret,omitzero</code></br>
+<em>
+<a href="#hypershift.openshift.io/v1beta1.SecretReference">
+SecretReference
+</a>
+</em>
+</td>
+<td>
+<p>userDataSecret references the generator-authored pointer-ignition Secret in the
+IgnitionPayload&rsquo;s namespace, named <code>&lt;ignitionpayload-name&gt;-&lt;rolloutGeneration&gt;</code>. The
+consumer points its machines&rsquo; bootstrap dataSecretName at it; it is a non-secret reference.
+That Secret embeds the per-payload endpoint (<code>/ignition/&lt;name&gt;</code>), the CA, a static
+rollout-generation header, and the bearer token; the token authenticates the fetch, lives
+only inside that Secret (never in the PayloadStore, which holds only payload bytes keyed by
+rollout identity, and never in status).</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>rolloutGeneration</code></br>
+<em>
+int64
+</em>
+</td>
+<td>
+<p>rolloutGeneration is a monotonically increasing counter the consumer watches to execute a
+rollout. It advances only when rolloutHash changes (so a management-only payload refresh does
+not advance it); each advance mints a new token, while a refresh re-issues the token with a
+fresh expiry under the same rollout identity. It is also the serving/storage identity: the
+PayloadStore entry, the userDataSecret, and the node&rsquo;s rollout-generation header are all
+keyed on it, so a rolloutHash formula rebaseline — which rewrites rolloutHash without advancing
+this counter — never moves serving identity. Minimum 1.</p>
+</td>
+</tr>
+</tbody>
 </table>
 ###PersistentVolumeAccessMode { #hypershift.openshift.io/v1beta1.PersistentVolumeAccessMode }
 <p>
@@ -62330,7 +62678,9 @@ history[0] is not Completed or Interrupted.</p>
 (<em>Appears on:</em>
 <a href="#hypershift.openshift.io/v1beta1.AESCBCKeyStatus">AESCBCKeyStatus</a>,
 <a href="#hypershift.openshift.io/v1beta1.HCPEtcdBackupAzureBlob">HCPEtcdBackupAzureBlob</a>,
-<a href="#hypershift.openshift.io/v1beta1.HCPEtcdBackupS3">HCPEtcdBackupS3</a>)
+<a href="#hypershift.openshift.io/v1beta1.HCPEtcdBackupS3">HCPEtcdBackupS3</a>,
+<a href="#hypershift.openshift.io/v1beta1.IgnitionPayloadSpec">IgnitionPayloadSpec</a>,
+<a href="#hypershift.openshift.io/v1beta1.PayloadReference">PayloadReference</a>)
 </p>
 <p>
 <p>SecretReference contains a reference to a Secret by name.
@@ -71911,7 +72261,21 @@ You can monitor rollout progress through the following NodePool conditions:
 | `UpdatingConfig` | A configuration rollout is in progress |
 | `UpdatingPlatformMachineTemplate` | A platform machine template rollout is in progress |
 
-These conditions are set to `True` while the corresponding rollout is in progress and are cleared when it completes.
+These conditions normally report `True` while the corresponding rollout is in progress and `False` when it completes. The migration exception for `UpdatingConfig` is described below.
+
+### Cluster API UpToDate Status for Replace NodePools
+
+With Cluster API (CAPI) v1.14 or later, Replace NodePools can report `UpToDate=False` on their Machines and `status.upToDateReplicas=0` on their MachineDeployment even after the rollout completes and the replacement Nodes are Ready.
+
+CAPI compares `Node.status.nodeInfo.kubeletVersion` with `Machine.spec.version` when calculating the Machine's `UpToDate` condition. HyperShift sets `Machine.spec.version` to the **OCP release version**, such as `4.20.3`, while the Node reports a **Kubernetes kubelet version**, such as `v1.33.5+<hash>`. These values differ, so the CAPI fields can continue to indicate that the Machines are not up to date.
+
+HyperShift determines Replace rollout completion from MachineDeployment and MachineSet state instead of `upToDateReplicas`: the desired replicas must be available, the current-revision MachineSet must be fully rolled out, older MachineSets must have no replicas, and the MachineDeployment must have observed its current generation. This completion check does not change CAPI's `UpToDate` condition or `upToDateReplicas` counter.
+
+Use the NodePool's `UpdatingVersion`, `UpdatingConfig`, and `UpdatingPlatformMachineTemplate` conditions above to monitor rollout progress. For a release rollout, also confirm that `NodePool.status.version` matches the target OCP version. A false Machine `UpToDate` condition or a zero `upToDateReplicas` counter alone does not mean that a NodePool rollout is incomplete.
+
+!!! note
+
+    During an operator upgrade, a NodePool without the `hypershift.openshift.io/nodePoolCurrentRolloutConfig` annotation adopts the currently requested configuration as its rollout baseline. This can include a pending configuration change, so `UpdatingConfig=False` alone does not prove that the Replace rollout has completed. First confirm that the MachineDeployment's machine template references the user-data Secret for the requested configuration, the expected OCP version, and the expected infrastructure template. Then check the MachineDeployment and MachineSet completion criteria described above.
 
 ## Summary Table
 

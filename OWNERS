@@ -1,5 +1,7 @@
 filters:
   ".*":
+    advisory_approvers:
+    - hypershift-advisory-approvers
     approvers:
     - core-approvers
     reviewers:
@@ -28,6 +30,11 @@ filters:
     labels:
     - area/platform/azure
   "^(api|cmd|control-plane-operator|docs|hypershift-operator|product-cli|test)/.*gcp.*":
+    reviewers:
+    - gcp-reviewers
+    labels:
+    - area/platform/gcp
+  "^(support/gmpmonitoring/|support/metrics/gmp_monitoring.*\\.go$|hack/gmp-api-gen/|hack/gmp-api-source/|hack/update-gmp-api\\.sh$)":
     reviewers:
     - gcp-reviewers
     labels:
