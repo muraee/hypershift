@@ -17280,8 +17280,20 @@ graph LR
 
 ## Configure the HostedCluster
 
-The `hypershift` CLI does not expose flags for these fields. Render the HostedCluster manifest,
-add the fields under `spec.services`, and apply the manifest.
+The `hypershift` CLI sets these fields at creation time:
+
+- `--kas-service-annotations key=value` is repeatable and populates
+  `spec.services[APIServer].servicePublishingStrategy.loadBalancer.serviceAnnotations`.
+- `--kas-load-balancer-class <class>` populates
+  `spec.services[APIServer].servicePublishingStrategy.loadBalancer.loadBalancerClass`.
+
+Both flags require the `LoadBalancer` APIServer publishing strategy. They cannot be combined
+with `--external-dns-domain`, which selects the `Route` strategy. Malformed annotations are
+rejected before provisioning, and after creation the CLI verifies that the API server
+persisted the fields. If the management cluster HostedCluster CRD lacks the `DeterministicLBIP`
+schema, the API server drops the fields and the command fails after the HostedCluster is
+created. Delete that HostedCluster, install the HyperShift Operator with
+`--tech-preview-no-upgrade`, and create the cluster again.
 
 ### Field reference
 
@@ -17334,8 +17346,17 @@ spec:
     not configured with a class only process Services **without** a class. If you use the
     default MetalLB configuration, omit `loadBalancerClass` and keep `serviceAnnotations`.
 
-Render the HostedCluster manifest, edit it to add the `loadBalancer` fields, and apply it to
-create the cluster:
+Create the cluster directly with the flags:
+
+```bash
+hypershift create cluster <platform> \
+  ... \
+  --kas-load-balancer-class=metallb.io/metallb \
+  --kas-service-annotations=metallb.io/loadBalancerIPs=10.1.1.100
+```
+
+Alternatively, render the HostedCluster manifest, add the fields under `spec.services`, and
+apply the manifest:
 
 ```bash
 hypershift create cluster <platform> \
@@ -27101,6 +27122,18 @@ spec:
           value: engineering
 ```
 
+#### HyperShift system labels
+
+On GCPCluster and NodePool machine resources, HyperShift sets the following labels
+after merging user-supplied labels:
+
+- `hypershift-openshift-io-cluster`: the HostedCluster name.
+- `hypershift-openshift-io-infra-id`: the infrastructure ID, when available.
+
+HyperShift's values take precedence over user-supplied values for these keys.
+For other keys, NodePool labels take precedence over HostedCluster labels on
+NodePool machine resources.
+
 #### LoadBalancer Service label ownership
 
 For legacy GCP LoadBalancer Services, HyperShift reconciles
@@ -27665,6 +27698,7 @@ hypershift create cluster gcp \
   --storage-service-account=<storage-sa-email> \
   --image-registry-service-account=<image-registry-sa-email> \
   --network-service-account=<network-sa-email> \
+  --ingress-service-account=<ingress-sa-email> \
   --service-account-signing-key-path=<path-to-sa-signer.key> \
   --oidc-issuer-url=<oidc-issuer-url> \
   --base-domain=<your-dns-domain> \
@@ -27715,6 +27749,7 @@ hypershift create cluster gcp \
 | `--storage-service-account` | Yes | GCP PD CSI Driver SA email |
 | `--image-registry-service-account` | Yes | Image Registry Operator SA email |
 | `--network-service-account` | Yes | Cloud Network Config Controller SA email |
+| `--ingress-service-account` | Conditional | Ingress Operator SA email (manages *.apps Cloud DNS). Required when the Ingress capability is enabled (the default); omit it only when Ingress is disabled via `--disable-cluster-capabilities=Ingress,Console`. |
 | `--service-account-signing-key-path` | Yes | Path to RSA private key for OIDC token signing |
 | `--oidc-issuer-url` | Yes | OIDC issuer URL |
 | `--node-pool-replicas` | Yes | Number of worker nodes (default: 0) |
@@ -27724,6 +27759,16 @@ hypershift create cluster gcp \
 | `--machine-type` | No | GCP machine type (default: `n2-standard-4`) |
 | `--zone` | Conditional | GCP zone for nodes. Required when `--node-pool-replicas >= 0` (default). Optional when `--node-pool-replicas=-1` (no NodePool created). |
 | `--boot-image` | No | Override RHCOS boot image from release payload |
+| `--resource-labels` | No | GCP resource labels as comma-separated `key=value` pairs; can be specified multiple times |
+
+## DNS
+
+The control plane operator creates three Cloud DNS zones in the hosted cluster's project: a private `{cluster}-hypershift.local` zone, and public/private ingress zones for `--base-domain`. Records for the API server and `*.apps` endpoints are managed in these zones automatically.
+
+Two things are expected from the deployment, not from HyperShift:
+
+- **Zone delegation**: the parent zone of `--base-domain` must delegate to the public ingress zone's name servers (surfaced in the HostedControlPlane status) for the ingress zone to be resolvable.
+- **Ingress certificate**: the ingress operator serves the `*.apps` wildcard with the cluster's default certificate unless a publicly-trusted one is provided. When the deployment runs a certificate issuer outside the cluster that must solve the ACME DNS-01 challenge for the wildcard (e.g. a central cert-manager with access to the parent zone, but not to the ingress zone in the hosted cluster's project), set `spec.platform.gcp.delegation.acmeChallengeTarget` on the HostedCluster to the fully qualified name that issuer is configured to write challenge TXT records for. The value must be lowercase, must start with `_acme-challenge.`, must contain at least two further labels (e.g. `_acme-challenge.central.example.com`), must not end with a dot, and is limited to 253 characters. The operator then creates a CNAME `_acme-challenge.<ingress domain>` → that target in the public ingress zone, so the external issuer can solve the challenge by following the CNAME. No record is created when the cluster's ingress domain is outside its base domain, or when the target equals the record name; the `GCPACMECNAMEAvailable` condition on the HostedCluster reports why. The field can be set at creation or added later, but once set it cannot be changed or removed. When the field is unset no record is created and the deployment handles the ingress wildcard certificate's DNS-01 challenge itself.
 
 ## Monitor Cluster Creation
 
@@ -50197,6 +50242,13 @@ recovery job was triggered.</p>
 A failure here requires external user intervention to resolve. E.g. changing the external DNS domain or making sure the domain is created
 and registered correctly.</p>
 </td>
+</tr><tr><td><p>&#34;GCPACMECNAMEAvailable&#34;</p></td>
+<td><p>GCPACMECNAMEAvailable indicates whether the ACME DNS-01 challenge CNAME
+requested through the HostedCluster&rsquo;s
+spec.platform.gcp.delegation.acmeChallengeTarget was published in the
+cluster&rsquo;s public ingress DNS zone. The condition is only present when
+that field is set.</p>
+</td>
 </tr><tr><td><p>&#34;GCPDNSAvailable&#34;</p></td>
 <td><p>GCPDNSAvailable indicates whether the DNS configuration has been
 created in the customer VPC</p>
@@ -50280,6 +50332,14 @@ and reports missing images if any.</p>
 <td><p>InfrastructureReady bubbles up the same condition from HCP. It signals if the infrastructure for a control plane to be operational,
 e.g. load balancers were created successfully.
 A failure here may require external user intervention to resolve. E.g. hitting quotas on the cloud provider.</p>
+</td>
+</tr><tr><td><p>&#34;IngressCredentialsFound&#34;</p></td>
+<td><p>IngressCredentialsFound indicates whether the optional ingress-operator
+credentials are configured. It is only evaluated for platforms whose
+ingress operator needs cloud credentials (today: GCP). A False condition
+is non-blocking: the HostedCluster keeps reconciling, but the guest
+ingress operator runs without cloud credentials and cannot publish the
+*.apps DNS records.</p>
 </td>
 </tr><tr><td><p>&#34;IngressDefaultCertificateSynced&#34;</p></td>
 <td><p>IngressDefaultCertificateSynced indicates whether the user-provided default
@@ -51814,6 +51874,59 @@ If not specified, Google-managed encryption keys are used.</p>
 </tr>
 </tbody>
 </table>
+###GCPDNSDelegationSpec { #hypershift.openshift.io/v1beta1.GCPDNSDelegationSpec }
+<p>
+(<em>Appears on:</em>
+<a href="#hypershift.openshift.io/v1beta1.GCPPlatformSpec">GCPPlatformSpec</a>)
+</p>
+<p>
+<p>GCPDNSDelegationSpec configures DNS delegation for the ingress wildcard
+certificate of a GCP hosted cluster.</p>
+</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>
+<code>acmeChallengeTarget</code></br>
+<em>
+string
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>acmeChallengeTarget delegates the ACME DNS-01 challenge for the ingress
+wildcard certificate (*.apps) to a solver running outside the cluster.
+When set, HyperShift publishes a CNAME record at
+_acme-challenge.<ingress domain> in the cluster&rsquo;s public ingress DNS zone,
+pointing at this target, so an external certificate issuer that can write
+the target&rsquo;s zone but not the cluster&rsquo;s ingress zone (for example a central
+cert-manager) can solve the challenge by following the CNAME.</p>
+<p>The value is the fully qualified name the external solver writes its
+challenge TXT records to. It must be lowercase, must start with the
+_acme-challenge. label, must contain at least two further labels, must not
+end with a dot, and is limited to 253 characters.</p>
+<p>The record is only created when the cluster&rsquo;s ingress domain
+(apps.<name>.<baseDomain> by default, apps.<baseDomainPrefix>.<baseDomain>
+when spec.dns.baseDomainPrefix is set, or the spec.configuration.ingress
+domain or appsDomain override when set) is within the cluster&rsquo;s base
+domain, and when the target differs from the record name. When the record
+is not created, the GCPACMECNAMEAvailable condition on the HostedCluster
+reports why.</p>
+<p>When this field is not set, no record is created and the deployment is
+responsible for issuing the ingress wildcard certificate, solving its
+DNS-01 challenge in the ingress zone itself.</p>
+<p>The field can be set when the cluster is created or added later, but once
+set it cannot be changed or removed.</p>
+</td>
+</tr>
+</tbody>
+</table>
 ###GCPDiskEncryptionKey { #hypershift.openshift.io/v1beta1.GCPDiskEncryptionKey }
 <p>
 (<em>Appears on:</em>
@@ -52038,7 +52151,10 @@ If not specified, uses the default compute service account for the project.</p>
 <p>resourceLabels is an optional list of additional labels to apply to GCP node
 instances and their associated resources (disks, etc.).
 Labels will be merged with cluster-level resource labels, with NodePool labels
-taking precedence in case of conflicts.</p>
+taking precedence in case of conflicts.
+HyperShift overrides user values for hypershift-openshift-io-cluster with the
+HostedCluster name and, when an infrastructure ID is available,
+hypershift-openshift-io-infra-id with that ID.</p>
 <p>Keys and values must conform to GCP labeling requirements:
 - Keys: 1–63 chars, must start with a lowercase letter; allowed [a-z0-9<em>-]
 - Values: empty or 1–63 chars; allowed [a-z0-9</em>-]
@@ -52270,6 +52386,10 @@ Allowed values: &ldquo;Private&rdquo;, &ldquo;PublicAndPrivate&rdquo;. Defaults 
 Labels are key-value pairs used for organizing and managing GCP resources.
 Changes to this field will be propagated in-place to GCP resources where supported.
 GCP supports a maximum of 64 labels per resource. HyperShift reserves approximately 4 labels for system use.
+HyperShift sets hypershift-openshift-io-cluster to the HostedCluster name and,
+when an infrastructure ID is available, hypershift-openshift-io-infra-id to that ID.
+These system values override user-supplied values for those keys on GCPCluster
+and NodePool machine resources.
 For GCP labeling guidance, see <a href="https://cloud.google.com/compute/docs/labeling-resources">https://cloud.google.com/compute/docs/labeling-resources</a></p>
 </td>
 </tr>
@@ -52310,6 +52430,21 @@ tag propagation. When that capability is unavailable, reconciliation fails
 with a message identifying resourceTags on the ReconciliationSucceeded
 condition, and dependent component deployments are blocked until a
 supporting control plane operator image is configured.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>delegation,omitzero</code></br>
+<em>
+<a href="#hypershift.openshift.io/v1beta1.GCPDNSDelegationSpec">
+GCPDNSDelegationSpec
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>delegation configures DNS delegation for the ingress wildcard certificate
+of the hosted cluster. When omitted, no delegation record is created.</p>
 </td>
 </tr>
 <tr>
@@ -52439,7 +52574,7 @@ Auto-populated by the HyperShift Operator</p>
 <td>
 <em>(Optional)</em>
 <p>conditions represent the current state of PSC infrastructure
-Current condition types are: &ldquo;GCPPrivateServiceConnectAvailable&rdquo;, &ldquo;GCPServiceAttachmentAvailable&rdquo;, &ldquo;GCPEndpointAvailable&rdquo;, &ldquo;GCPDNSAvailable&rdquo;</p>
+Current condition types are: &ldquo;GCPPrivateServiceConnectAvailable&rdquo;, &ldquo;GCPServiceAttachmentAvailable&rdquo;, &ldquo;GCPEndpointAvailable&rdquo;, &ldquo;GCPDNSAvailable&rdquo;, &ldquo;GCPACMECNAMEAvailable&rdquo;</p>
 </td>
 </tr>
 <tr>
@@ -52866,6 +53001,36 @@ This GSA requires the following IAM roles:
 - roles/compute.networkUser (Compute Network User - for using subnets)
 See cmd/infra/gcp/iam-bindings.json for the authoritative role definitions.
 Format: service-account-name@project-id.iam.gserviceaccount.com</p>
+<p>This is a user-provided value referencing a pre-created Google Service Account.
+Typically obtained from the output of <code>hypershift infra create gcp</code> which creates
+the required service accounts with appropriate IAM roles and WIF bindings.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>ingress</code></br>
+<em>
+<a href="#hypershift.openshift.io/v1beta1.GCPServiceAccountEmail">
+GCPServiceAccountEmail
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>ingress is the Google Service Account email for the cluster Ingress Operator
+that manages the default IngressController&rsquo;s wildcard (*.apps) Cloud DNS records.
+This GSA requires the following IAM role:
+- roles/dns.admin (DNS Admin - for managing records in the ingress managed zone)
+See cmd/infra/gcp/iam-bindings.json for the authoritative role definitions.</p>
+<p>When the Ingress capability is enabled (the default), creating the cluster
+through the CLI without this field fails fast, and a cluster created
+without it (e.g. via direct YAML) reports a non-blocking
+IngressCredentialsFound condition: the guest ingress operator runs
+without credentials and cannot publish the *.apps DNS records. Because
+the field is immutable, such a cluster cannot be fixed after creation.
+When the Ingress capability is disabled, this field is ignored. The email
+must belong to the GCP project in spec.platform.gcp.project, and it can
+only be set at creation time.</p>
 <p>This is a user-provided value referencing a pre-created Google Service Account.
 Typically obtained from the output of <code>hypershift infra create gcp</code> which creates
 the required service accounts with appropriate IAM roles and WIF bindings.</p>
@@ -65318,14 +65483,15 @@ In all standard installation methods -- including MCE (Multicluster Engine) and 
 
 Starting with OCP 4.21, the upstream CAPI v1.11 bump introduced the `v1beta2` API version. Since HyperShift did not support CAPI `v1beta2` until 5.0, a backward compatibility mechanism pins specific CAPI images to their 4.20.10 equivalents (which ship CAPI v1.10 / `v1beta1` only) for releases 4.21 and 4.22.
 
-Separately, on `main` and `release-5.0+` (where HyperShift compiles against CAPI v1.11+), hosted clusters running OCP **below 4.19** ship a CAPI controller that writes status via `v1beta1`. The `v1beta1`→`v1beta2` conversion webhook drops the `status.phase` field, leaving it permanently empty. To fix this, the core CAPI manager image is pinned to a known-good OCP 4.22 build that writes status through `v1beta2` natively.
+Separately, on `main` and `release-5.0+` (where HyperShift compiles against CAPI v1.11+), hosted clusters running OCP **below 4.21** ship a CAPI controller that writes status via `v1beta1`. The `v1beta1`→`v1beta2` conversion webhook drops the `status.phase` field, leaving it permanently empty. Additionally, on large environments this causes congestion on the API server due to high conversion volumes.
+To fix this, the core CAPI manager image is pinned to a known-good OCP 4.22 build that writes status through `v1beta2` natively. This removes the need for conversion.
 
 ### Implementation
 
 The pinning is implemented in `support/backwardcompat/backwardcompat.go` via the `GetBackwardCompatibleCAPIImage()` function. The behaviour depends on the branch and the hosted cluster's payload version:
 
 - **release-4.21 / release-4.22** -- for payload version >= 4.21.0, the function extracts the CAPI images from a pinned 4.20.10 release instead of the hosted cluster's own payload.
-- **main / release-5.0+** -- for payload version < 4.19.0, the function returns a pinned OCP 4.22 `cluster-capi-controllers` image. For versions >= 4.19.0 it returns an empty string and the standard image resolution priority applies.
+- **main / release-5.0+** -- for payload version < 4.21.0, the function returns a pinned OCP 4.22 `cluster-capi-controllers` image. For versions >= 4.21.0 it returns an empty string and the standard image resolution priority applies.
 
 In both cases an explicit `hypershift.openshift.io/capi-manager-image` annotation on the HostedCluster takes priority over the pinned image.
 
@@ -65360,24 +65526,25 @@ The following platforms are **not affected** by pinning on any branch: PowerVS, 
 | release-4.20 | No | -- | Not needed -- already ships CAPI v1.10 |
 | release-4.21 | Yes | `cluster-capi-controllers`, CAPA (AWS), CAPZ (Azure) | Pins to 4.20.10 for payloads >= 4.21 |
 | release-4.22 | Yes | `cluster-capi-controllers`, CAPA (AWS), CAPZ (Azure) | Pins to 4.20.10 for payloads >= 4.21 |
-| release-5.0+ | Yes | `cluster-capi-controllers` | Pins to OCP 4.22 CAPI manager for payloads < 4.19 |
-| main | Yes | `cluster-capi-controllers` | Pins to OCP 4.22 CAPI manager for payloads < 4.19 |
+| release-5.0+ | Yes | `cluster-capi-controllers` | Pins to OCP 4.22 CAPI manager for payloads < 4.21 |
+| main | Yes | `cluster-capi-controllers` | Pins to OCP 4.22 CAPI manager for payloads < 4.21 |
 
 !!! note
-    The 4.20.10 pinning was removed once HyperShift gained the ability to compile with CAPI v1.11+, tracked under CNTRLPLANE-2207. The related `v1beta2` client migration is tracked separately under CNTRLPLANE-1200. On `main` and `release-5.0+` the 4.20.10 pinning is replaced by the < 4.19 phase-conversion pinning.
+    The 4.20.10 pinning was removed once HyperShift gained the ability to compile with CAPI v1.11+, tracked under CNTRLPLANE-2207. The related `v1beta2` client migration is tracked separately under CNTRLPLANE-1200. On `main` and `release-5.0+` the 4.20.10 pinning is replaced by the < 4.21 phase-conversion + congestion avoidance pinning.
 
 ### Introducing PRs
 
 - OCPBUGS-74247: CAPI image overrides aware of registry config -- initial implementation (merged to main)
 - OCPBUGS-86295: CAPI image overrides aware of registry config -- backport to release-4.21
 - OCPBUGS-123171: CAPI manager pinning below 4.19 to fix phase conversion -- OCP 4.22 CAPI manager pinning for payloads < 4.19
+- OCPBUGS-140990: fix(capi): extend CAPI manager override up to 4.20 -- OCP 4.22 CAPI manager pinning extended from < 4.19 to < 4.21
 
 ### Known Issues
 
 In disconnected environments, pinned images are not part of the hosted cluster payload's `image-references`, so `oc-mirror` does not discover them automatically:
 
 - On **release-4.21/4.22**: users must manually mirror the 4.20.10 release. Tracked under OCPBUGS-74263 and OCPBUGS-86056.
-- On **main/5.0+**: users must manually mirror the OCP 4.22 `cluster-capi-controllers` image listed above. Tracked under OCPBUGS-123171.
+- On **main/5.0+**: users must manually mirror the OCP 4.22 `cluster-capi-controllers` image listed above. Tracked under OCPBUGS-123171 and OCPBUGS-140990.
 
 ## Related Files
 
