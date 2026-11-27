@@ -85,6 +85,7 @@ nav:
     - how-to/automated-machine-management/performance-profiling.md
     - how-to/automated-machine-management/node-tuning.md
     - how-to/automated-machine-management/nodepool-lifecycle.md
+    - how-to/automated-machine-management/targeted-machine-deletion.md
     - how-to/automated-machine-management/scale-to-zero-dataplane.md
     - 'Spot Instances': how-to/automated-machine-management/spot-instances.md
   - how-to/autoscaling.md
@@ -459,6 +460,7 @@ nav:
   - 'Retrospective Guidelines': contribute/retrospective-guidelines.md
 - 'Blog':
   - blog/index.md
+  - 'September 2026 Progress Report': blog/2026-09-progress-report.md
   - 'August 2026 Progress Report': blog/2026-08-progress-report.md
   - 'July 2026 Progress Report': blog/2026-07-progress-report.md
   - 'June 2026 Progress Report': blog/2026-06-progress-report.md

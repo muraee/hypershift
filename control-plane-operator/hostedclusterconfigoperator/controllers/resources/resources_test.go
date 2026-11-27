@@ -15,6 +15,7 @@ import (
 	cpomanifests "github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/manifests"
 	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/ocm"
 	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/api"
+	ccm "github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/cloudcontrollermanager/azure"
 	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/manifests"
 	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/registry"
 	kasconst "github.com/openshift/hypershift/pkg/kas"
@@ -22,6 +23,7 @@ import (
 	"github.com/openshift/hypershift/support/azureutil"
 	"github.com/openshift/hypershift/support/globalconfig"
 	"github.com/openshift/hypershift/support/k8sutil"
+	karpenterutil "github.com/openshift/hypershift/support/karpenter"
 	"github.com/openshift/hypershift/support/netutil"
 	"github.com/openshift/hypershift/support/reconcilerpolicy"
 	"github.com/openshift/hypershift/support/releaseinfo"
@@ -54,6 +56,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
+	"github.com/blang/semver"
 	"github.com/go-logr/logr"
 	"github.com/go-logr/zapr"
 	operatorsv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
@@ -208,6 +211,7 @@ func TestReconcileErrorHandling(t *testing.T) {
 					"cli": "quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:cli-fake",
 				},
 			},
+			cpReleaseProvider:     &fakereleaseprovider.FakeReleaseProvider{Version: "5.1.0"},
 			ImageMetaDataProvider: &imageMetaDataProvider,
 		}
 		_, err := r.Reconcile(ctx, controllerruntime.Request{})
@@ -243,6 +247,7 @@ func TestReconcileErrorHandling(t *testing.T) {
 					"cli": "quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:cli-fake",
 				},
 			},
+			cpReleaseProvider:     &fakereleaseprovider.FakeReleaseProvider{Version: "5.1.0"},
 			ImageMetaDataProvider: &imageMetaDataProvider,
 		}
 		_, err := r.Reconcile(ctx, controllerruntime.Request{})
@@ -257,6 +262,45 @@ func TestReconcileErrorHandling(t *testing.T) {
 			}
 		}
 	}
+}
+
+// releaseProviderFunc adapts a function to releaseinfo.Provider.
+type releaseProviderFunc func(ctx context.Context, image string, pullSecret []byte) (*releaseinfo.ReleaseImage, error)
+
+func (f releaseProviderFunc) Lookup(ctx context.Context, image string, pullSecret []byte) (*releaseinfo.ReleaseImage, error) {
+	return f(ctx, image, pullSecret)
+}
+
+func TestReconciler_ResolveControlPlaneReleaseVersion(t *testing.T) {
+	// The control plane release lookup adds the provider credential, so it must go
+	// through its own provider. Sharing the data plane provider would share its
+	// cache, which is keyed by pull spec only, so a release cached with the provider
+	// credential would be returned to a later data plane lookup without checking the
+	// cluster pull secret.
+	t.Run("When a distinct control plane release is pinned, it should look it up with the control plane release provider", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+
+		cpReleaseImage := "quay.io/openshift-release-dev/ocp-release-private:5.1.0-x86_64"
+		hcp := fakeHCP()
+		hcp.Spec.ControlPlaneReleaseImage = &cpReleaseImage
+
+		var cpLookups []string
+		r := &reconciler{
+			cpClient: fake.NewClientBuilder().WithScheme(api.Scheme).WithObjects(hcp).Build(),
+			releaseProvider: releaseProviderFunc(func(_ context.Context, image string, _ []byte) (*releaseinfo.ReleaseImage, error) {
+				return nil, fmt.Errorf("unexpected data plane provider lookup of %s", image)
+			}),
+			cpReleaseProvider: releaseProviderFunc(func(_ context.Context, image string, _ []byte) (*releaseinfo.ReleaseImage, error) {
+				cpLookups = append(cpLookups, image)
+				return (&fakereleaseprovider.FakeReleaseProvider{Version: "5.1.0"}).Lookup(context.Background(), image, nil)
+			}),
+		}
+
+		version, err := r.resolveControlPlaneReleaseVersion(t.Context(), hcp, []byte(`{"auths":{}}`), semver.MustParse("5.0.0"))
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(version.String()).To(Equal("5.1.0"))
+		g.Expect(cpLookups).To(Equal([]string{cpReleaseImage}))
+	})
 }
 
 func TestReconcileRequeueBehavior(t *testing.T) {
@@ -4204,5 +4248,28 @@ func TestReconcileConfigOperatorReconciliationCondition(t *testing.T) {
 			g.Expect(condition.Message).To(Equal(tc.expectedMessage))
 			g.Expect(condition.ObservedGeneration).To(Equal(hcp.Generation))
 		})
+	}
+}
+
+func TestReconcileAzureCloudNodeManager(t *testing.T) {
+	g := NewWithT(t)
+
+	guestClient := fake.NewClientBuilder().WithScheme(api.Scheme).Build()
+	r := &reconciler{
+		client:                 guestClient,
+		CreateOrUpdateProvider: &simpleCreateOrUpdater{},
+	}
+
+	errs := r.reconcileAzureCloudNodeManager(t.Context(), "cloud-node-manager-image")
+	g.Expect(errs).To(BeEmpty())
+
+	daemonSet := ccm.CloudNodeManagerDaemonSet()
+	g.Expect(guestClient.Get(t.Context(), client.ObjectKeyFromObject(daemonSet), daemonSet)).To(Succeed())
+
+	g.Expect(karpenterutil.KarpenterBaseTaints).ToNot(BeEmpty())
+	for _, taint := range karpenterutil.KarpenterBaseTaints {
+		g.Expect(daemonSet.Spec.Template.Spec.Tolerations).To(ContainElement(Satisfy(func(toleration corev1.Toleration) bool {
+			return toleration.ToleratesTaint(logr.Discard(), &taint, false)
+		})), "cloud node manager must tolerate Karpenter taint %s", taint.Key)
 	}
 }

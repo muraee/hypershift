@@ -10,6 +10,7 @@ import (
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	controlplaneoperatoroverrides "github.com/openshift/hypershift/hypershift-operator/controlplaneoperator-overrides"
 	"github.com/openshift/hypershift/support/config"
+	karpenterutil "github.com/openshift/hypershift/support/karpenter"
 	"github.com/openshift/hypershift/support/rhobsmonitoring"
 
 	configv1 "github.com/openshift/api/config/v1"
@@ -834,6 +835,16 @@ func TestHyperShiftOperatorClusterRole_WebhookRBAC(t *testing.T) {
 			ResourceNames: []string{hyperv1.GroupVersion.Group},
 		})))
 	})
+
+	t.Run("When building the ClusterRole it should permit delegating VMIM creation", func(t *testing.T) {
+		t.Parallel()
+		g := NewGomegaWithT(t)
+		g.Expect(clusterRole.Rules).To(ContainElement(Equal(rbacv1.PolicyRule{
+			APIGroups: []string{"kubevirt.io"},
+			Resources: []string{"virtualmachineinstancemigrations"},
+			Verbs:     []string{"create"},
+		})))
+	})
 }
 
 func TestHyperShiftOperatorPodDisruptionBudget_Build(t *testing.T) {
@@ -953,6 +964,8 @@ func TestBuildEnvVars(t *testing.T) {
 		deployment     HyperShiftOperatorDeployment
 		expectContains []corev1.EnvVar
 		expectAbsent   []string
+		// expectOnce lists variables that must be rendered exactly once.
+		expectOnce []string
 	}{
 		{
 			name: "When TechPreviewNoUpgrade is enabled, it should include HYPERSHIFT_FEATURESET env var",
@@ -961,6 +974,15 @@ func TestBuildEnvVars(t *testing.T) {
 			},
 			expectContains: []corev1.EnvVar{
 				{Name: "HYPERSHIFT_FEATURESET", Value: string(configv1.TechPreviewNoUpgrade)},
+			},
+		},
+		{
+			name: "When EnableKarpenterOperator is enabled, it should include the env var",
+			deployment: HyperShiftOperatorDeployment{
+				EnableKarpenterOperator: true,
+			},
+			expectContains: []corev1.EnvVar{
+				{Name: karpenterutil.EnableStandaloneKarpenterOperatorEnvVar, Value: "1"},
 			},
 		},
 		{
@@ -1054,6 +1076,36 @@ func TestBuildEnvVars(t *testing.T) {
 			},
 		},
 		{
+			name: "When ControlPlaneReleasePullSecretName is set, it should include the env var",
+			deployment: HyperShiftOperatorDeployment{
+				ControlPlaneReleasePullSecretName: "generated-by-another-system",
+			},
+			expectContains: []corev1.EnvVar{
+				{Name: ControlPlaneReleasePullSecretNameEnvVar, Value: "generated-by-another-system"},
+			},
+		},
+		{
+			name: "When ControlPlaneReleasePullSecretName is also set in AdditionalOperatorEnvVars, it should render the env var once with the flag's value",
+			deployment: HyperShiftOperatorDeployment{
+				ControlPlaneReleasePullSecretName: "generated-by-another-system",
+				AdditionalOperatorEnvVars:         map[string]string{ControlPlaneReleasePullSecretNameEnvVar: "from-additional-env-vars"},
+			},
+			expectContains: []corev1.EnvVar{
+				{Name: ControlPlaneReleasePullSecretNameEnvVar, Value: "generated-by-another-system"},
+			},
+			expectOnce: []string{ControlPlaneReleasePullSecretNameEnvVar},
+		},
+		{
+			name: "When the env var is only set in AdditionalOperatorEnvVars, it should render that value once",
+			deployment: HyperShiftOperatorDeployment{
+				AdditionalOperatorEnvVars: map[string]string{ControlPlaneReleasePullSecretNameEnvVar: "from-additional-env-vars"},
+			},
+			expectContains: []corev1.EnvVar{
+				{Name: ControlPlaneReleasePullSecretNameEnvVar, Value: "from-additional-env-vars"},
+			},
+			expectOnce: []string{ControlPlaneReleasePullSecretNameEnvVar},
+		},
+		{
 			name: "When CAPI migration is enabled, it should include CAPI_STORAGE_VERSION env var",
 			deployment: HyperShiftOperatorDeployment{
 				CAPIStorageVersion: "v1beta2",
@@ -1068,12 +1120,14 @@ func TestBuildEnvVars(t *testing.T) {
 				CertRotationScale: 24 * time.Hour,
 			},
 			expectAbsent: []string{
+				ControlPlaneReleasePullSecretNameEnvVar,
 				"HYPERSHIFT_FEATURESET",
 				"ENABLE_AUDIT_LOG_PERSISTENCE",
 				"MANAGED_SERVICE",
 				"ENABLE_SIZE_TAGGING",
 				"MONITORING_DASHBOARDS",
 				"CAPI_STORAGE_VERSION",
+				"ENABLE_STANDALONE_KARPENTER_OPERATOR",
 			},
 		},
 	}
@@ -1089,6 +1143,15 @@ func TestBuildEnvVars(t *testing.T) {
 				for _, env := range envVars {
 					g.Expect(env.Name).NotTo(Equal(absent))
 				}
+			}
+			for _, name := range tc.expectOnce {
+				count := 0
+				for _, env := range envVars {
+					if env.Name == name {
+						count++
+					}
+				}
+				g.Expect(count).To(Equal(1), "expected %s to be rendered exactly once", name)
 			}
 		})
 	}

@@ -13,6 +13,7 @@ import (
 
 	configv1 "github.com/openshift/api/config/v1"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 
@@ -303,14 +304,38 @@ func TestIsStandaloneKarpenterOperatorEnabled(t *testing.T) {
 			expected:   false,
 		},
 		{
-			name:       "When feature gate is disabled but env var is set to 1, it should return false",
+			name:       "When the default feature set is used and env var is set to 1, it should return true",
 			featureSet: configv1.Default,
+			envValue:   "1",
+			expected:   true,
+		},
+		{
+			name:       "When the default feature set is used and env var is unset, it should return false",
+			featureSet: configv1.Default,
+			envValue:   "",
+			expected:   false,
+		},
+		{
+			name:       "When the default feature set is used and env var is set to 0, it should return false",
+			featureSet: configv1.Default,
+			envValue:   "0",
+			expected:   false,
+		},
+		{
+			name:       "When the default feature set is used and env var is set to true, it should return false",
+			featureSet: configv1.Default,
+			envValue:   "true",
+			expected:   false,
+		},
+		{
+			name:       "When feature gate is disabled but env var is set to 1, it should return false",
+			featureSet: configv1.DevPreviewNoUpgrade,
 			envValue:   "1",
 			expected:   false,
 		},
 		{
 			name:       "When both feature gate and env var are disabled, it should return false",
-			featureSet: configv1.Default,
+			featureSet: configv1.DevPreviewNoUpgrade,
 			envValue:   "",
 			expected:   false,
 		},
@@ -356,4 +381,16 @@ func TestKarpenterBaseTaintMap(t *testing.T) {
 			g.Expect(taint["effect"]).To(Equal(string(KarpenterBaseTaints[i].Effect)))
 		}
 	})
+}
+
+func TestKarpenterBaseTaintTolerations(t *testing.T) {
+	g := NewWithT(t)
+
+	tolerations := KarpenterBaseTaintTolerations()
+	g.Expect(tolerations).To(HaveLen(len(KarpenterBaseTaints)))
+	for i, toleration := range tolerations {
+		g.Expect(toleration.Key).To(Equal(KarpenterBaseTaints[i].Key))
+		g.Expect(toleration.Operator).To(Equal(corev1.TolerationOpExists))
+		g.Expect(toleration.Effect).To(Equal(KarpenterBaseTaints[i].Effect))
+	}
 }

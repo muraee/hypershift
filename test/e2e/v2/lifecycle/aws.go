@@ -30,7 +30,8 @@ type AWSPlatformConfig struct {
 	sharedDir      string
 	externalOIDC   externalOIDCSetup
 
-	newMirrorRegistry func(crclient.Client, mirrorregistry.Options) (mirrorRegistry, error)
+	newMirrorRegistry  func(crclient.Client, mirrorregistry.Options) (mirrorRegistry, error)
+	resolveKMSKeyARNFn func(ctx context.Context, alias string) (string, error)
 }
 
 type AWSPlatformOptions struct {
@@ -125,6 +126,21 @@ func (a *AWSPlatformConfig) ClusterSpecs(ctx context.Context, releaseImage, n1Im
 	}
 	oneInitialReplica := 1
 
+	var kmsKeyARNArgs []string
+	if kmsKeyARN := os.Getenv("HYPERSHIFT_ETCD_KMS_KEY_ARN"); kmsKeyARN != "" {
+		// If the value is an alias (alias/<name>), resolve it to a full ARN.
+		// IAM policy Resources require ARN format; aliases are rejected.
+		if strings.HasPrefix(kmsKeyARN, "alias/") {
+			resolved, err := a.resolveKMSKeyARN(ctx, kmsKeyARN)
+			if err != nil {
+				panic(fmt.Sprintf("HYPERSHIFT_ETCD_KMS_KEY_ARN is set to alias %q but could not be resolved to an ARN: %v", kmsKeyARN, err))
+			}
+			log.Printf("Resolved etcd KMS key alias %q to ARN %q", kmsKeyARN, resolved)
+			kmsKeyARN = resolved
+		}
+		kmsKeyARNArgs = append(kmsKeyARNArgs, "--kms-key-arn="+kmsKeyARN)
+	}
+
 	// The storage-kms test runs on the public cluster and requires the cluster
 	// to be created with a KMS key. HYPERSHIFT_STORAGE_KMS_KEY_ALIAS carries a
 	// pre-provisioned CI KMS key alias (e.g. alias/hypershift-ci), resolved here
@@ -163,7 +179,7 @@ func (a *AWSPlatformConfig) ClusterSpecs(ctx context.Context, releaseImage, n1Im
 		}
 	}
 
-	return []ClusterSpec{
+	specs := []ClusterSpec{
 		{
 			Variant:     "public",
 			DestroyArgs: destroyArgs,
@@ -276,7 +292,19 @@ func (a *AWSPlatformConfig) ClusterSpecs(ctx context.Context, releaseImage, n1Im
 			InitialNodePoolReplicas: &oneInitialReplica,
 			CreateArgs:              clusterArgs(deterministicLBArgs...),
 		},
+		{
+			// Dedicated cluster for etcd KMS re-encryption tests. When
+			// HYPERSHIFT_ETCD_KMS_KEY_ARN is set, the cluster is created with
+			// --kms-key-arn so AWSKMSKeyRotationTest can rotate keys. When the
+			// variable is unset the cluster is created without KMS encryption and
+			// the rotation tests skip themselves via applies().
+			Variant:     "kms-reencryption",
+			DestroyArgs: destroyArgs,
+			CreateArgs:  clusterArgs(slices.Concat([]string{"--public-only"}, kmsKeyARNArgs)...),
+		},
 	}
+
+	return specs
 }
 
 // PreCreate deploys the external OIDC provider and the mirror registry fixture
@@ -361,6 +389,11 @@ func (a *AWSPlatformConfig) TestMatrix() TestMatrix {
 				Variant:     "karpenter-upgrade",
 				LabelFilter: "karpenter-upgrade",
 			},
+			{
+				Name:        "kms-reencryption",
+				Variant:     "kms-reencryption",
+				LabelFilter: "etcd-encryption-reencryption",
+			},
 		},
 		Sequential: []SequentialGroup{
 			// The removal step is a day-2 mutation of imageContentSources that is
@@ -390,7 +423,7 @@ func (a *AWSPlatformConfig) TestMatrix() TestMatrix {
 							"hosted-cluster-cpo || nodepool-arm64 || secret-encryption || control-plane-workloads || " +
 							"hosted-cluster-security || nodepool-osimagestream || hosted-cluster-ingress || hosted-cluster-dns || " +
 							"hosted-cluster-health || hosted-cluster-metrics || hosted-cluster-image-registry || storage-kms || " +
-							"hosted-cluster-event-ttl",
+							"hosted-cluster-event-ttl || installation-diagnostics",
 					},
 				},
 			},
@@ -492,13 +525,32 @@ func (a *AWSPlatformConfig) TestMatrix() TestMatrix {
 
 func (a *AWSPlatformConfig) SetupTestEnv(sharedDir string) {
 	setupExternalOIDCTestEnv(sharedDir)
+
+	// E2E_AWS_KMS_KEY_ARN_ALTERNATE may be set to a KMS alias by CI. The rotation
+	// test writes it verbatim into spec.secretEncryption.kms.aws.activeKey.arn, which
+	// the HostedCluster CRD requires to be a full ARN. Resolve the alias here, before
+	// any test reads the env var, so the patch is never rejected by API validation.
+	if alt := os.Getenv("E2E_AWS_KMS_KEY_ARN_ALTERNATE"); strings.HasPrefix(alt, "alias/") {
+		resolved, err := a.resolveKMSKeyARN(context.Background(), alt)
+		if err != nil {
+			panic(fmt.Sprintf("E2E_AWS_KMS_KEY_ARN_ALTERNATE is set to alias %q but could not be resolved to an ARN: %v", alt, err))
+		}
+		log.Printf("Resolved alternate KMS key alias %q to ARN %q", alt, resolved)
+		if err := os.Setenv("E2E_AWS_KMS_KEY_ARN_ALTERNATE", resolved); err != nil {
+			panic(fmt.Sprintf("failed to update E2E_AWS_KMS_KEY_ARN_ALTERNATE: %v", err))
+		}
+	}
 }
 
 // resolveKMSKeyARN resolves a KMS key alias (e.g. "alias/hypershift-ci") to its
 // full key ARN using DescribeKey. AWS credentials are sourced from the SDK default
 // credential chain (shared config/credentials files, environment variables, and
-// instance/role providers).
+// instance/role providers). resolveKMSKeyARNFn can be set on the struct to override
+// this behavior in tests without making real AWS API calls.
 func (a *AWSPlatformConfig) resolveKMSKeyARN(ctx context.Context, alias string) (string, error) {
+	if a.resolveKMSKeyARNFn != nil {
+		return a.resolveKMSKeyARNFn(ctx, alias)
+	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 

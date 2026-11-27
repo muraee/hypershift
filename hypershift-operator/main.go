@@ -364,7 +364,7 @@ func run(ctx context.Context, opts *StartOptions, log logr.Logger) error {
 	}
 
 	ec2Client := setupEC2Client(ctx, opts)
-	npmetrics.CreateAndRegisterNodePoolsMetricsCollector(mgr.GetClient(), ec2Client)
+	npmetrics.CreateAndRegisterNodePoolsMetricsCollector(ctx, mgr.GetClient(), ec2Client)
 
 	if err := setupNodePoolController(ctx, mgr, opts, operatorImage, createOrUpdate, registryProvider, ec2Client, log); err != nil {
 		return err
@@ -688,6 +688,7 @@ func setupHostedClusterController(ctx context.Context, mgr ctrl.Manager, opts *S
 		MetricsSet:                              metricsSet,
 		EnableGMPMonitoring:                     opts.EnableGMPMonitoring,
 		OperatorNamespace:                       opts.Namespace,
+		ControlPlaneReleasePullSecretName:       os.Getenv(assets.ControlPlaneReleasePullSecretNameEnvVar),
 		SREConfigHash:                           sreConfigHash,
 		KubevirtInfraClients:                    kvinfra.NewKubevirtInfraClientMap(),
 		MonitoringDashboards:                    monitoringDashboards,

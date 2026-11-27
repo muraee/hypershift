@@ -1,6 +1,7 @@
 package controlplanecomponent
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -325,7 +326,8 @@ func TestReconcileComponentStatus(t *testing.T) {
 
 			var hcpGeneration int64 = 5
 			cpContext := ControlPlaneContext{
-				Client: client,
+				Context: context.Background(),
+				Client:  client,
 				HCP: &hyperv1.HostedControlPlane{
 					ObjectMeta: metav1.ObjectMeta{
 						Namespace:  namespace,
@@ -371,6 +373,242 @@ func TestReconcileComponentStatus(t *testing.T) {
 			g.Expect(componentStatus.Status.ObservedGeneration).To(Equal(hcpGeneration))
 		})
 	}
+
+	t.Run("should set RolloutComplete with PodSchedulingFailed and append diagnosis when a pod is unschedulable", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+
+		deployment := &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        componentName,
+				Namespace:   namespace,
+				UID:         "deploy-uid-1",
+				Annotations: map[string]string{"deployment.kubernetes.io/revision": "2"},
+			},
+			Spec: appsv1.DeploymentSpec{
+				Replicas: ptr.To[int32](3),
+				Selector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{"app": componentName},
+				},
+			},
+			Status: appsv1.DeploymentStatus{
+				AvailableReplicas: 2,
+				ReadyReplicas:     2,
+				Replicas:          3,
+				UpdatedReplicas:   3,
+				Conditions: []appsv1.DeploymentCondition{
+					{
+						Type:   appsv1.DeploymentAvailable,
+						Status: corev1.ConditionTrue,
+					},
+				},
+			},
+		}
+
+		currentRS := &appsv1.ReplicaSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        componentName + "-rev2",
+				Namespace:   namespace,
+				Labels:      map[string]string{"app": componentName, "pod-template-hash": "rev2"},
+				Annotations: map[string]string{"deployment.kubernetes.io/revision": "2"},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: "apps/v1",
+						Kind:       "Deployment",
+						Name:       componentName,
+						UID:        deployment.UID,
+						Controller: ptr.To(true),
+					},
+				},
+			},
+			Spec: appsv1.ReplicaSetSpec{
+				Selector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{"app": componentName, "pod-template-hash": "rev2"},
+				},
+			},
+		}
+
+		unschedulablePod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      componentName + "-abc",
+				Namespace: namespace,
+				Labels:    map[string]string{"app": componentName, "pod-template-hash": "rev2"},
+			},
+			Status: corev1.PodStatus{
+				Conditions: []corev1.PodCondition{
+					{
+						Type:    corev1.PodScheduled,
+						Status:  corev1.ConditionFalse,
+						Reason:  "Unschedulable",
+						Message: "0/3 nodes are available: 3 Insufficient cpu.",
+					},
+				},
+			},
+		}
+
+		c := fake.NewClientBuilder().
+			WithScheme(api.Scheme).
+			WithObjects(deployment, currentRS, unschedulablePod).
+			Build()
+
+		cpContext := ControlPlaneContext{
+			Context: context.Background(),
+			Client:  c,
+			HCP: &hyperv1.HostedControlPlane{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:  namespace,
+					Generation: 5,
+				},
+			},
+			ReleaseImageProvider: testutil.FakeImageProvider(),
+		}
+
+		component := NewDeploymentComponent(componentName, nil)
+		workload := component.Build().(*controlPlaneWorkload[*appsv1.Deployment])
+
+		componentStatus := &hyperv1.ControlPlaneComponent{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      componentName,
+				Namespace: namespace,
+			},
+		}
+
+		err := workload.reconcileComponentStatus(cpContext, componentStatus, nil, nil, nil)
+		g.Expect(err).NotTo(HaveOccurred())
+
+		rollout := meta.FindStatusCondition(componentStatus.Status.Conditions, string(hyperv1.ControlPlaneComponentRolloutComplete))
+		g.Expect(rollout).NotTo(BeNil())
+		g.Expect(rollout.Status).To(Equal(metav1.ConditionFalse))
+		g.Expect(rollout.Reason).To(Equal(hyperv1.PodSchedulingFailedReason))
+		// Preserves rollout context and appends pod diagnosis.
+		g.Expect(rollout.Message).To(ContainSubstring("Waiting for deployment " + componentName + " rollout to finish"))
+		g.Expect(rollout.Message).To(ContainSubstring("; Pod " + componentName + "-abc is unschedulable: Insufficient cpu"))
+		// Must not leak management cluster details.
+		g.Expect(rollout.Message).NotTo(ContainSubstring("nodes are available"))
+	})
+
+	t.Run("should immediately diagnose when transitioning from healthy to unhealthy and preserve distinct messages", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+
+		deployment := &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        componentName,
+				Namespace:   namespace,
+				UID:         "deploy-uid-2",
+				Annotations: map[string]string{"deployment.kubernetes.io/revision": "3"},
+			},
+			Spec: appsv1.DeploymentSpec{
+				Replicas: ptr.To[int32](3),
+				Selector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{"app": componentName},
+				},
+			},
+			Status: appsv1.DeploymentStatus{
+				AvailableReplicas: 0,
+				ReadyReplicas:     0,
+				Replicas:          3,
+				UpdatedReplicas:   1,
+				Conditions: []appsv1.DeploymentCondition{
+					{
+						Type:    appsv1.DeploymentAvailable,
+						Status:  corev1.ConditionFalse,
+						Message: "Deployment does not have minimum availability.",
+					},
+				},
+			},
+		}
+
+		currentRS := &appsv1.ReplicaSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        componentName + "-rev3",
+				Namespace:   namespace,
+				Labels:      map[string]string{"app": componentName, "pod-template-hash": "rev3"},
+				Annotations: map[string]string{"deployment.kubernetes.io/revision": "3"},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: "apps/v1",
+						Kind:       "Deployment",
+						Name:       componentName,
+						UID:        deployment.UID,
+						Controller: ptr.To(true),
+					},
+				},
+			},
+			Spec: appsv1.ReplicaSetSpec{
+				Selector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{"app": componentName, "pod-template-hash": "rev3"},
+				},
+			},
+		}
+
+		crashingPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      componentName + "-xyz",
+				Namespace: namespace,
+				Labels:    map[string]string{"app": componentName, "pod-template-hash": "rev3"},
+			},
+			Status: corev1.PodStatus{
+				ContainerStatuses: []corev1.ContainerStatus{
+					{
+						Name: "server",
+						State: corev1.ContainerState{
+							Waiting: &corev1.ContainerStateWaiting{
+								Reason: "CrashLoopBackOff",
+							},
+						},
+					},
+				},
+			},
+		}
+
+		c := fake.NewClientBuilder().
+			WithScheme(api.Scheme).
+			WithObjects(deployment, currentRS, crashingPod).
+			Build()
+
+		cpContext := ControlPlaneContext{
+			Context: context.Background(),
+			Client:  c,
+			HCP: &hyperv1.HostedControlPlane{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:  namespace,
+					Generation: 5,
+				},
+			},
+			ReleaseImageProvider: testutil.FakeImageProvider(),
+		}
+
+		component := NewDeploymentComponent(componentName, nil)
+		workload := component.Build().(*controlPlaneWorkload[*appsv1.Deployment])
+
+		// Simulate a previously healthy component transitioning to unhealthy.
+		componentStatus := &hyperv1.ControlPlaneComponent{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      componentName,
+				Namespace: namespace,
+			},
+			Status: hyperv1.ControlPlaneComponentStatus{
+				Conditions: []metav1.Condition{
+					{Type: string(hyperv1.ControlPlaneComponentAvailable), Status: metav1.ConditionTrue, Reason: hyperv1.AsExpectedReason},
+					{Type: string(hyperv1.ControlPlaneComponentRolloutComplete), Status: metav1.ConditionTrue, Reason: hyperv1.AsExpectedReason},
+				},
+			},
+		}
+
+		err := workload.reconcileComponentStatus(cpContext, componentStatus, nil, nil, nil)
+		g.Expect(err).NotTo(HaveOccurred())
+
+		avail := meta.FindStatusCondition(componentStatus.Status.Conditions, string(hyperv1.ControlPlaneComponentAvailable))
+		g.Expect(avail).NotTo(BeNil())
+		g.Expect(avail.Status).To(Equal(metav1.ConditionFalse))
+		g.Expect(avail.Reason).To(Equal(hyperv1.CrashLoopBackOffReason))
+		g.Expect(avail.Message).To(Equal("Deployment " + componentName + " is not available: Deployment does not have minimum availability.; Pod " + componentName + "-xyz container server: CrashLoopBackOff"))
+
+		rollout := meta.FindStatusCondition(componentStatus.Status.Conditions, string(hyperv1.ControlPlaneComponentRolloutComplete))
+		g.Expect(rollout).NotTo(BeNil())
+		g.Expect(rollout.Status).To(Equal(metav1.ConditionFalse))
+		g.Expect(rollout.Reason).To(Equal(hyperv1.CrashLoopBackOffReason))
+		g.Expect(rollout.Message).To(Equal("Waiting for deployment " + componentName + " rollout to finish: 1 out of 3 new replicas have been updated; Pod " + componentName + "-xyz container server: CrashLoopBackOff"))
+	})
 }
 
 func createMockControlPlaneComponent(name string, available, rolloutComplete bool, version string) hyperv1.ControlPlaneComponent {
@@ -462,6 +700,55 @@ func TestCheckDependencies(t *testing.T) {
 			expectedMissing: []string{},
 			setup: func(cpContext *ControlPlaneContext) *controlPlaneWorkload[*appsv1.Deployment] {
 				return createMockWorkload("external-oidc-webhook", nil)
+			},
+		},
+		{
+			// capi-provider mounts the service-network-admin-kubeconfig secret the
+			// kube-apiserver component applies, so unlike the other components that
+			// predate the kube-apiserver (cluster-api, router, ...) it must wait for
+			// its rollout on releases guaranteed to run a v2 CPO (4.20+).
+			testName:        "When capi-provider uses release 4.20 or later, it should depend on kube-apiserver",
+			mockComponents:  []hyperv1.ControlPlaneComponent{},
+			expectedMissing: []string{kubeAPIServerComponentName},
+			setup: func(cpContext *ControlPlaneContext) *controlPlaneWorkload[*appsv1.Deployment] {
+				cpContext.ReleaseImageProvider = testutil.FakeImageProvider(testutil.WithVersion("4.20.0"))
+				return createMockWorkload("capi-provider", nil)
+			},
+		},
+		{
+			// Releases before 4.20 may run a v1 CPO, which never publishes a
+			// kube-apiserver ControlPlaneComponent; waiting for one would block
+			// capi-provider forever (OCPBUGS-143987).
+			testName:        "When capi-provider uses a release before 4.20, it should not depend on kube-apiserver",
+			mockComponents:  []hyperv1.ControlPlaneComponent{},
+			expectedMissing: []string{},
+			setup: func(cpContext *ControlPlaneContext) *controlPlaneWorkload[*appsv1.Deployment] {
+				cpContext.ReleaseImageProvider = testutil.FakeImageProvider(testutil.WithVersion("4.19.0"))
+				return createMockWorkload("capi-provider", nil)
+			},
+		},
+		{
+			// 4.20 pre-release payloads (ec, rc, nightly) already ship a v2-only
+			// CPO, so the pre-release must not drag them below the 4.20.0
+			// threshold and strip the dependency.
+			testName:        "When capi-provider uses a 4.20 pre-release, it should depend on kube-apiserver",
+			mockComponents:  []hyperv1.ControlPlaneComponent{},
+			expectedMissing: []string{kubeAPIServerComponentName},
+			setup: func(cpContext *ControlPlaneContext) *controlPlaneWorkload[*appsv1.Deployment] {
+				cpContext.ReleaseImageProvider = testutil.FakeImageProvider(testutil.WithVersion("4.20.0-0.nightly-2025-01-01-000000"))
+				return createMockWorkload("capi-provider", nil)
+			},
+		},
+		{
+			// An unparsable version can't prove the CPO is v2-only. Skipping the
+			// dependency risks a transient FailedMount; keeping it would block the
+			// component forever, so the skip is the recoverable choice.
+			testName:        "When capi-provider has an unparsable release version, it should not depend on kube-apiserver",
+			mockComponents:  []hyperv1.ControlPlaneComponent{},
+			expectedMissing: []string{},
+			setup: func(cpContext *ControlPlaneContext) *controlPlaneWorkload[*appsv1.Deployment] {
+				cpContext.ReleaseImageProvider = testutil.FakeImageProvider(testutil.WithVersion("not-a-version"))
+				return createMockWorkload("capi-provider", nil)
 			},
 		},
 		{

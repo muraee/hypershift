@@ -50,7 +50,9 @@ import (
 	"github.com/openshift/hypershift/support/config"
 	"github.com/openshift/hypershift/support/imageregistry"
 	"github.com/openshift/hypershift/support/k8sutil"
+	karpenterutil "github.com/openshift/hypershift/support/karpenter"
 	"github.com/openshift/hypershift/support/netutil"
+	"github.com/openshift/hypershift/support/pullsecret"
 	"github.com/openshift/hypershift/support/reconcilerpolicy"
 	"github.com/openshift/hypershift/support/releaseinfo"
 	"github.com/openshift/hypershift/support/statuspatching"
@@ -149,6 +151,7 @@ type reconciler struct {
 	hcpName                   string
 	hcpNamespace              string
 	releaseProvider           releaseinfo.Provider
+	cpReleaseProvider         releaseinfo.Provider
 	konnectivityServerAddress string
 	konnectivityServerPort    int32
 	oauthAddress              string
@@ -226,6 +229,7 @@ func Setup(ctx context.Context, opts *operator.HostedClusterConfigOperatorConfig
 			hcpName:                   opts.HCPName,
 			hcpNamespace:              opts.Namespace,
 			releaseProvider:           opts.ReleaseProvider,
+			cpReleaseProvider:         opts.ControlPlaneReleaseProvider,
 			konnectivityServerAddress: opts.KonnectivityAddress,
 			konnectivityServerPort:    opts.KonnectivityPort,
 			oauthAddress:              opts.OAuthAddress,
@@ -358,6 +362,33 @@ func notUserCABundlePredicate() predicate.Funcs {
 	})
 }
 
+// resolveControlPlaneReleaseVersion returns the version of the release the control
+// plane is running. When the control plane pins a release image distinct from the
+// data plane's, that image may live in a private registry the cluster pull secret
+// does not cover, so the lookup uses the additional control plane release credential.
+// dataPlaneVersion is returned unchanged when no distinct control plane release is set.
+func (r *reconciler) resolveControlPlaneReleaseVersion(ctx context.Context, hcp *hyperv1.HostedControlPlane, pullSecretBytes []byte, dataPlaneVersion semver.Version) (semver.Version, error) {
+	if hcp.Spec.ControlPlaneReleaseImage == nil {
+		return dataPlaneVersion, nil
+	}
+
+	cpPullSecretBytes, err := pullsecret.ForHostedControlPlane(ctx, r.cpClient, hcp, pullSecretBytes)
+	if err != nil {
+		return semver.Version{}, fmt.Errorf("failed to resolve control plane release pull secret: %w", err)
+	}
+	// cpReleaseProvider has its own cache, separate from releaseProvider's: the
+	// cache is keyed by pull spec only, and this lookup adds the provider credential.
+	controlPlaneReleaseImage, err := r.cpReleaseProvider.Lookup(ctx, *hcp.Spec.ControlPlaneReleaseImage, cpPullSecretBytes)
+	if err != nil {
+		return semver.Version{}, fmt.Errorf("failed to lookup control plane release image %s: %w", *hcp.Spec.ControlPlaneReleaseImage, err)
+	}
+	version, err := semver.Parse(controlPlaneReleaseImage.Version())
+	if err != nil {
+		return semver.Version{}, fmt.Errorf("failed to parse control plane release image version: %w", err)
+	}
+	return version, nil
+}
+
 func (r *reconciler) Reconcile(ctx context.Context, _ ctrl.Request) (result ctrl.Result, returnErr error) {
 	log := ctrl.LoggerFrom(ctx)
 
@@ -419,16 +450,9 @@ func (r *reconciler) Reconcile(ctx context.Context, _ ctrl.Request) (result ctrl
 		return ctrl.Result{}, fmt.Errorf("failed to parse release image version: %w", err)
 	}
 
-	controlPlaneReleaseVersion := releaseImageVersion
-	if hcp.Spec.ControlPlaneReleaseImage != nil {
-		controlPlaneReleaseImage, err := r.releaseProvider.Lookup(ctx, *hcp.Spec.ControlPlaneReleaseImage, pullSecret.Data[corev1.DockerConfigJsonKey])
-		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed to lookup control plane release image %s: %w", *hcp.Spec.ControlPlaneReleaseImage, err)
-		}
-		controlPlaneReleaseVersion, err = semver.Parse(controlPlaneReleaseImage.Version())
-		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed to parse control plane release image version: %w", err)
-		}
+	controlPlaneReleaseVersion, err := r.resolveControlPlaneReleaseVersion(ctx, hcp, pullSecret.Data[corev1.DockerConfigJsonKey], releaseImageVersion)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// The exception for IBMCloudPlatform is due to the fact that the IBM will include new certificates for HCCO from 4.17 version
@@ -3292,7 +3316,7 @@ func (r *reconciler) reconcileAzureCloudNodeManager(ctx context.Context, image s
 					ServiceAccountName: ccm.CloudNodeManagerName,
 					HostNetwork:        true,
 					// https://github.com/openshift/cluster-cloud-controller-manager-operator/blob/release-4.15/pkg/cloud/azure/assets/cloud-node-manager-daemonset.yaml#L34
-					Tolerations: []corev1.Toleration{
+					Tolerations: append([]corev1.Toleration{
 						{
 							Operator: corev1.TolerationOpExists,
 							Effect:   corev1.TaintEffectNoSchedule,
@@ -3307,15 +3331,8 @@ func (r *reconciler) reconcileAzureCloudNodeManager(ctx context.Context, image s
 							Operator: corev1.TolerationOpExists,
 							Effect:   corev1.TaintEffectNoExecute,
 						},
-						// TODO(maxcao13): remove this when we fix this in karpenter-operator which will set the providerId instead
-						// https://redhat.atlassian.net/browse/AUTOSCALE-1036
-						// Karpenter nodes register with karpenter.sh/unregistered taint until providerID is set.
-						{
-							Key:      "karpenter.sh/unregistered",
-							Operator: corev1.TolerationOpExists,
-							Effect:   corev1.TaintEffectNoExecute,
-						},
-					},
+						// Run on unregistered Karpenter nodes to set the providerID they need to register.
+					}, karpenterutil.KarpenterBaseTaintTolerations()...),
 					Containers: []corev1.Container{
 						{
 							Name:    ccm.CloudNodeManagerName,

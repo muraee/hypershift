@@ -17,6 +17,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/blang/semver"
 )
 
 const (
@@ -24,6 +26,7 @@ const (
 	etcdComponentName                 = "etcd"
 	featureGateGeneratorComponetName  = "featuregate-generator"
 	controlPlaneOperatorComponentName = "control-plane-operator"
+	capiProviderComponentName         = "capi-provider"
 )
 
 // isEtcdComponent returns true for the default etcd component and any etcd shard
@@ -34,12 +37,22 @@ func isEtcdComponent(name string) bool {
 }
 
 var (
+	// componentsExcludedFromKubeAPIServerDependency lists components that must
+	// not wait for the kube-apiserver to roll out: the components the
+	// kube-apiserver itself needs (etcd, featuregate-generator), the operator
+	// running the rollout, and components that historically started before it.
+	// capi-provider is intentionally not in this set: its deployment mounts the
+	// service-network-admin-kubeconfig secret, which the kube-apiserver
+	// component applies, so the deployment must wait for the kube-apiserver
+	// rollout to avoid FailedMount events during initial cluster bootstrap.
+	// On releases that may run a v1 CPO (pre-4.20), the dependency is instead
+	// skipped via componentsDependingOnKubeAPIServerOnlyOnV2CPO below, because
+	// a v1 CPO never publishes a kube-apiserver ControlPlaneComponent.
 	componentsExcludedFromKubeAPIServerDependency = sets.New(
 		etcdComponentName,
 		featureGateGeneratorComponetName,
 		controlPlaneOperatorComponentName,
 		"cluster-api",
-		"capi-provider",
 		"karpenter-operator",
 		"karpenter",
 		"router",
@@ -47,6 +60,24 @@ var (
 		"ignition-server-proxy",
 		// Allow External OIDC webhook resources, including the CA needed by KAS, to reconcile before KAS.
 		"external-oidc-webhook",
+	)
+
+	// minV2OnlyCPORelease is the first release whose CPO only ships the v2
+	// code path. Releases before it may run a v1 CPO (when the HO no longer
+	// sets the v2 opt-in), and a v1 CPO never publishes a kube-apiserver
+	// ControlPlaneComponent.
+	minV2OnlyCPORelease = semver.MustParse("4.20.0")
+
+	// componentsDependingOnKubeAPIServerOnlyOnV2CPO lists components whose
+	// kube-apiserver dependency only applies when the control plane is
+	// guaranteed to be reconciled by a v2 CPO (release 4.20 and later). For
+	// older releases (4.14-4.19), which may run a v1 CPO, waiting for a
+	// kube-apiserver ControlPlaneComponent would block the component forever.
+	// capi-provider is in this set because it is reconciled by the HO through
+	// the v2 component framework unconditionally, regardless of which CPO
+	// code path the HostedCluster runs.
+	componentsDependingOnKubeAPIServerOnlyOnV2CPO = sets.New(
+		capiProviderComponentName,
 	)
 )
 
@@ -61,7 +92,22 @@ var (
 func (c *controlPlaneWorkload[T]) checkDependencies(cpContext ControlPlaneContext) ([]string, error) {
 	unavailableDependencies := sets.New(c.dependencies...)
 	// always add kube-apiserver as a dependency, except execluded components.
-	if !componentsExcludedFromKubeAPIServerDependency.Has(c.Name()) && !isEtcdComponent(c.Name()) {
+	dependsOnKubeAPIServer := !componentsExcludedFromKubeAPIServerDependency.Has(c.Name()) && !isEtcdComponent(c.Name())
+	if dependsOnKubeAPIServer && componentsDependingOnKubeAPIServerOnlyOnV2CPO.Has(c.Name()) {
+		// A v1 CPO never publishes a kube-apiserver ControlPlaneComponent, so
+		// for releases that may run one the dependency must be skipped.
+		// On parse errors, skip the dependency as well: a spurious FailedMount
+		// is transient and self-healing, while a dependency that can never be
+		// satisfied blocks the component forever.
+		version, err := semver.ParseTolerant(cpContext.ReleaseImageProvider.Version())
+		// Ignore the pre-release so that 4.20 ec/rc/nightly payloads, which
+		// already ship a v2-only CPO, keep the dependency.
+		version.Pre = nil
+		if err != nil || version.LT(minV2OnlyCPORelease) {
+			dependsOnKubeAPIServer = false
+		}
+	}
+	if dependsOnKubeAPIServer {
 		unavailableDependencies.Insert(kubeAPIServerComponentName)
 	}
 	// we don't deploy etcd for unmanaged, therefore components can't have a dependency on it.
@@ -169,8 +215,13 @@ func (c *controlPlaneWorkload[T]) reconcileComponentStatus(cpContext ControlPlan
 		}
 	}
 
-	c.setAvailableCondition(cpContext, &component.Status.Conditions)
-	rolloutStatus := c.setRolloutCompleteCondition(cpContext, &component.Status.Conditions, unmetPreconditions, unavailableDependencies, reconcilationError)
+	var diagReason, diagMessage string
+	workloadObject := c.workloadProvider.NewObject()
+	if err := cpContext.Client.Get(cpContext, client.ObjectKey{Namespace: cpContext.HCP.Namespace, Name: c.name}, workloadObject); err == nil {
+		diagReason, diagMessage = podspec.DiagnoseWorkloadPodFailure(cpContext, cpContext.Client, workloadObject)
+	}
+	c.setAvailableCondition(cpContext, &component.Status.Conditions, diagReason, diagMessage)
+	rolloutStatus := c.setRolloutCompleteCondition(cpContext, &component.Status.Conditions, unmetPreconditions, unavailableDependencies, reconcilationError, diagReason, diagMessage)
 	if rolloutStatus == metav1.ConditionTrue {
 		// set the version only if the rollout is complete
 		component.Status.Version = cpContext.ReleaseImageProvider.Version()
@@ -181,7 +232,7 @@ func (c *controlPlaneWorkload[T]) reconcileComponentStatus(cpContext ControlPlan
 	return nil
 }
 
-func (c *controlPlaneWorkload[T]) setAvailableCondition(cpContext ControlPlaneContext, conditions *[]metav1.Condition) {
+func (c *controlPlaneWorkload[T]) setAvailableCondition(cpContext ControlPlaneContext, conditions *[]metav1.Condition, diagReason, diagMessage string) {
 	workloadObject := c.workloadProvider.NewObject()
 	if err := cpContext.Client.Get(cpContext, client.ObjectKey{Namespace: cpContext.HCP.Namespace, Name: c.name}, workloadObject); err != nil {
 		meta.SetStatusCondition(conditions, metav1.Condition{
@@ -194,6 +245,10 @@ func (c *controlPlaneWorkload[T]) setAvailableCondition(cpContext ControlPlaneCo
 	}
 
 	status, reason, message := c.workloadProvider.IsAvailable(workloadObject)
+	if status == metav1.ConditionFalse && diagReason != "" {
+		reason = diagReason
+		message = fmt.Sprintf("%s; %s", message, diagMessage)
+	}
 	meta.SetStatusCondition(conditions, metav1.Condition{
 		Type:    string(hyperv1.ControlPlaneComponentAvailable),
 		Status:  status,
@@ -202,7 +257,7 @@ func (c *controlPlaneWorkload[T]) setAvailableCondition(cpContext ControlPlaneCo
 	})
 }
 
-func (c *controlPlaneWorkload[T]) setRolloutCompleteCondition(cpContext ControlPlaneContext, conditions *[]metav1.Condition, unmetPreconditions []hyperv1.ConditionType, unavailableDependencies []string, reconcilationError error) metav1.ConditionStatus {
+func (c *controlPlaneWorkload[T]) setRolloutCompleteCondition(cpContext ControlPlaneContext, conditions *[]metav1.Condition, unmetPreconditions []hyperv1.ConditionType, unavailableDependencies []string, reconcilationError error, diagReason, diagMessage string) metav1.ConditionStatus {
 	if len(unmetPreconditions) > 0 {
 		preconditionNames := make([]string, 0, len(unmetPreconditions))
 		for _, precondition := range unmetPreconditions {
@@ -254,6 +309,10 @@ func (c *controlPlaneWorkload[T]) setRolloutCompleteCondition(cpContext ControlP
 	}
 
 	status, reason, message := c.workloadProvider.IsReady(workloadObject)
+	if status == metav1.ConditionFalse && diagReason != "" {
+		reason = diagReason
+		message = fmt.Sprintf("%s; %s", message, diagMessage)
+	}
 
 	operandsReady, err := checkOperandsRolloutStatusFn(cpContext.workloadContext())
 	if !operandsReady && status == metav1.ConditionTrue {
